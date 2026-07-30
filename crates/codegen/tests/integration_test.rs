@@ -14,6 +14,12 @@ fn workspace_root() -> &'static std::path::Path {
     )
 }
 
+fn cli_binary() -> std::path::PathBuf {
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    let bin = if cfg!(target_os = "windows") { "marisjs.exe" } else { "marisjs" };
+    workspace_root().join("target").join(profile).join(bin)
+}
+
 fn setup_test_dir(dir: &tempfile::TempDir) {
     let root = workspace_root();
     let ws_nm = root.join("node_modules");
@@ -1536,7 +1542,7 @@ fn transitive_css_collected_and_linked_in_page_html() {
     std::fs::write(&page_path, page_fixture).unwrap();
 
     // Build
-    let bin = workspace_root().join("target/debug/cli");
+    let bin = cli_binary();
     let out_dir = dir.path().join("dist");
     let status = Command::new(&bin)
         .arg("build")
@@ -1715,7 +1721,7 @@ fn server_component_with_data_prerenders_correct_html() {
     let fixture_path = pages_dir.join("Menu.tsx");
     std::fs::write(&fixture_path, fixture).unwrap();
 
-    let bin = workspace_root().join("target/debug/cli");
+    let bin = cli_binary();
     let out_dir = dir.path().join("dist");
     let status = Command::new(bin)
         .arg("build")
@@ -1852,7 +1858,7 @@ fn data_fetcher_rejection_fails_the_build() {
     let fixture_path = pages_dir.join("Fail.tsx");
     std::fs::write(&fixture_path, fixture).unwrap();
 
-    let bin = workspace_root().join("target/debug/cli");
+    let bin = cli_binary();
     let out_dir = dir.path().join("dist");
     let status = Command::new(bin)
         .arg("build")
@@ -1958,7 +1964,7 @@ fn nested_server_data_renders_deep_author_info() {
     std::fs::write(&page_path, page_fixture).unwrap();
 
     use std::process::Command;
-    let bin = workspace_root().join("target/debug/cli");
+    let bin = cli_binary();
     let out_dir = dir.path().join("dist");
     let status = Command::new(&bin)
         .arg("build")
@@ -2009,7 +2015,7 @@ fn nested_data_rejection_fails_build() {
     std::fs::write(&page_path, page_fixture).unwrap();
 
     use std::process::Command;
-    let bin = workspace_root().join("target/debug/cli");
+    let bin = cli_binary();
     let out_dir = dir.path().join("dist");
     let status = Command::new(&bin)
         .arg("build")
