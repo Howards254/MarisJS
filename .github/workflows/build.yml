@@ -65,11 +65,21 @@ jobs:
       - name: Install aarch64 cross-compilation toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          # Default Ubuntu mirrors only carry amd64 — ports.ubuntu.com hosts arm64.
+          # Pin ALL existing apt sources to amd64 only — the default mirrors
+          # (azure.archive.ubuntu.com, security.ubuntu.com) don't carry arm64
+          # packages, so without this pin, apt-get update will 404 on arm64
+          # package lists from them.
+          sudo sed -i 's/^deb /deb [arch=amd64] /g' /etc/apt/sources.list
+          sudo find /etc/apt/sources.list.d -name '*.list' -exec sudo sed -i 's/^deb /deb [arch=amd64] /g' {} \;
+
+          # Add arm64-only sources pointing at ports.ubuntu.com.
           codename=$(lsb_release -cs)
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename} main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename}-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename}-security main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+          sudo tee /etc/apt/sources.list.d/arm64.list <<EOF
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename} main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-backports main restricted universe multiverse
+          EOF
 
           sudo dpkg --add-architecture arm64
           sudo apt-get update
