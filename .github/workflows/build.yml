@@ -65,8 +65,9 @@ jobs:
       - name: Install aarch64 cross-compilation toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo dpkg --add-architecture arm64
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static libc6:arm64
 
       - name: Build (native x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
