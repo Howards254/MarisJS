@@ -27,7 +27,23 @@ importers:
 
   packages/core: {}
 
-  packages/marisjs: {}
+  packages/marisjs:
+    optionalDependencies:
+      marisjs-linux-x64:
+        specifier: 0.1.0
+        version: link:../marisjs-linux-x64
+      marisjs-linux-arm64:
+        specifier: 0.1.0
+        version: link:../marisjs-linux-arm64
+      marisjs-darwin-x64:
+        specifier: 0.1.0
+        version: link:../marisjs-darwin-x64
+      marisjs-darwin-arm64:
+        specifier: 0.1.0
+        version: link:../marisjs-darwin-arm64
+      marisjs-win32-x64:
+        specifier: 0.1.0
+        version: link:../marisjs-win32-x64
 
   packages/marisjs-darwin-arm64: {}
 
