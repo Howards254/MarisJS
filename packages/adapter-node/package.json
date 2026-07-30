@@ -1,0 +1,13 @@
+{
+  "name": "@maris/adapter-node",
+  "version": "0.1.0",
+  "description": "Plain Node.js HTTP server adapter for marisjs build output",
+  "type": "module",
+  "bin": {
+    "marisjs-serve": "server.mjs"
+  },
+  "files": [
+    "server.mjs"
+  ],
+  "license": "MIT"
+}

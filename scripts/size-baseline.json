@@ -1,0 +1,16 @@
+{
+  "runtime": {
+    "max_bytes": 10000,
+    "note": "Hard ceiling. @maris/runtime source must stay under 10KB unminified."
+  },
+  "binaries": {
+    "note": "Last-measured release build size per target. CI fails if any binary grows >25% beyond its baseline in a single change. Update this file intentionally when size growth is justified. Entries with null mean 'not yet measured — CI will report the size on next run.'",
+    "growth_max_percent": 25,
+    "x86_64-unknown-linux-gnu": 5025816,
+    "aarch64-unknown-linux-gnu": 3549352,
+    "x86_64-apple-darwin": null,
+    "aarch64-apple-darwin": null,
+    "x86_64-pc-windows-msvc": null,
+    "x86_64-pc-windows-gnu": 6745600
+  }
+}

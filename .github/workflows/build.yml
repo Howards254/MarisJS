@@ -1,0 +1,321 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run — simulate publish without actually pushing to the registry'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Gate: tests must pass before any binary is built ────────────────
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - run: cargo test
+
+      - name: SPEC.md drift check
+        run: bash scripts/check-spec-drift.sh
+
+      - name: Size check — @maris/runtime
+        run: bash scripts/check-sizes.sh --runtime
+
+  # ── Linux: native x86_64 + cross-compiled aarch64 via QEMU ──────────
+
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install aarch64 cross-compilation toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: Build (native x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Verify (native x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          ./target/${{ matrix.target }}/release/marisjs --version
+          ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
+
+      - name: Verify (aarch64 via QEMU)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          qemu-aarch64-static ./target/${{ matrix.target }}/release/marisjs --version
+          qemu-aarch64-static ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
+
+      - name: Size check
+        run: bash scripts/check-sizes.sh --binary ./target/${{ matrix.target }}/release/marisjs ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marisjs-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/marisjs
+          if-no-files-found: error
+
+  # ── macOS x86_64 (Intel, macos-13 runner) ───────────────────────────
+
+  build-macos-x86:
+    needs: test
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Verify
+        run: |
+          ./target/release/marisjs --version
+          ./target/release/marisjs --version | grep -q '^marisjs '
+      - name: Size check
+        run: |
+          TARGET=$(rustc -vV | grep ^host: | awk '{print $2}')
+          bash scripts/check-sizes.sh --binary ./target/release/marisjs "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marisjs-x86_64-apple-darwin
+          path: target/release/marisjs
+          if-no-files-found: error
+
+  # ── macOS aarch64 (Apple Silicon, macos-latest runner) ──────────────
+
+  build-macos-arm:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Verify
+        run: |
+          ./target/release/marisjs --version
+          ./target/release/marisjs --version | grep -q '^marisjs '
+      - name: Size check
+        run: |
+          TARGET=$(rustc -vV | grep ^host: | awk '{print $2}')
+          bash scripts/check-sizes.sh --binary ./target/release/marisjs "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marisjs-aarch64-apple-darwin
+          path: target/release/marisjs
+          if-no-files-found: error
+
+  # ── Windows x86_64 (windows-latest runner) ──────────────────────────
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Verify
+        shell: bash
+        run: |
+          ./target/release/marisjs.exe --version
+          ./target/release/marisjs.exe --version | grep -q '^marisjs '
+      - name: Size check
+        shell: bash
+        run: |
+          TARGET=$(rustc -vV | grep ^host: | awk '{print $2}')
+          bash scripts/check-sizes.sh --binary ./target/release/marisjs.exe "$TARGET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marisjs-x86_64-pc-windows-msvc
+          path: target/release/marisjs.exe
+          if-no-files-found: error
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  Publish — tag-triggered or manual dispatch only
+  # ═══════════════════════════════════════════════════════════════════════
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos-x86, build-macos-arm, build-windows]
+    runs-on: ubuntu-latest
+    environment:
+      name: npm-release
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Determine mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "flag=--dry-run" >> "$GITHUB_OUTPUT"
+            echo "::warning::DRY RUN — no packages will be published. npm publish will simulate only."
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "::notice::LIVE PUBLISH — packages will be irrevocably published to the npm registry."
+          fi
+
+      - name: Verify version consistency
+        run: |
+          set -euo pipefail
+
+          TAG_VERSION=""
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "Tag version: $TAG_VERSION"
+          else
+            echo "Not a tag push — checking internal consistency only."
+          fi
+
+          PKG_DIRS=(
+            packages/marisjs-linux-x64
+            packages/marisjs-linux-arm64
+            packages/marisjs-darwin-x64
+            packages/marisjs-darwin-arm64
+            packages/marisjs-win32-x64
+            packages/marisjs
+            packages/runtime
+          )
+
+          errors=()
+          for dir in "${PKG_DIRS[@]}"; do
+            name=$(node -e "console.log(require('./$dir/package.json').name)")
+            ver=$(node -e "console.log(require('./$dir/package.json').version)")
+
+            if [ -n "$TAG_VERSION" ] && [ "$ver" != "$TAG_VERSION" ]; then
+              errors+=("$name  →  package.json says $ver, tag says $TAG_VERSION")
+            fi
+          done
+
+          if [ ${#errors[@]} -gt 0 ]; then
+            echo "::error::Version mismatch between git tag ($TAG_VERSION) and package.json files:"
+            for e in "${errors[@]}"; do
+              echo "  ✗ $e"
+            done
+            exit 1
+          fi
+
+          echo "All 7 packages agree on version ${TAG_VERSION:-consistent}."
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Place binaries in platform packages
+        run: |
+          set -euo pipefail
+
+          mkdir -p packages/marisjs-linux-x64/bin
+          mkdir -p packages/marisjs-linux-arm64/bin
+          mkdir -p packages/marisjs-darwin-x64/bin
+          mkdir -p packages/marisjs-darwin-arm64/bin
+          mkdir -p packages/marisjs-win32-x64/bin
+
+          cp marisjs-x86_64-unknown-linux-gnu/marisjs  packages/marisjs-linux-x64/bin/marisjs
+          cp marisjs-aarch64-unknown-linux-gnu/marisjs packages/marisjs-linux-arm64/bin/marisjs
+          cp marisjs-x86_64-apple-darwin/marisjs          packages/marisjs-darwin-x64/bin/marisjs
+          cp marisjs-aarch64-apple-darwin/marisjs         packages/marisjs-darwin-arm64/bin/marisjs
+          cp marisjs-x86_64-pc-windows-msvc/marisjs.exe   packages/marisjs-win32-x64/bin/marisjs.exe
+
+          chmod +x packages/marisjs-linux-x64/bin/marisjs
+          chmod +x packages/marisjs-linux-arm64/bin/marisjs
+          chmod +x packages/marisjs-darwin-x64/bin/marisjs
+          chmod +x packages/marisjs-darwin-arm64/bin/marisjs
+
+          echo "=== Binary sizes ==="
+          ls -lh packages/marisjs-*/bin/*
+
+      # Publish order: platform packages first, then the main CLI wrapper,
+      # then @maris/runtime (standalone, order-independent).  Platform
+      # packages go first because the main `marisjs` package declares them
+      # as optionalDependencies — while optionalDeps are not required for
+      # publish, publishing in dependency order avoids confusing transient
+      # resolution errors on the registry side.
+      #
+      # Each publish step uses scripts/publish-safe.sh, which is
+      # idempotent: if npm returns "previously published versions" (HTTP
+      # 403 / E403 / EPUBLISHCONFLICT), the step logs a warning and
+      # succeeds.  Any other failure is fatal.  This makes the job safe to
+      # re-run after a partial failure without blocking on already-
+      # published packages.
+
+      - name: Publish marisjs-linux-x64
+        run: bash scripts/publish-safe.sh packages/marisjs-linux-x64 "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish marisjs-linux-arm64
+        run: bash scripts/publish-safe.sh packages/marisjs-linux-arm64 "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish marisjs-darwin-x64
+        run: bash scripts/publish-safe.sh packages/marisjs-darwin-x64 "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish marisjs-darwin-arm64
+        run: bash scripts/publish-safe.sh packages/marisjs-darwin-arm64 "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish marisjs-win32-x64
+        run: bash scripts/publish-safe.sh packages/marisjs-win32-x64 "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish marisjs (main CLI wrapper)
+        run: bash scripts/publish-safe.sh packages/marisjs "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish @maris/runtime
+        run: bash scripts/publish-safe.sh packages/runtime "${{ steps.mode.outputs.flag }}"
+
+      - name: Summary
+        run: |
+          DRY="${{ steps.mode.outputs.flag }}"
+          if [ -n "$DRY" ]; then
+            echo "DRY RUN COMPLETE — nothing was published."
+            echo "To publish for real: push a 'v*' tag, or re-run workflow_dispatch"
+            echo "with dry_run: false and wait for the npm-release environment approval."
+          else
+            echo "PUBLISH COMPLETE — all 7 packages published to npm."
+          fi

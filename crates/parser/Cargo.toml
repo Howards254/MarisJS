@@ -1,0 +1,12 @@
+[package]
+name = "parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+swc_common = "0.33"
+swc_ecma_ast = "0.112"
+swc_ecma_parser = "0.143"
+swc_ecma_visit = "0.98"
+serde = ">=1.0, <1.0.200"

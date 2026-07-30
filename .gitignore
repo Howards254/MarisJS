@@ -1,0 +1,29 @@
+# Build artifacts
+target/
+node_modules/
+
+# Dist output directories (anywhere in repo)
+dist/
+dist-*/
+
+# Benchmark working folder (source kept local)
+benchmark/
+
+# Platform binaries (produced by CI, published to npm directly)
+packages/marisjs-*/bin/
+
+# Packed tarballs
+*.tgz
+
+# Test results
+test-results/
+
+# Vitest cache
+.vite/
+
+# Log files
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
