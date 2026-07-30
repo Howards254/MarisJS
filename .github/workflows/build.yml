@@ -65,6 +65,12 @@ jobs:
       - name: Install aarch64 cross-compilation toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          # Default Ubuntu mirrors only carry amd64 — ports.ubuntu.com hosts arm64.
+          codename=$(lsb_release -cs)
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename} main restricted universe" | sudo tee /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename}-updates main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ ${codename}-security main restricted universe" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+
           sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static libc6:arm64
