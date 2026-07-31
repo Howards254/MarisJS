@@ -88,7 +88,7 @@ jobs:
 
       - name: Verify (aarch64 inside ARM64 container)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: uraimo/run-on-arch-action@v2
+        uses: uraimo/run-on-arch-action@v3
         with:
           arch: aarch64
           distro: ubuntu24.04
