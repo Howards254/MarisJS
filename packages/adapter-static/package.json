@@ -1,5 +1,5 @@
 {
-  "name": "@maris/adapter-static",
+  "name": "@marisjs/adapter-static",
   "version": "0.1.0",
   "description": "Produces a fully static deployment from marisjs build output — no server required",
   "type": "module",

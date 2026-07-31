@@ -37,7 +37,7 @@ dist/
 │   ├── Header.mjs
 │   └── Header.css                  # Transitive CSS, copied verbatim
 └── node_modules/
-    └── @maris/
+    └── @marisjs/
         └── runtime/
             └── package.json        # Node.js resolution shim for SSR
 ```

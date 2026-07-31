@@ -1,9 +1,9 @@
-# @maris/adapter-node
+# @marisjs/adapter-node
 
 A plain Node.js HTTP server for marisjs build output. Zero framework dependencies.
 
 ```bash
-npm install @maris/adapter-node
+npm install @marisjs/adapter-node
 npx marisjs-serve ./dist          # serve the build output
 npx marisjs-serve ./dist --port 8080  # custom port via PORT= env
 PORT=8080 npx marisjs-serve ./dist

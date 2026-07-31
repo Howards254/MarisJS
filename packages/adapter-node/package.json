@@ -1,5 +1,5 @@
 {
-  "name": "@maris/adapter-node",
+  "name": "@marisjs/adapter-node",
   "version": "0.1.0",
   "description": "Plain Node.js HTTP server adapter for marisjs build output",
   "type": "module",

@@ -201,8 +201,8 @@ See [`docs/mcp-server.md`](docs/mcp-server.md) for build instructions and develo
 
 | Adapter | Package | Description |
 |---------|---------|-------------|
-| Node.js server | `@maris/adapter-node` | Zero-dependency HTTP server. Re-executes server routes per request, serves static routes from disk. |
-| Static output | `@maris/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error if any route requires server execution. |
+| Node.js server | `@marisjs/adapter-node` | Zero-dependency HTTP server. Re-executes server routes per request, serves static routes from disk. |
+| Static output | `@marisjs/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error if any route requires server execution. |
 
 See [`docs/adapter-interface.md`](docs/adapter-interface.md) for the adapter contract, and
 [`docs/writing-an-adapter.md`](docs/writing-an-adapter.md) for a walkthrough on writing your own.

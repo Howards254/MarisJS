@@ -41,7 +41,7 @@ if (serverRoutes.length > 0) {
   console.error(`\nThese routes use data() which re-executes per request.`);
   console.error('Use one of these options:');
   console.error('  1. Remove data() calls to make the route fully static.');
-  console.error('  2. Use @maris/adapter-node for a server that handles both modes.');
+  console.error('  2. Use @marisjs/adapter-node for a server that handles both modes.');
   console.error('  3. Use a platform adapter (Vercel, Netlify) that supports SSR.');
   process.exit(1);
 }

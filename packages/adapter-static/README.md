@@ -1,10 +1,10 @@
-# @maris/adapter-static
+# @marisjs/adapter-static
 
 Produces a fully static deployment from marisjs build output — zero server, zero runtime
 process. The output directory can be deployed to any static host.
 
 ```bash
-npm install @maris/adapter-static
+npm install @marisjs/adapter-static
 npx marisjs-static ./dist ./static-out
 ```
 
@@ -51,7 +51,7 @@ This adapter only produces fully static output. The following routes cannot be d
 These routes use data() which re-executes per request.
 Use one of these options:
   1. Remove data() calls to make the route fully static.
-  2. Use @maris/adapter-node for a server that handles both modes.
+  2. Use @marisjs/adapter-node for a server that handles both modes.
   3. Use a platform adapter (Vercel, Netlify) that supports SSR.
 ```
 

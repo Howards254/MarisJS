@@ -82,7 +82,7 @@ whether to support `mode: "server"` or reject it.
   re-execute at the edge on every request.
 
 If you were writing an adapter for a purely static platform (S3, GitHub Pages), you'd
-reject `mode: "server"` routes — just like `@maris/adapter-static` does.
+reject `mode: "server"` routes — just like `@marisjs/adapter-static` does.
 
 ## Step 3: Handle static routes
 
@@ -209,7 +209,7 @@ compiler.
 ## Complete adapter structure
 
 A real adapter is typically a small script or package. Here's the full file list
-for `@maris/adapter-cloudflare`:
+for `@marisjs/adapter-cloudflare`:
 
 ```
 packages/adapter-cloudflare/
