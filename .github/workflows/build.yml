@@ -62,32 +62,13 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install aarch64 cross-compilation toolchain
+      - name: Set up QEMU for aarch64
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          # Pin the main Ubuntu source file to amd64 only — the default
-          # mirrors (azure.archive.ubuntu.com, security.ubuntu.com) don't
-          # carry arm64 packages, so without this pin apt-get update will
-          # 404 on arm64 package lists.
-          #
-          # Only touch /etc/apt/sources.list — NOT any files under
-          # /etc/apt/sources.list.d/.  Third-party repos (Microsoft, etc.)
-          # often carry their own [arch=...] tags already and re-sed-ing
-          # them produces malformed entries.
-          sudo sed -i 's/^deb /deb [arch=amd64] /g' /etc/apt/sources.list
+        uses: docker/setup-qemu-action@v3
 
-          # Add arm64-only sources pointing at ports.ubuntu.com.
-          codename=$(lsb_release -cs)
-          sudo tee /etc/apt/sources.list.d/arm64.list <<EOF
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename} main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-backports main restricted universe multiverse
-          EOF
-
-          sudo dpkg --add-architecture arm64
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static libc6:arm64
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build (native x86_64)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -108,8 +89,8 @@ jobs:
       - name: Verify (aarch64 via QEMU)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          qemu-aarch64-static ./target/${{ matrix.target }}/release/marisjs --version
-          qemu-aarch64-static ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
+          ./target/${{ matrix.target }}/release/marisjs --version
+          ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
 
       - name: Size check
         run: bash scripts/check-sizes.sh --binary ./target/${{ matrix.target }}/release/marisjs ${{ matrix.target }}
