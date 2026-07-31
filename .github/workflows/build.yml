@@ -86,11 +86,16 @@ jobs:
           ./target/${{ matrix.target }}/release/marisjs --version
           ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
 
-      - name: Verify (aarch64 via QEMU)
+      - name: Verify (aarch64 inside ARM64 container)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          ./target/${{ matrix.target }}/release/marisjs --version
-          ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: aarch64
+          distro: ubuntu24.04
+          run: |
+            chmod +x ./target/aarch64-unknown-linux-gnu/release/marisjs
+            ./target/aarch64-unknown-linux-gnu/release/marisjs --version
+            ./target/aarch64-unknown-linux-gnu/release/marisjs --version | grep -q '^marisjs '
 
       - name: Size check
         run: bash scripts/check-sizes.sh --binary ./target/${{ matrix.target }}/release/marisjs ${{ matrix.target }}
