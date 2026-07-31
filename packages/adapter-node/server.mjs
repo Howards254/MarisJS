@@ -43,7 +43,7 @@ function htmlShell(serverHtml, route) {
   <script type="importmap">
   {
     "imports": {
-      "@maris/runtime": "./runtime.mjs"
+      "@marisjs/runtime": "./runtime.mjs"
     }
   }
   </script>
@@ -54,7 +54,7 @@ ${cssLinks}
   ${serverHtml}
   </div>
   <script type="module">
-    import { mount } from '@maris/runtime';
+    import { mount } from '@marisjs/runtime';
 ${clientImports}
     const root = document.getElementById('root');
 ${clientMounts}

@@ -25,7 +25,7 @@ Accepts a file path or raw TSX source code. Returns the exact same structured JS
       "column": 0,
       "code": "FORBIDDEN_IMPORT",
       "message": "Import from 'react' is not allowed. Use marisjs primitives instead.",
-      "fix_hint": "Remove this import and use <For>, signal(), or computed() from @maris/runtime."
+      "fix_hint": "Remove this import and use <For>, signal(), or computed() from @marisjs/runtime."
     }
   ]
 }

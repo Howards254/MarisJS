@@ -75,6 +75,6 @@ test('adapter returns 404 for unknown routes', async ({ page }) => {
 });
 
 test('adapter does not expose node_modules to browser', async ({ page }) => {
-  const response = await page.goto(`${BASE_URL}/node_modules/@maris/runtime/package.json`);
+  const response = await page.goto(`${BASE_URL}/node_modules/@marisjs/runtime/package.json`);
   expect(response.status()).toBe(404);
 });

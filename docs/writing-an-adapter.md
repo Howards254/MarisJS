@@ -162,12 +162,12 @@ CSS links, client hydration script. You can copy it verbatim from the spec.
 
 ## Step 5: Handle the runtime
 
-The `import { signal } from '@maris/runtime'` statements in client modules need to
+The `import { signal } from '@marisjs/runtime'` statements in client modules need to
 resolve. For **browsers**, this is handled by the import map in the HTML shell:
 
 ```html
 <script type="importmap">
-{ "imports": { "@maris/runtime": "./runtime.mjs" } }
+{ "imports": { "@marisjs/runtime": "./runtime.mjs" } }
 </script>
 ```
 
@@ -175,7 +175,7 @@ The adapter just needs to serve `runtime.mjs` as a static file at that path. For
 Cloudflare Workers, put `runtime.mjs` in the static assets bucket.
 
 For **the Worker itself** (when importing page modules that reference
-`@maris/runtime`), the adapter can bundle `runtime.mjs` directly into the Worker
+`@marisjs/runtime`), the adapter can bundle `runtime.mjs` directly into the Worker
 script so ES module imports resolve at build time, or it can use an import map in
 the Worker's `wrangler.toml`. Either approach works; the interface doesn't prescribe
 one.

@@ -230,10 +230,10 @@ fn test_missing_runs_on_json_has_null_positions() {
     assert!(error["column"].is_null(), "MISSING_RUNSON must emit 'column': null");
 }
 
-// ── Regression: server prerender resolves @maris/runtime via embedded runtime ─
+// ── Regression: server prerender resolves @marisjs/runtime via embedded runtime ─
 
 /// Builds a @runsOn server component in a clean temp directory with NO
-/// @maris/runtime npm package installed. Verifies the prerender step
+/// @marisjs/runtime npm package installed. Verifies the prerender step
 /// successfully rewrites the import and produces static HTML.
 #[test]
 fn server_prerender_resolves_runtime_without_npm_install() {
@@ -244,7 +244,7 @@ fn server_prerender_resolves_runtime_without_npm_install() {
 
     let fixture = concat!(
         "// @runsOn server\n",
-        "import { data } from '@maris/runtime';\n",
+        "import { data } from '@marisjs/runtime';\n",
         "type Props = {};\n",
         "export function Index(props: Props) {\n",
         "  const msg = data(async () => 'hello');\n",
@@ -297,7 +297,7 @@ fn manifest_distinguishes_static_vs_data_pages() {
     // Page with data() — should be mode "server"
     let data_page = concat!(
         "// @runsOn server\n",
-        "import { data } from '@maris/runtime';\n",
+        "import { data } from '@marisjs/runtime';\n",
         "type Props = {};\n",
         "export function Index(props: Props) {\n",
         "  const msg = await data(async () => 'hello');\n",

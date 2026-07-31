@@ -24,9 +24,9 @@ fn setup_test_dir(dir: &tempfile::TempDir) {
     let root = workspace_root();
     let ws_nm = root.join("node_modules");
 
-    // Ensure @maris/runtime exists in workspace node_modules (shared, one-time setup).
+    // Ensure @marisjs/runtime exists in workspace node_modules (shared, one-time setup).
     // create_dir and symlink tolerate "already exists" so concurrent tests are safe.
-    let maris_dir = ws_nm.join("@maris");
+    let maris_dir = ws_nm.join("@marisjs");
     let _ = std::fs::create_dir(&maris_dir);
     let runtime_link = maris_dir.join("runtime");
     if !runtime_link.exists() {
@@ -973,7 +973,7 @@ fn mount_integration_with_two_components() {
     parse_validate_generate(&dir, "App", parent_fixture);
 
     let runner = r#"import { JSDOM } from 'jsdom';
-import { mount } from '@maris/runtime';
+import { mount } from '@marisjs/runtime';
 import { App } from './App.mjs';
 
 const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
@@ -1277,7 +1277,7 @@ if (status.textContent === 'OK') {
 fn binary_operators_in_jsx_expressions() {
     let fixture = concat!(
         "// @runsOn client\n",
-        "import { signal } from '@maris/runtime';\n",
+        "import { signal } from '@marisjs/runtime';\n",
         "type MathProps = {};\n",
         "export function MathDemo(props: MathProps) {\n",
         "  const a = signal(10);\n",
@@ -1660,7 +1660,7 @@ fn server_data_emits_derived_const_in_generated_js() {
     let js = codegen::generate(&component).unwrap();
     eprintln!("--- Generated JS (server with data()) ---\n{}", js);
 
-    assert!(js.contains("import { data } from '@maris/runtime'"), "missing data import");
+    assert!(js.contains("import { data } from '@marisjs/runtime'"), "missing data import");
     assert!(js.contains("async function Shop"), "function not async");
     assert!(js.contains("await data(async ()"), "missing await data(...) declaration");
     assert!(js.contains(".map("), "missing .map() for <For>");

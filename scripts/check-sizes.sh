@@ -3,7 +3,7 @@
 # Protects the project's core efficiency claim with automated CI gates:
 #
 #   Runtime hard ceiling
-#     @maris/runtime source must stay under 10KB unminified (currently
+#     @marisjs/runtime source must stay under 10KB unminified (currently
 #     ~2.8KB). This is an absolute cap — no growth-percentage tolerance.
 #
 #   Binary growth limit
@@ -118,7 +118,7 @@ fi
 
 if $CHECK_RUNTIME; then
   echo ""
-  echo "── @maris/runtime size check ────────────────────────────────────"
+  echo "── @marisjs/runtime size check ────────────────────────────────────"
 
   if [ ! -f "$RUNTIME_FILE" ]; then
     fail "runtime source not found: $RUNTIME_FILE"

@@ -51,8 +51,8 @@ dist/
 - CSS files are copied verbatim to the output directory, preserving their relative
   path from the source tree. They are globally scoped (no class-name rewriting).
 - `runtime.mjs` always exists and exports `signal`, `computed`, `bind`, `mount.`
-- `node_modules/@maris/runtime/package.json` exists inside `dist/` solely to let
-  Node.js resolve `import { ... } from '@maris/runtime'` during SSR. Browsers use
+- `node_modules/@marisjs/runtime/package.json` exists inside `dist/` solely to let
+  Node.js resolve `import { ... } from '@marisjs/runtime'` during SSR. Browsers use
   the import map injected into HTML — they never touch this directory.
 
 **What an adapter should NOT assume:**
@@ -172,7 +172,7 @@ For every route with `mode: "static"`, serve `file` as a static file. A standard
 static file server reading from the dist directory is sufficient.
 
 The HTML file already contains:
-- A `<script type="importmap">` that maps `@maris/runtime` to `./runtime.mjs`.
+- A `<script type="importmap">` that maps `@marisjs/runtime` to `./runtime.mjs`.
 - CSS `<link>` tags for every file listed in `css`.
 - A `<script type="module">` block that imports `mount` from the runtime and
   calls it for each entry in `clientModules` (if any).
@@ -237,7 +237,7 @@ The standard shell:
   <script type="importmap">
   {
     "imports": {
-      "@maris/runtime": "./runtime.mjs"
+      "@marisjs/runtime": "./runtime.mjs"
     }
   }
   </script>
@@ -248,7 +248,7 @@ The standard shell:
   <!-- SSR HTML from PageComponent({}) inserted here -->
   </div>
   <script type="module">
-    import { mount } from '@maris/runtime';
+    import { mount } from '@marisjs/runtime';
     // import each client module from routes[].clientModules
     // mount(root, () => ComponentName({}))
   </script>
@@ -293,7 +293,7 @@ An adapter author needs zero knowledge of:
 
 - **The import map.** The import map is either embedded in static HTML or generated
   by the adapter for server routes. In both cases its content is fixed:
-  `@maris/runtime` → `./runtime.mjs`. No discovery or compilation needed.
+  `@marisjs/runtime` → `./runtime.mjs`. No discovery or compilation needed.
 
 ---
 
@@ -313,10 +313,10 @@ dependencies. It exports:
 The runtime is resolved at two different points:
 
 1. **Browser:** via the import map `<script type="importmap">` in the HTML head,
-   which maps `@maris/runtime` to `./runtime.mjs`. The `.mjs` file is served as
+   which maps `@marisjs/runtime` to `./runtime.mjs`. The `.mjs` file is served as
    a static file from the output directory.
 
-2. **Node.js (SSR):** via the `node_modules/@maris/runtime/package.json` shim
+2. **Node.js (SSR):** via the `node_modules/@marisjs/runtime/package.json` shim
    automatically generated inside the output directory. Node's standard module
    resolver walks the directory tree, finds this shim, and resolves to
    `runtime.mjs`. The adapter does not need to create this shim — it is part of
@@ -333,7 +333,7 @@ static HTML. An adapter hosting the output directory must:
 - Treat the entire output directory as a web root. Any file in it may be requested
   by a browser (e.g., `./components/Counter.mjs` imported by a `<script
   type="module">`).
-- Not expose `node_modules/` to browsers. The `node_modules/@maris/runtime/`
+- Not expose `node_modules/` to browsers. The `node_modules/@marisjs/runtime/`
   shim is only for Node.js SSR — it serves no purpose for browser requests and
   can be excluded from static serving.
 - Not assume any particular hosting mechanism. The adapter may copy files to a
@@ -372,7 +372,7 @@ function htmlShell(serverHtml, route) {
 <html>
 <head>
   <script type="importmap">
-  { "imports": { "@maris/runtime": "./runtime.mjs" } }
+  { "imports": { "@marisjs/runtime": "./runtime.mjs" } }
   </script>
 ${cssLinks}
 </head>
@@ -381,7 +381,7 @@ ${cssLinks}
   ${serverHtml}
   </div>
   <script type="module">
-    import { mount } from '@maris/runtime';
+    import { mount } from '@marisjs/runtime';
 ${clientImports}
     const root = document.getElementById('root');
 ${clientMounts}

@@ -41,7 +41,7 @@ jobs:
       - name: SPEC.md drift check
         run: bash scripts/check-spec-drift.sh
 
-      - name: Size check — @maris/runtime
+      - name: Size check — @marisjs/runtime
         run: bash scripts/check-sizes.sh --runtime
 
   # ── Linux: native x86_64 + cross-compiled aarch64 via QEMU ──────────
@@ -282,7 +282,7 @@ jobs:
           ls -lh packages/marisjs-*/bin/*
 
       # Publish order: platform packages first, then the main CLI wrapper,
-      # then @maris/runtime (standalone, order-independent).  Platform
+      # then @marisjs/runtime (standalone, order-independent).  Platform
       # packages go first because the main `marisjs` package declares them
       # as optionalDependencies — while optionalDeps are not required for
       # publish, publishing in dependency order avoids confusing transient
@@ -313,7 +313,7 @@ jobs:
       - name: Publish marisjs (main CLI wrapper)
         run: bash scripts/publish-safe.sh packages/marisjs "${{ steps.mode.outputs.flag }}"
 
-      - name: Publish @maris/runtime
+      - name: Publish @marisjs/runtime
         run: bash scripts/publish-safe.sh packages/runtime "${{ steps.mode.outputs.flag }}"
 
       - name: Summary

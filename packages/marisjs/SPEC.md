@@ -120,7 +120,7 @@ directory tree maps directly to URL routes:
   `pages/` as helper components — their location does not affect routing.
 - Pages are pre-rendered to static HTML during `marisjs build` by invoking the server
   component via Node.js. The generated HTML includes an import map so browser-side code
-  resolves `@maris/runtime` to `./runtime.mjs` without any `node_modules` dependency.
+  resolves `@marisjs/runtime` to `./runtime.mjs` without any `node_modules` dependency.
 
 ---
 
@@ -318,7 +318,7 @@ matching the same rule already established for component props.
 ## 6. Server/Client Data Rules
 
 - A `// @runsOn server` component may declare data fetches using the `data()` primitive,
-  imported from `@maris/runtime`. The `data()` function takes an async fetcher callback
+  imported from `@marisjs/runtime`. The `data()` function takes an async fetcher callback
   and must be `await`-ed:
 
 ```tsx

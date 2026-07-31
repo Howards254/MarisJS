@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# ── @maris/runtime publishability test ────────────────────────────────
+# ── @marisjs/runtime publishability test ────────────────────────────────
 # Packs the runtime as a standalone tarball, installs it into a clean
 # temp Node project, then verifies all five exports (signal, computed,
 # bind, mount, data) work exactly as generated apps expect at runtime.
 #
-# Generated component code imports from '@maris/runtime' with simple ESM
+# Generated component code imports from '@marisjs/runtime' with simple ESM
 # import statements — this test replicates that exact consumer pattern.
 # ──────────────────────────────────────────────────────────────────────
 
@@ -19,14 +19,14 @@ say()  { echo -e "$*"; }
 pass() { echo -e "${GREEN}PASS${NC} $*"; }
 fail() { echo -e "${RED}FAIL${NC} $*"; exit 1; }
 
-say "@maris/runtime standalone package test"
+say "@marisjs/runtime standalone package test"
 
 # ── 1. Pack the runtime ──────────────────────────────────────────────
 
 TEST_DIR=$(mktemp -d)
 trap "rm -rf '$TEST_DIR'" EXIT
 
-say "packing @maris/runtime…"
+say "packing @marisjs/runtime…"
 RUNTIME_TGZ=$(cd packages/runtime && npm pack --pack-destination "$TEST_DIR" 2>/dev/null | tail -1)
 
 if [ ! -f "$TEST_DIR/$RUNTIME_TGZ" ]; then
@@ -56,7 +56,7 @@ say "installed"
 # ── 3. Run all-exports verification ──────────────────────────────────
 
 cat > "$PROJ_DIR/test-runtime.mjs" <<'TESTEOF'
-import { signal, computed, bind, mount, data } from '@maris/runtime';
+import { signal, computed, bind, mount, data } from '@marisjs/runtime';
 import { JSDOM } from 'jsdom';
 
 let failures = 0;
@@ -170,4 +170,4 @@ if [ $EXIT_CODE -ne 0 ]; then
 fi
 
 echo "$OUTPUT"
-pass "@maris/runtime passes all assertions as a standalone install"
+pass "@marisjs/runtime passes all assertions as a standalone install"

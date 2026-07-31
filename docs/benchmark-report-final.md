@@ -70,7 +70,7 @@ target rather than a referendum on the underlying design philosophy.
 
 ## Confirmed bugs, in priority order (see companion fix instructions)
 
-1. **Node prerender runtime resolution** (Task 1) — `@maris/runtime` isn't resolvable during
+1. **Node prerender runtime resolution** (Task 1) — `@marisjs/runtime` isn't resolvable during
    server-side prerendering for any `client:hydrate` component, despite being fully embedded and
    resolved correctly for the browser. Highest priority: this breaks a core, commonly-used
    feature (islands) and currently requires an undocumented manual fix.

@@ -114,13 +114,13 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     std::fs::write(&runtime_dest, RUNTIME_JS).map_err(|e| format!("failed to write runtime: {}", e))?;
     eprintln!("  wrote runtime → runtime.mjs");
 
-    // Create node_modules shim so Node can resolve @maris/runtime during prerendering.
+    // Create node_modules shim so Node can resolve @marisjs/runtime during prerendering.
     // The dist/ directory is self-contained: runtime.mjs sits at the root, and the shim
     // tells Node's module resolver to look there. Browser code uses the import map
     // injected into generated HTML instead.
-    let nm_runtime = out_dir.join("node_modules/@maris/runtime");
+    let nm_runtime = out_dir.join("node_modules/@marisjs/runtime");
     std::fs::create_dir_all(&nm_runtime).map_err(|e| format!("create node_modules: {}", e))?;
-    std::fs::write(nm_runtime.join("package.json"), r#"{"name":"@maris/runtime","type":"module","main":"../../../runtime.mjs"}"#)
+    std::fs::write(nm_runtime.join("package.json"), r#"{"name":"@marisjs/runtime","type":"module","main":"../../../runtime.mjs"}"#)
         .map_err(|e| format!("write runtime package.json: {}", e))?;
 
     // Collect transitive CSS for each page
@@ -389,7 +389,7 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
-    html.push_str("  <script type=\"importmap\">\n  {\n    \"imports\": {\n      \"@maris/runtime\": \"./runtime.mjs\"\n    }\n  }\n  </script>\n");
+    html.push_str("  <script type=\"importmap\">\n  {\n    \"imports\": {\n      \"@marisjs/runtime\": \"./runtime.mjs\"\n    }\n  }\n  </script>\n");
     for css_file in css_files {
         html.push_str(&format!("  <link rel=\"stylesheet\" href=\"{}\">\n", css_file));
     }
@@ -399,7 +399,7 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
     html.push_str("  </div>\n");
     html.push_str("  <script type=\"module\">\n");
     if !client_roots.is_empty() {
-        html.push_str("    import { mount } from '@maris/runtime';\n");
+        html.push_str("    import { mount } from '@marisjs/runtime';\n");
         for (name, path) in client_roots {
             html.push_str(&format!("    import {{ {} }} from '{}';\n", name, path));
         }

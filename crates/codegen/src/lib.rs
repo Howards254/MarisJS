@@ -45,7 +45,7 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
 
     if !imports.is_empty() {
         output.push_str(&format!(
-            "import {{ {} }} from '@maris/runtime';\n\n",
+            "import {{ {} }} from '@marisjs/runtime';\n\n",
             imports.join(", ")
         ));
     }
@@ -138,7 +138,7 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
     }
 
     if has_data {
-        output.push_str("import { data } from '@maris/runtime';\n\n");
+        output.push_str("import { data } from '@marisjs/runtime';\n\n");
     }
 
     let fn_prefix = if has_data { "async " } else { "" };

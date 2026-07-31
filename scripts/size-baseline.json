@@ -1,7 +1,7 @@
 {
   "runtime": {
     "max_bytes": 10000,
-    "note": "Hard ceiling. @maris/runtime source must stay under 10KB unminified."
+    "note": "Hard ceiling. @marisjs/runtime source must stay under 10KB unminified."
   },
   "binaries": {
     "note": "Last-measured release build size per target. CI fails if any binary grows >25% beyond its baseline in a single change. Update this file intentionally when size growth is justified. Entries with null mean 'not yet measured — CI will report the size on next run.'",

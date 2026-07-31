@@ -11,7 +11,7 @@ npm install marisjs
 ```tsx
 // src/Counter.tsx
 // @runsOn client
-import { signal } from '@maris/runtime';
+import { signal } from '@marisjs/runtime';
 
 type Props = {};
 
@@ -46,7 +46,7 @@ A server page is a file under `pages/` with `// @runsOn server`. It imports clie
 ```tsx
 // src/pages/Index.tsx — server page (the route)
 // @runsOn server
-import { data } from '@maris/runtime';
+import { data } from '@marisjs/runtime';
 import { Counter } from '../components/Counter.tsx';
 
 type Props = {};
@@ -65,7 +65,7 @@ export function Index(props: Props) {
 ```tsx
 // src/components/Counter.tsx — client island
 // @runsOn client
-import { signal } from '@maris/runtime';
+import { signal } from '@marisjs/runtime';
 
 type Props = {};
 
@@ -96,7 +96,7 @@ The full grammar spec is shipped with the package at `SPEC.md` — use it as a r
 
 - One component per file. Filename must match the exported component name.
 - Every file begins with `// @runsOn client` or `// @runsOn server`.
-- Reactive state via `signal(initial)` and `computed(() => expr)` from `@maris/runtime`.
+- Reactive state via `signal(initial)` and `computed(() => expr)` from `@marisjs/runtime`.
 - Lists use `<For each={array} key={fn}>{(item) => <li>...</li>}</For>` — no `.map()` in JSX.
 - Props are a single typed parameter (`props: MyType`), never destructured.
 - Named handlers in the component body (`function handleClick() { ... }`), referenced as `onClick={handleClick}`.

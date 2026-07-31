@@ -33,10 +33,10 @@ Concretely, this means:
 
 ```
 npm install marisjs
-npm install @maris/runtime
+npm install @marisjs/runtime
 ```
 
-`marisjs` is the CLI/compiler. `@maris/runtime` is the tiny signals library your compiled
+`marisjs` is the CLI/compiler. `@marisjs/runtime` is the tiny signals library your compiled
 components import at runtime.
 
 ## Quick start
