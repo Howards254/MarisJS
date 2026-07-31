@@ -106,11 +106,11 @@ jobs:
           path: target/${{ matrix.target }}/release/marisjs
           if-no-files-found: error
 
-  # ── macOS x86_64 (Intel, macos-13 runner) ───────────────────────────
+  # ── macOS x86_64 (Intel, macos-15-intel runner) ──────────────────────
 
   build-macos-x86:
     needs: test
-    runs-on: macos-13
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
