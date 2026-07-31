@@ -130,11 +130,11 @@ marisjs ships an [MCP](https://modelcontextprotocol.io/) server so AI coding age
 }
 ```
 
-See `docs/mcp-server.md` in the [repository](https://github.com/anomalyco/marisjs) for build instructions and development setup.
+See `docs/mcp-server.md` in the [repository](https://github.com/howards254/MarisJS) for build instructions and development setup.
 
 ## Example apps
 
-See `examples/` in the [repository](https://github.com/anomalyco/marisjs):
+See `examples/` in the [repository](https://github.com/howards254/MarisJS):
 
 | App | Demonstrates |
 |-----|-------------|
@@ -171,7 +171,7 @@ marisjs is a **strict subset of real TSX** — every valid marisjs file is also 
 
 ## Links
 
-- [Repository](https://github.com/anomalyco/marisjs)
+- [Repository](https://github.com/howards254/MarisJS)
 - [Grammar spec](SPEC.md) (shipped with this package)
-- [MCP server docs](https://github.com/anomalyco/marisjs/blob/main/docs/mcp-server.md)
-- [Benchmark report](https://github.com/anomalyco/marisjs/blob/main/docs/benchmark-report.md)
+- [MCP server docs](https://github.com/howards254/MarisJS/blob/main/docs/mcp-server.md)
+- [Benchmark report](https://github.com/howards254/MarisJS/blob/main/docs/benchmark-report.md)
