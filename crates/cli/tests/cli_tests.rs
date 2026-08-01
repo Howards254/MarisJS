@@ -354,3 +354,98 @@ fn manifest_distinguishes_static_vs_data_pages() {
         }
     }
 }
+
+#[test]
+fn dev_server_serves_image_correct_mime() {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, TcpListener};
+    use std::process::{Command as ProcCommand, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(pages.join("Index.tsx"), concat!(
+        "// @runsOn server\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) { return <div>test</div>; }\n",
+    )).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_marisjs");
+    let out = dir.path().join("dist");
+    let status = ProcCommand::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "build failed: {}", String::from_utf8_lossy(&status.stderr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut child = ProcCommand::new(bin)
+        .arg("dev")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Wait for server to be ready after its initial build
+    let started = Instant::now();
+    let mut ready = false;
+    while started.elapsed() < Duration::from_secs(10) {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_millis(200),
+        ).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(ready, "dev server did not start on port {} within 10s", port);
+
+    // Place images in dist AFTER the initial build completes (build_all wipes dist/)
+    std::fs::write(out.join("logo.png"), b"PNG_PLACEHOLDER").unwrap();
+    std::fs::write(out.join("icon.jpg"), b"JPG_PLACEHOLDER").unwrap();
+    std::fs::write(out.join("favicon.ico"), b"ICO_PLACEHOLDER").unwrap();
+    std::fs::write(out.join("graphic.svg"), b"<svg></svg>").unwrap();
+    std::fs::write(out.join("photo.webp"), b"WEBP_PLACEHOLDER").unwrap();
+
+    let test_cases = [
+        ("/logo.png", "image/png"),
+        ("/icon.jpg", "image/jpeg"),
+        ("/favicon.ico", "image/x-icon"),
+        ("/graphic.svg", "image/svg+xml"),
+        ("/photo.webp", "image/webp"),
+    ];
+
+    for (path, expected_mime) in &test_cases {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let req = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n", path, port);
+        stream.write_all(req.as_bytes()).unwrap();
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+
+        let received = response.lines()
+            .find(|line| line.to_lowercase().starts_with("content-type:"))
+            .map(|line| line.split(':').nth(1).unwrap_or("").trim().to_string())
+            .unwrap_or_default();
+
+        assert_eq!(received, *expected_mime,
+            "path {:?} should have Content-Type {:?}, got: {:?}",
+            path, expected_mime, received);
+    }
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}

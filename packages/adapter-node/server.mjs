@@ -19,6 +19,13 @@ const mimeTypes = {
   '.js': 'application/javascript',
   '.css': 'text/css',
   '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
 };
 
 const routeMap = new Map(manifest.routes.map(r => [r.path, r]));

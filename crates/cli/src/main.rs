@@ -688,6 +688,23 @@ fn start_file_watcher(source_dir: std::path::PathBuf, tx: mpsc::Sender<()>) -> R
     Ok(())
 }
 
+fn mime_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "html" => "text/html",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "css" => "text/css",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "text/plain",
+    }
+}
+
+
 fn handle_http(out_dir: &Path, routes: &HashMap<String, String>, stream: &mut std::net::TcpStream) {
     let mut buf = [0u8; 2048];
     let n = stream.read(&mut buf).unwrap_or(0);
@@ -718,7 +735,7 @@ fn handle_http(out_dir: &Path, routes: &HashMap<String, String>, stream: &mut st
             match std::fs::read(&file_path) {
                 Ok(content) => {
                     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                    let mime = match ext { "html" => "text/html", "js"|"mjs" => "application/javascript", "json" => "application/json", "css" => "text/css", _ => "text/plain" };
+                    let mime = mime_for_ext(ext);
                     let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n", mime, content.len());
                     let _ = stream.write_all(resp.as_bytes());
                     let _ = stream.write_all(&content);
@@ -729,5 +746,37 @@ fn handle_http(out_dir: &Path, routes: &HashMap<String, String>, stream: &mut st
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::mime_for_ext;
+
+    #[test]
+    fn known_mime_types() {
+        assert_eq!(mime_for_ext("html"), "text/html");
+        assert_eq!(mime_for_ext("js"), "application/javascript");
+        assert_eq!(mime_for_ext("mjs"), "application/javascript");
+        assert_eq!(mime_for_ext("json"), "application/json");
+        assert_eq!(mime_for_ext("css"), "text/css");
+    }
+
+    #[test]
+    fn image_mime_types() {
+        assert_eq!(mime_for_ext("png"), "image/png");
+        assert_eq!(mime_for_ext("jpg"), "image/jpeg");
+        assert_eq!(mime_for_ext("jpeg"), "image/jpeg");
+        assert_eq!(mime_for_ext("svg"), "image/svg+xml");
+        assert_eq!(mime_for_ext("ico"), "image/x-icon");
+        assert_eq!(mime_for_ext("webp"), "image/webp");
+        assert_eq!(mime_for_ext("gif"), "image/gif");
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_to_text_plain() {
+        assert_eq!(mime_for_ext("wasm"), "text/plain");
+        assert_eq!(mime_for_ext("woff2"), "text/plain");
+        assert_eq!(mime_for_ext(""), "text/plain");
     }
 }
