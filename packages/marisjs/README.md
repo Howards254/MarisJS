@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/howards254/MarisJS/main/assets/logo.svg" alt="marisjs" width="220">
+</p>
+
 # marisjs
 
 A strict-subset reactive component framework. Write TSX components in a small, machine-checkable language — the compiler validates every rule before generating code, so errors surface at build time, not runtime. Built-in reactivity via signals, computed values, and effects. Server-side data loading with `data()`. Client-side islands with `@runsOn client`.

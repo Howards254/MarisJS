@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="marisjs" width="220">
+</p>
+
 # marisjs
 
 A strict, signals-based, AI-agent-oriented full-stack framework for the web.
