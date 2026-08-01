@@ -86,16 +86,80 @@ import type { CartProps } from "./types";
 
 **Runtime behavior:**
 
-- CSS is **globally scoped** — the stylesheet is loaded into the document's global style
-  scope with no class-name rewriting, no CSS Modules-style collision protection, no
-  Shadow DOM encapsulation. This means selectors like `.cart` or `button` affect every
-  matching element in the document, not just those rendered by the importing component.
+- CSS is **globally scoped** — meaning its cascade semantics: the stylesheet is loaded
+  into the document's global style scope with no class-name rewriting, no CSS
+  Modules-style collision protection, no Shadow DOM encapsulation. This means selectors
+  like `.cart` or `button` affect every matching element in the document, not just those
+  rendered by the importing component. (**This is a different meaning of "global" than
+  "a site-wide shared stylesheet"** — "globally scoped" here refers to CSS cascade
+  behavior (no per-component scope isolation), NOT to whether a `.css` file is included
+  on every page. The pattern for a single CSS file loaded on all pages is the site-wide
+  stylesheet convention described immediately below.)
   This is a known, deliberate v1 limitation: it keeps the runtime simple (the compiler
   copies the `.css` file verbatim to the output directory with no transformation). A future
   phase may add scoping if collisions become a real debugging burden in practice.
   Until then, the recommended convention is to prefix class names with the component name
   (e.g. `.Cart-header` rather than `.header`), but this is not enforced by any validator
-  rule — two components using the same class name will silently collide at runtime.
+  rule   — two components using the same class name will silently collide at runtime.
+
+**Site-wide stylesheet convention:**
+
+The CSS pipeline collects stylesheets per-page by walking the component dependency tree
+(§2a, build-time step). For a single `.css` file shared across every page — resets,
+typography, layout utilities — the pattern is a `Layout` component that every page
+renders:
+
+```tsx
+// src/components/Layout.tsx
+// @runsOn client
+import "./styles.css";   // shared site-wide CSS
+
+type LayoutProps = {};
+
+export function Layout(props: LayoutProps) {
+  return <nav>/* shared header, footer, etc. */</nav>;
+}
+```
+
+```tsx
+// src/pages/Index.tsx
+// @runsOn server
+import { Layout } from '../components/Layout';
+
+type IndexProps = {};
+
+export function Index(props: IndexProps) {
+  return (
+    <div>
+      <Layout client:hydrate />
+      <h1>Home</h1>
+    </div>
+  );
+}
+```
+
+Because `Index`'s render tree contains `<Layout>`, the compiler walks into `Layout.tsx`,
+finds `import "./styles.css"`, and includes `<link rel="stylesheet" href=".../styles.css">`
+in the generated HTML. Every page that renders `<Layout>` gets the same CSS file in its
+output — there is nothing else to configure.
+
+**Rules and caveats:**
+
+- The Layout must be `@runsOn client` because CSS imports are a validation error in
+  `@runsOn server` files (§2a).
+- In page files, the Layout must be marked `client:hydrate` so the SSR prerender step
+  skips it (client-side DOM code like `document.createElement` would crash Node.js during
+  prerender). The CSS import metadata is still collected — the `collect_component_imports`
+  and `collect_css_recursive` pipeline does not execute the component; it only reads the
+  import declarations.
+- There is no framework-level `children` slot or `<slot>` mechanism. The Layout is
+  rendered as a sibling to page content in the server page's JSX. Shared page chrome
+  (nav, footer) lives inside the Layout component's own JSX. A page that needs to pass
+  content through a Layout should do so via typed props — e.g., `Layout({ content: ... })`.
+- This is a **convention**, not a framework feature. There is no `<Layout>` built-in
+  component, no special `<slot>` syntax, and no automatic global-stylesheet injection.
+  The pattern works because the CSS collection walk is transitive and name-based — any
+  component tag in the render tree triggers an import look-up and CSS collection.
 
 
 ### 2b. File-Based Routing
@@ -121,6 +185,44 @@ directory tree maps directly to URL routes:
 - Pages are pre-rendered to static HTML during `marisjs build` by invoking the server
   component via Node.js. The generated HTML includes an import map so browser-side code
   resolves `@marisjs/runtime` to `./runtime.mjs` without any `node_modules` dependency.
+
+**Page metadata (`<head>` content):**
+
+A server page declares page-level metadata by assigning a raw HTML string to a `const head`
+at the top of the component body (in the derived-const section, per Section 3 statement
+ordering rules). The string is injected verbatim into the built page's `<head>`, alongside
+the import map and any CSS `<link>` tags the page's component tree requires:
+
+```tsx
+// @runsOn server
+type IndexProps = {};
+
+export function Index(props: IndexProps) {
+  const head = '<title>My Page</title><meta name="description" content="About marisjs"><meta name="viewport" content="width=device-width, initial-scale=1">';
+  return (
+    <div>
+      <h1>Hello</h1>
+    </div>
+  );
+}
+```
+
+**Rules:**
+
+- The name is fixed: `head`. A server page declaring `const head` gets `head` in its
+  compiled return value (`{ html, head, clientBundles }`), and the prerender step injects
+  it between the existing `<head>` tags of the generated HTML.
+- `head` is a **raw HTML string** — the framework does not parse, validate, escape, or
+  transform it. It is inserted verbatim. Use it for `<title>`, `<meta>` tags, `<link
+  rel="icon">`, Open Graph tags, structured data, or any other `<head>` content.
+- It must be a string literal (or a const that evaluates to a string). It must appear in
+  the derived-const section: before any event handlers, per the standard ordering rules.
+- This is the sanctioned pattern for page metadata in v1. `<Title>`/`<Meta>`/`<Head>`
+  convenience components are deliberately not provided — raw strings keep the language
+  subset small and machine-checkable.
+- If the page declares no `head` const, the `<head>` contains only the import map and the
+  page's CSS links (as before). A `head` const on a `@runsOn client` file has no special
+  meaning — it is an ordinary derived const.
 
 ---
 

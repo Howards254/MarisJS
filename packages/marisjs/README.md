@@ -3,33 +3,48 @@
 A strict-subset reactive component framework. Write TSX components in a small, machine-checkable language — the compiler validates every rule before generating code, so errors surface at build time, not runtime. Built-in reactivity via signals, computed values, and effects. Server-side data loading with `data()`. Client-side islands with `@runsOn client`.
 
 ```bash
-npm install marisjs
+npm install marisjs @marisjs/runtime
 ```
 
 ## Quick start
 
-```tsx
-// src/Counter.tsx
-// @runsOn client
-import { signal } from '@marisjs/runtime';
+```bash
+marisjs init
+# writes a starter package.json with dev/build scripts
+mkdir -p src/pages
+```
 
+```tsx
+// src/pages/Index.tsx
+// @runsOn server
 type Props = {};
 
-export function Counter(props: Props) {
-  const count = signal(0);
+export function Index(props: Props) {
   return (
     <div>
-      <p>Count: {count.value}</p>
-      <button onClick={() => count.set(count.value + 1)}>+</button>
+      <h1>Hello, marisjs!</h1>
     </div>
   );
 }
 ```
 
 ```bash
-marisjs dev ./src --out dist
+marisjs dev
 # -> http://localhost:3000
 ```
+
+Zero-config defaults: `src/` is the source directory, `dist/` the output. Pass a
+source path and/or `--out <dir>` to override. After `marisjs init`, your daily
+commands are just:
+
+```bash
+npm run dev
+npm run build
+npm run serve
+```
+
+`npm run serve` runs `@marisjs/adapter-node` to preview the finished output with
+clean URLs at http://localhost:3000.
 
 ## File structure & routing
 
@@ -86,9 +101,25 @@ On first build the server page is pre-rendered to static HTML. Client islands ar
 
 | Command | Description |
 |---------|-------------|
-| `marisjs dev ./src --out dist` | Dev server with hot reload on file change |
-| `marisjs build ./src --out dist` | Compile source directory to static output |
+| `marisjs dev` | Dev server with hot reload on file change (defaults: `src/` → `dist/`) |
+| `marisjs build` | Compile source directory to static output (defaults: `src/` → `dist/`) |
+| `marisjs init` | Scaffold a starter `package.json` with `dev`/`build`/`serve` scripts |
 | `marisjs validate ./src/App.tsx` | Check a single file for errors |
+
+## Adapters
+
+`marisjs build` produces a `dist/` directory that any adapter can turn into a running
+deployment. Two adapters ship in the `@marisjs` org — install (or `npx`) whichever fits:
+
+| Adapter | What it does | Usage |
+|---------|--------------|-------|
+| `@marisjs/adapter-node` | Plain Node.js HTTP server. Serves static routes from disk, re-executes `data()` routes per request. Clean URL routing, no framework dependencies. | `npx @marisjs/adapter-node ./dist` |
+| `@marisjs/adapter-static` | Produces a clean static-only output directory (no `node_modules`, no server modules) for any static host: S3, GitHub Pages, Cloudflare Pages, CDNs. Fails loudly if any route requires a server. | `npx @marisjs/adapter-static ./dist ./out` |
+
+The adapter contract is documented in
+[`docs/adapter-interface.md`](https://github.com/howards254/MarisJS/blob/main/docs/adapter-interface.md),
+with a walkthrough for writing your own in
+[`docs/writing-an-adapter.md`](https://github.com/howards254/MarisJS/blob/main/docs/writing-an-adapter.md).
 
 ## Language rules
 

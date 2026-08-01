@@ -42,16 +42,25 @@ components import at runtime.
 ## Quick start
 
 ```
-marisjs dev ./src
+marisjs dev
 ```
 
-Starts a local dev server, builds your project, and rebuilds on save.
+Starts a local dev server, builds your project, and rebuilds on save. `src/` and `dist/`
+are the defaults — pass a source path and/or `--out <dir>` for a non-standard layout.
 
 ```
-marisjs build ./src --out dist
+marisjs build
 ```
 
-Produces a static, deployable output directory.
+Produces a static, deployable output directory in `dist/`.
+
+```
+npx @marisjs/adapter-node ./dist
+```
+
+Serves the finished output with clean URLs at http://localhost:3000 — for previewing
+locally or running anywhere Node.js exists. (`@marisjs/adapter-static` produces a plain
+static directory instead, for CDNs and static hosts.)
 
 ```
 marisjs validate ./src/MyComponent.tsx
@@ -148,8 +157,9 @@ on page load.
 
 | Command | Description |
 |---------|-------------|
-| `marisjs dev ./src --out dist` | Dev server with hot reload on file change |
-| `marisjs build ./src --out dist` | Compile source directory to static output |
+| `marisjs dev` | Dev server with hot reload on file change (defaults: `src/` → `dist/`) |
+| `marisjs build` | Compile source directory to static output (defaults: `src/` → `dist/`) |
+| `marisjs init` | Scaffold a starter `package.json` with `dev`/`build` scripts |
 | `marisjs validate ./src/App.tsx` | Check a single file for errors |
 
 ## Language rules
@@ -201,8 +211,8 @@ See [`docs/mcp-server.md`](docs/mcp-server.md) for build instructions and develo
 
 | Adapter | Package | Description |
 |---------|---------|-------------|
-| Node.js server | `@marisjs/adapter-node` | Zero-dependency HTTP server. Re-executes server routes per request, serves static routes from disk. |
-| Static output | `@marisjs/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error if any route requires server execution. |
+| Node.js server | `@marisjs/adapter-node` | Zero-dependency HTTP server. Re-executes server routes per request, serves static routes from disk. `npx @marisjs/adapter-node ./dist` |
+| Static output | `@marisjs/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error if any route requires server execution. `npx @marisjs/adapter-static ./dist ./out` |
 
 See [`docs/adapter-interface.md`](docs/adapter-interface.md) for the adapter contract, and
 [`docs/writing-an-adapter.md`](docs/writing-an-adapter.md) for a walkthrough on writing your own.

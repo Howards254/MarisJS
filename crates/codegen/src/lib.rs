@@ -127,6 +127,15 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
     let has_data = component.has_data_call;
     let hydrates = collect_hydrate_roots(render_tree);
 
+    // A server page may declare `const head = '...'` (raw HTML injected into the
+    // built page's <head>). Codegen includes it in the return object as `head`.
+    let has_head = component.derived_consts.iter().any(|line| {
+        let t = line.trim_start();
+        t.strip_prefix("const")
+            .map(|rest| rest.trim_start().split([' ', '=']).next().unwrap_or("") == "head")
+            .unwrap_or(false)
+    });
+
     let mut output = String::new();
 
     let comp_imports = collect_component_imports(render_tree, &component.imports);
@@ -168,7 +177,7 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
         output.push_str("  // data() resolution (v1: direct await)\n");
     }
 
-    if hydrates.is_empty() {
+    if hydrates.is_empty() && !has_head {
         output.push_str("  return ");
         gen_html_node(render_tree, &mut output, has_data)?;
         output.push_str(";\n");
@@ -176,7 +185,11 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
         output.push_str("  const _html = ");
         gen_html_node(render_tree, &mut output, has_data)?;
         output.push_str(";\n");
-        output.push_str("  return { html: _html, clientBundles: [");
+        output.push_str("  return { html: _html");
+        if has_head {
+            output.push_str(", head: head");
+        }
+        output.push_str(", clientBundles: [");
         let names: Vec<String> = hydrates.iter().map(|h| format!("'./{}.js'", h)).collect();
         output.push_str(&names.join(", "));
         output.push_str("] };\n");

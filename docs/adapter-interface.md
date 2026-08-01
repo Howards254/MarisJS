@@ -22,7 +22,7 @@ bounded pieces of work written against this interface — they do not define it.
 
 ## 1. Build output layout
 
-After `marisjs build ./src --out dist`, the output directory contains:
+After `marisjs build`, the output directory contains:
 
 ```
 dist/

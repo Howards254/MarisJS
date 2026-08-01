@@ -5,7 +5,7 @@ process. The output directory can be deployed to any static host.
 
 ```bash
 npm install @marisjs/adapter-static
-npx marisjs-static ./dist ./static-out
+npx @marisjs/adapter-static ./dist ./static-out
 ```
 
 ## What it does
@@ -30,8 +30,10 @@ npx marisjs-static ./dist ./static-out
 ## Usage
 
 ```
-marisjs-static <input-dist> <output-dir>
+npx @marisjs/adapter-static <input-dist> <output-dir>
 ```
+
+After installation the same tool is on your PATH as `marisjs-static`.
 
 | Argument | Description |
 |----------|-------------|

@@ -42,16 +42,25 @@ components import at runtime.
 ## Quick start
 
 ```
-marisjs dev ./src
+marisjs dev
 ```
 
-Starts a local dev server, builds your project, and rebuilds on save.
+Starts a local dev server, builds your project, and rebuilds on save. `src/` and `dist/`
+are the defaults — pass a source path and/or `--out <dir>` for a non-standard layout.
 
 ```
-marisjs build ./src --out dist
+marisjs build
 ```
 
-Produces a static, deployable output directory.
+Produces a static, deployable output directory in `dist/`.
+
+```
+npx @marisjs/adapter-node ./dist
+```
+
+Serves the finished output with clean URLs at http://localhost:3000 — for previewing
+locally or running anywhere Node.js exists. (`@marisjs/adapter-static` produces a plain
+static directory instead, for CDNs and static hosts.)
 
 ```
 marisjs validate ./src/MyComponent.tsx
@@ -107,8 +116,9 @@ complete language reference.
 
 Being upfront about this matters more than sounding finished:
 
-- **No deployment adapters yet.** You can build a `dist/` folder; there's no automated path to
-  Vercel, Netlify, or any other host yet.
+- **No platform-specific deployment adapters yet.** `@marisjs/adapter-node` serves the
+  build output anywhere Node.js runs, and `@marisjs/adapter-static` produces a plain static
+  directory for any static host; Vercel/Netlify-specific adapters are future work.
 - **No CSS scoping.** Styles are global — two components using the same class name will
   silently collide. See the spec's Section 2a for the recommended (unenforced) naming
   convention.

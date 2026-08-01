@@ -24,17 +24,21 @@ struct Cli {
 enum Command {
     Validate { file: String },
     Build {
+        #[arg(default_value = "src")]
         source: String,
         #[arg(long, default_value = "dist")]
         out: String,
     },
     Dev {
+        #[arg(default_value = "src")]
         source: String,
         #[arg(long, default_value = "dist")]
         out: String,
         #[arg(long, default_value = "3000")]
         port: u16,
     },
+    #[command(about = "Scaffold a starter package.json with dev/build/serve scripts")]
+    Init,
 }
 
 #[derive(Serialize)]
@@ -89,15 +93,57 @@ fn main() {
                 eprintln!("dev error: {}", e); std::process::exit(1);
             }
         }
+        Command::Init => {
+            if let Err(e) = run_init() {
+                eprintln!("init error: {}", e); std::process::exit(1);
+            }
+        }
     }
+}
+
+// ── init ────────────────────────────────────────────────────────────────
+
+fn run_init() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {}", e))?;
+    let pkg_path = cwd.join("package.json");
+    if pkg_path.exists() {
+        return Err(format!("package.json already exists at {}", pkg_path.display()));
+    }
+
+    let name = cwd.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase().replace([' ', '_'], "-"))
+        .unwrap_or_else(|| "marisjs-app".to_string());
+
+    let pkg = format!(
+        r#"{{
+  "name": {},
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {{
+    "dev": "marisjs dev",
+    "build": "marisjs build",
+    "serve": "npx @marisjs/adapter-node ./dist"
+  }}
+}}
+"#,
+        serde_json::to_string(&name).map_err(|e| format!("json name: {}", e))?
+    );
+    std::fs::write(&pkg_path, pkg).map_err(|e| format!("write package.json: {}", e))?;
+    eprintln!("  wrote package.json");
+    eprintln!("  next: mkdir -p src/pages && npm run dev");
+    Ok(())
 }
 
 // ── build ──────────────────────────────────────────────────────────────
 
 fn build_all(source: &str, out: &str) -> Result<usize, String> {
     let source_dir = Path::new(source);
+    if !source_dir.exists() {
+        return Err(format!("directory '{}' does not exist (run `marisjs init` to scaffold, or pass a source path)", source));
+    }
     if !source_dir.is_dir() { return Err(format!("'{}' is not a directory", source)); }
-    if !source_dir.exists() { return Err(format!("directory '{}' does not exist", source)); }
 
     let mut count = 0usize;
     let out_dir = Path::new(out);
@@ -385,11 +431,16 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
         None
     };
 
-    let Some(html_content) = server_html else { return Ok(None); };
+    let Some((html_content, head_content)) = server_html else { return Ok(None); };
 
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
     html.push_str("  <script type=\"importmap\">\n  {\n    \"imports\": {\n      \"@marisjs/runtime\": \"./runtime.mjs\"\n    }\n  }\n  </script>\n");
+    if let Some(head) = head_content {
+        for line in head.lines() {
+            html.push_str(&format!("  {}\n", line));
+        }
+    }
     for css_file in css_files {
         html.push_str(&format!("  <link rel=\"stylesheet\" href=\"{}\">\n", css_file));
     }
@@ -437,7 +488,7 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
-fn prerender_with_node(_out_dir: &Path, mjs_path: &Path) -> Result<String, String> {
+fn prerender_with_node(_out_dir: &Path, mjs_path: &Path) -> Result<(String, Option<String>), String> {
     let abs = std::fs::canonicalize(mjs_path).map_err(|e| format!("canonicalize: {}", e))?;
     let abs_str = abs.to_str().ok_or("invalid path")?;
 
@@ -472,19 +523,20 @@ fn prerender_with_node(_out_dir: &Path, mjs_path: &Path) -> Result<String, Strin
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
-    if trimmed.is_empty() { return Ok(String::new()); }
+    if trimmed.is_empty() { return Ok((String::new(), None)); }
 
-    // Parse as JSON — the server component returns { html, clientBundles } or a plain string
+    // Parse as JSON — the server component returns { html, head, clientBundles } or a plain string
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
         if let Some(html) = val.get("html").and_then(|v| v.as_str()) {
-            return Ok(html.to_string());
+            let head = val.get("head").and_then(|v| v.as_str()).map(|s| s.to_string());
+            return Ok((html.to_string(), head));
         }
         if let Some(s) = val.as_str() {
-            return Ok(s.to_string());
+            return Ok((s.to_string(), None));
         }
     }
     // Not JSON? Treat as raw HTML string
-    Ok(trimmed.to_string())
+    Ok((trimmed.to_string(), None))
 }
 
 // ── routes manifest ────────────────────────────────────────────────────

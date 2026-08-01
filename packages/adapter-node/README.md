@@ -4,9 +4,8 @@ A plain Node.js HTTP server for marisjs build output. Zero framework dependencie
 
 ```bash
 npm install @marisjs/adapter-node
-npx marisjs-serve ./dist          # serve the build output
-npx marisjs-serve ./dist --port 8080  # custom port via PORT= env
-PORT=8080 npx marisjs-serve ./dist
+npx @marisjs/adapter-node ./dist      # serve the build output
+PORT=8080 npx @marisjs/adapter-node ./dist  # custom port via PORT= env
 ```
 
 ## What it does
@@ -20,8 +19,10 @@ PORT=8080 npx marisjs-serve ./dist
 ## Usage
 
 ```
-marisjs-serve <dist-directory>
+npx @marisjs/adapter-node <dist-directory>
 ```
+
+After installation the same server is on your PATH as `marisjs-serve`.
 
 | Argument | Default | Description |
 |----------|---------|-------------|

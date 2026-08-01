@@ -232,6 +232,8 @@ jobs:
             packages/marisjs-win32-x64
             packages/marisjs
             packages/runtime
+            packages/adapter-node
+            packages/adapter-static
           )
 
           errors=()
@@ -252,7 +254,7 @@ jobs:
             exit 1
           fi
 
-          echo "All 7 packages agree on version ${TAG_VERSION:-consistent}."
+          echo "All 9 packages agree on version ${TAG_VERSION:-consistent}."
 
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
@@ -288,6 +290,10 @@ jobs:
       # publish, publishing in dependency order avoids confusing transient
       # resolution errors on the registry side.
       #
+      # Adapters (@marisjs/adapter-node, @marisjs/adapter-static) go last —
+      # they are independent packages with no inter-dependencies and no
+      # consumer depends on them being live before anything else.
+      #
       # Each publish step uses scripts/publish-safe.sh, which is
       # idempotent: if npm returns "previously published versions" (HTTP
       # 403 / E403 / EPUBLISHCONFLICT), the step logs a warning and
@@ -316,6 +322,12 @@ jobs:
       - name: Publish @marisjs/runtime
         run: bash scripts/publish-safe.sh packages/runtime "${{ steps.mode.outputs.flag }}"
 
+      - name: Publish @marisjs/adapter-node
+        run: bash scripts/publish-safe.sh packages/adapter-node "${{ steps.mode.outputs.flag }}"
+
+      - name: Publish @marisjs/adapter-static
+        run: bash scripts/publish-safe.sh packages/adapter-static "${{ steps.mode.outputs.flag }}"
+
       - name: Summary
         run: |
           DRY="${{ steps.mode.outputs.flag }}"
@@ -324,5 +336,5 @@ jobs:
             echo "To publish for real: push a 'v*' tag, or re-run workflow_dispatch"
             echo "with dry_run: false and wait for the npm-release environment approval."
           else
-            echo "PUBLISH COMPLETE — all 7 packages published to npm."
+            echo "PUBLISH COMPLETE — all 9 packages published to npm."
           fi

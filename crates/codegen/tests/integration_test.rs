@@ -1582,6 +1582,136 @@ fn transitive_css_collected_and_linked_in_page_html() {
     assert!(out_dir.join("components/Base.css").exists(), "Base.css should be copied to out dir");
     assert!(out_dir.join("components/Override.css").exists(), "Override.css should be copied to out dir");
 }
+
+#[test]
+fn page_head_meta_is_injected_into_built_html() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let page_fixture = concat!(
+        "// @runsOn server\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  const head = '<title>My Page</title><meta name=\"description\" content=\"A test page\">';\n",
+        "  return (<div class=\"page\"><h1>Meta test</h1></div>);\n",
+        "}\n",
+    );
+    let page_path = pages_dir.join("Index.tsx");
+    std::fs::write(&page_path, page_fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    if !status.status.success() {
+        panic!("build failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
+
+    let html = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+
+    let head_start = html.find("<head>").expect("page should have a <head>");
+    let head_end = html.find("</head>").expect("page should have a </head>");
+    let head = &html[head_start..head_end];
+
+    assert!(
+        head.contains("<title>My Page</title>"),
+        "built <head> should contain the page title, got: {}",
+        head
+    );
+    assert!(
+        head.contains("<meta name=\"description\" content=\"A test page\">"),
+        "built <head> should contain the page meta description, got: {}",
+        head
+    );
+
+    assert!(html.contains("<h1>Meta test</h1>"), "body should still contain the rendered page");
+}
+
+#[test]
+fn page_head_meta_works_with_hydrate_islands() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components_dir = dir.path().join("components");
+    std::fs::create_dir(&components_dir).unwrap();
+    let widget_fixture = concat!(
+        "// @runsOn client\n",
+        "type WidgetProps = { label: string };\n",
+        "export function Widget(props: WidgetProps) {\n",
+        "  return <button>{props.label}</button>;\n",
+        "}\n",
+    );
+    std::fs::write(components_dir.join("Widget.tsx"), widget_fixture).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let page_fixture = concat!(
+        "// @runsOn server\n",
+        "import { Widget } from '../components/Widget';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  const head = '<title>Hybrid</title><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">';\n",
+        "  return (<div><Widget label=\"Go\" client:hydrate /></div>);\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), page_fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    if !status.status.success() {
+        panic!("build failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
+
+    let html = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+
+    let head_start = html.find("<head>").expect("page should have a <head>");
+    let head_end = html.find("</head>").expect("page should have a </head>");
+    let head = &html[head_start..head_end];
+
+    assert!(
+        head.contains("<title>Hybrid</title>"),
+        "built <head> should contain the page title, got: {}",
+        head
+    );
+    assert!(
+        head.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"),
+        "built <head> should contain the viewport meta, got: {}",
+        head
+    );
+
+    let mjs = std::fs::read_to_string(out_dir.join("pages/Index.mjs")).unwrap();
+    assert!(
+        mjs.contains("head: head"),
+        "compiled page should return the head key, got: {}",
+        mjs
+    );
+    assert!(
+        mjs.contains("clientBundles"),
+        "compiled page should still return clientBundles, got: {}",
+        mjs
+    );
+
+    assert!(
+        html.contains("data-hydrate=\"Widget\""),
+        "hydrate root should still be present"
+    );
+}
 #[test]
 fn destructured_arrow_param_in_handler() {
     let fixture = concat!(
