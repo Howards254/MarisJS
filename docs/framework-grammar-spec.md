@@ -508,6 +508,56 @@ objects to CSS strings at compile time, or (b) add a validator check that reject
 style syntax with a clear error directing users to use string styles
 (`style="background:red;padding:1rem"`).
 
+**#7 — Island props not serialized (severity: high-priority candidate)**
+
+`client:hydrate` islands always receive an empty props object `{}` at the mount call site,
+regardless of what the server page passes in JSX. A server page writing
+`<Widget label="Go" client:hydrate />` has the `label` prop silently dropped — the
+compiled mount call is `mount(..., () => Widget({}))`. This affects every `client:hydrate`
+island unconditionally, not a subset of cases. There is no workaround other than
+avoiding server-passed props entirely (all data must be fetched independently on the
+client side).
+
+**Minimal reproduction:**
+
+```tsx
+// components/Widget.tsx
+// @runsOn client
+type WidgetProps = { label: string };
+export function Widget(props: WidgetProps) {
+  return <span>{props.label}</span>;
+}
+```
+
+```tsx
+// pages/Index.tsx
+// @runsOn server
+import { Widget } from '../components/Widget';
+
+export function Index(props: IndexProps) {
+  const message = await data(async () => 'Hello from server');
+  return <Widget label={message} client:hydrate />;
+}
+```
+
+The server prerender emits `<div data-hydrate="Widget"></div>` (not the rendered
+component), and the client mount calls `Widget({})` — the `label` prop is lost.
+The hydrated island renders with `props.label === undefined`.
+
+**Impact:** server/client data composition — the primary pattern for passing
+server-fetched data into interactive components — does not work. Every
+`client:hydrate` island must be entirely self-contained today. This is a real
+limitation on practical composition; fixing it would unlock server-driven
+island initialization.
+
+**Fix candidates:** (a) generate the mount call with the actual props expression
+from the server source, serializing scalar props to JSON-embeddable literals;
+(b) JSON-serialize all props into a `<script type="application/json">` block
+in the HTML shell and deserialize at mount time; (c) mark the gap as
+unresolvable in v1 and document it as a language rule (server pages may not
+pass non-empty props to `client:hydrate` islands) until a broader hydration
+overhaul in Layer 2.
+
 **#1 (resolved 2026-07-28) — Block-bodied For arrows now fully supported**
 Parser fix: `extract_arrow_body_jsx` walks block statements to find the return JSX
 and captures preceding function/const declarations via `span_to_snippet`. Codegen fix:

@@ -6,11 +6,11 @@
   "binaries": {
     "note": "Last-measured release build size per target. CI fails if any binary grows >25% beyond its baseline in a single change. Update this file intentionally when size growth is justified. Entries with null mean 'not yet measured — CI will report the size on next run.'",
     "growth_max_percent": 25,
-    "x86_64-unknown-linux-gnu": 5025816,
-    "aarch64-unknown-linux-gnu": 4700000,
     "x86_64-apple-darwin": null,
     "aarch64-apple-darwin": null,
     "x86_64-pc-windows-msvc": null,
-    "x86_64-pc-windows-gnu": 6745600
+    "x86_64-pc-windows-gnu": 6745600,
+    "x86_64-unknown-linux-musl": 5178584,
+    "aarch64-unknown-linux-musl": 4700000
   }
 }

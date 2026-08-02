@@ -1,6 +1,6 @@
 {
   "name": "@marisjs/adapter-static",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Produces a fully static deployment from marisjs build output — no server required",
   "type": "module",
   "bin": {

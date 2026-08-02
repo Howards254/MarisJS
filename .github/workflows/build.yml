@@ -44,7 +44,7 @@ jobs:
       - name: Size check — @marisjs/runtime
         run: bash scripts/check-sizes.sh --runtime
 
-  # ── Linux: native x86_64 + cross-compiled aarch64 via QEMU ──────────
+  # ── Linux: x86_64 musl + cross-compiled aarch64 musl (static) ────────
 
   build-linux:
     needs: test
@@ -52,8 +52,8 @@ jobs:
     strategy:
       matrix:
         target:
-          - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
@@ -62,40 +62,54 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Set up QEMU for aarch64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@v3
-
       - name: Install aarch64 cross-compiler
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build (native x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      # x86_64-musl: native gcc + rust-lld, fully static
+      - name: Build (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
-      - name: Verify (native x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      # Run full test suite against musl-compiled test bins (unit + integration)
+      - name: Test (x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo test --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+
+      # aarch64-musl: cross gcc + rust-lld, fully static (no QEMU needed)
+      - name: Build (aarch64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+
+      - name: Verify static linking + version (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
+          ldd ./target/${{ matrix.target }}/release/marisjs 2>&1 | grep -q "statically linked" || { ldd ./target/${{ matrix.target }}/release/marisjs; echo "ERROR: binary is not statically linked"; exit 1; }
+          file ./target/${{ matrix.target }}/release/marisjs | grep -q "static" || { file ./target/${{ matrix.target }}/release/marisjs; echo "ERROR: binary is not static"; exit 1; }
+          echo "Binary is statically linked ✓"
           ./target/${{ matrix.target }}/release/marisjs --version
           ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
 
-      - name: Verify (aarch64 inside ARM64 container)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Verify static + version (aarch64 in ARM64 container)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         uses: uraimo/run-on-arch-action@v3
         with:
           arch: aarch64
           distro: ubuntu24.04
           run: |
-            chmod +x ./target/aarch64-unknown-linux-gnu/release/marisjs
-            ./target/aarch64-unknown-linux-gnu/release/marisjs --version
-            ./target/aarch64-unknown-linux-gnu/release/marisjs --version | grep -q '^marisjs '
+            chmod +x ./target/aarch64-unknown-linux-musl/release/marisjs
+            ldd ./target/aarch64-unknown-linux-musl/release/marisjs 2>&1 | grep -q "statically linked" || { ldd ./target/aarch64-unknown-linux-musl/release/marisjs; echo "ERROR: binary is not statically linked"; exit 1; }
+            echo "Binary is statically linked ✓"
+            ./target/aarch64-unknown-linux-musl/release/marisjs --version
+            ./target/aarch64-unknown-linux-musl/release/marisjs --version | grep -q '^marisjs '
 
       - name: Size check
         run: bash scripts/check-sizes.sh --binary ./target/${{ matrix.target }}/release/marisjs ${{ matrix.target }}
@@ -269,8 +283,8 @@ jobs:
           mkdir -p packages/marisjs-darwin-arm64/bin
           mkdir -p packages/marisjs-win32-x64/bin
 
-          cp marisjs-x86_64-unknown-linux-gnu/marisjs  packages/marisjs-linux-x64/bin/marisjs
-          cp marisjs-aarch64-unknown-linux-gnu/marisjs packages/marisjs-linux-arm64/bin/marisjs
+          cp marisjs-x86_64-unknown-linux-musl/marisjs  packages/marisjs-linux-x64/bin/marisjs
+          cp marisjs-aarch64-unknown-linux-musl/marisjs packages/marisjs-linux-arm64/bin/marisjs
           cp marisjs-x86_64-apple-darwin/marisjs          packages/marisjs-darwin-x64/bin/marisjs
           cp marisjs-aarch64-apple-darwin/marisjs         packages/marisjs-darwin-arm64/bin/marisjs
           cp marisjs-x86_64-pc-windows-msvc/marisjs.exe   packages/marisjs-win32-x64/bin/marisjs.exe

@@ -1798,6 +1798,123 @@ fn hydrate_islands_target_correct_data_hydrate_placeholder() {
 }
 
 #[test]
+fn hydrate_islands_verified_by_playwright_dom_positions() {
+    // This test requires `npx playwright` to be available (devDependency).
+    // If Playwright isn't installed, skip without failing — the static codegen
+    // test above (hydrate_islands_target_correct_data_hydrate_placeholder)
+    // still guards the fix at the code-generation level.
+    let playwright_available = std::process::Command::new("npx")
+        .arg("playwright")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !playwright_available {
+        eprintln!("SKIP: playwright not installed — skipping real-browser DOM test");
+        return;
+    }
+
+    // Build the same fixture used by the static test above
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components_dir = dir.path().join("components");
+    std::fs::create_dir(&components_dir).unwrap();
+    std::fs::write(components_dir.join("WidgetA.tsx"), concat!(
+        "// @runsOn client\n",
+        "type WidgetAProps = {};\n",
+        "export function WidgetA(props: WidgetAProps) {\n",
+        "  return <span class=\"first\">First</span>;\n",
+        "}\n",
+    )).unwrap();
+    std::fs::write(components_dir.join("WidgetB.tsx"), concat!(
+        "// @runsOn client\n",
+        "type WidgetBProps = {};\n",
+        "export function WidgetB(props: WidgetBProps) {\n",
+        "  return <span class=\"second\">Second</span>;\n",
+        "}\n",
+    )).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Index.tsx"), concat!(
+        "// @runsOn server\n",
+        "import { WidgetA } from '../components/WidgetA';\n",
+        "import { WidgetB } from '../components/WidgetB';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (<div><h1>Before</h1><WidgetA client:hydrate /><hr /><WidgetB client:hydrate /><h2>After</h2></div>);\n",
+        "}\n",
+    )).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = std::process::Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "build failed: {}", String::from_utf8_lossy(&status.stderr));
+
+    // Start the dev server on a random port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut server = std::process::Command::new(&bin)
+        .arg("dev")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // Wait for server
+    let start = std::time::Instant::now();
+    let mut ready = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            std::time::Duration::from_millis(200),
+        ).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(ready, "dev server did not start on port {}", port);
+
+    // Run the Playwright spec
+    let spec = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/hydrate-dom-position.spec.mjs");
+    let status = std::process::Command::new("npx")
+        .arg("playwright")
+        .arg("test")
+        .arg(spec)
+        .arg("--reporter=line")
+        .env("MARISJS_DEV_URL", format!("http://127.0.0.1:{}", port))
+        .status()
+        .unwrap_or_else(|e| {
+            server.kill().unwrap();
+            let _ = server.wait();
+            panic!("failed to run playwright: {}", e);
+        });
+
+    server.kill().unwrap();
+    let _ = server.wait();
+
+    assert!(status.success(), "Playwright DOM-position test failed");
+}
+
+#[test]
 fn destructured_arrow_param_in_handler() {
     let fixture = concat!(
         "// @runsOn client\n",
