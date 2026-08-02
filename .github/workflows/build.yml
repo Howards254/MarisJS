@@ -108,9 +108,15 @@ jobs:
       - name: Verify static linking + version (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          ldd ./target/${{ matrix.target }}/release/marisjs 2>&1 | grep -q "statically linked" || { ldd ./target/${{ matrix.target }}/release/marisjs; echo "ERROR: binary is not statically linked"; exit 1; }
+          LDD_OUT=$(ldd ./target/${{ matrix.target }}/release/marisjs 2>&1) || true
+          if echo "$LDD_OUT" | grep -qE "statically linked|not a dynamic executable"; then
+            echo "Binary is statically linked ✓  ($LDD_OUT)"
+          else
+            echo "ERROR: binary is not statically linked. ldd output:"
+            echo "$LDD_OUT"
+            exit 1
+          fi
           file ./target/${{ matrix.target }}/release/marisjs | grep -q "static" || { file ./target/${{ matrix.target }}/release/marisjs; echo "ERROR: binary is not static"; exit 1; }
-          echo "Binary is statically linked ✓"
           ./target/${{ matrix.target }}/release/marisjs --version
           ./target/${{ matrix.target }}/release/marisjs --version | grep -q '^marisjs '
 
@@ -122,8 +128,14 @@ jobs:
           distro: ubuntu24.04
           run: |
             chmod +x ./target/aarch64-unknown-linux-musl/release/marisjs
-            ldd ./target/aarch64-unknown-linux-musl/release/marisjs 2>&1 | grep -q "statically linked" || { ldd ./target/aarch64-unknown-linux-musl/release/marisjs; echo "ERROR: binary is not statically linked"; exit 1; }
-            echo "Binary is statically linked ✓"
+            LDD_OUT=$(ldd ./target/aarch64-unknown-linux-musl/release/marisjs 2>&1) || true
+            if echo "$LDD_OUT" | grep -qE "statically linked|not a dynamic executable"; then
+              echo "Binary is statically linked ✓  ($LDD_OUT)"
+            else
+              echo "ERROR: binary is not statically linked. ldd output:"
+              echo "$LDD_OUT"
+              exit 1
+            fi
             ./target/aarch64-unknown-linux-musl/release/marisjs --version
             ./target/aarch64-unknown-linux-musl/release/marisjs --version | grep -q '^marisjs '
 
