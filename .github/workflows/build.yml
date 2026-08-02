@@ -88,10 +88,14 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
-      # Run full test suite against musl-compiled test bins (unit + integration)
-      - name: Test (x86_64 musl)
+      # Run unit tests (lib + bin) against musl-compiled code — verifies
+      # compile/link correctness and core logic. Integration tests that
+      # spawn Node.js and require jsdom are skipped here; they run in the
+      # default-target `test` job where pnpm node_modules is available.
+      # Codegen output correctness is target-independent.
+      - name: Unit tests (x86_64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo test --target ${{ matrix.target }}
+        run: cargo test --target ${{ matrix.target }} --workspace --lib --bins
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
