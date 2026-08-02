@@ -41,7 +41,7 @@ function htmlShell(serverHtml, route) {
     `    import { ${m.name} } from '${m.path}';`
   ).join('\n');
   const clientMounts = (route.clientModules || []).map(m =>
-    `    mount(root, () => ${m.name}({}));`
+    `    mount(document.querySelector('[data-hydrate="${m.name}"]'), () => ${m.name}({}));`
   ).join('\n');
 
   return `<!DOCTYPE html>
@@ -63,7 +63,6 @@ ${cssLinks}
   <script type="module">
     import { mount } from '@marisjs/runtime';
 ${clientImports}
-    const root = document.getElementById('root');
 ${clientMounts}
   </script>
 </body>

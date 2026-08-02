@@ -1712,6 +1712,91 @@ fn page_head_meta_works_with_hydrate_islands() {
         "hydrate root should still be present"
     );
 }
+
+#[test]
+fn hydrate_islands_target_correct_data_hydrate_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components_dir = dir.path().join("components");
+    std::fs::create_dir(&components_dir).unwrap();
+    let widget_a = concat!(
+        "// @runsOn client\n",
+        "type WidgetAProps = {};\n",
+        "export function WidgetA(props: WidgetAProps) {\n",
+        "  return <span class=\"first\">First</span>;\n",
+        "}\n",
+    );
+    std::fs::write(components_dir.join("WidgetA.tsx"), widget_a).unwrap();
+    let widget_b = concat!(
+        "// @runsOn client\n",
+        "type WidgetBProps = {};\n",
+        "export function WidgetB(props: WidgetBProps) {\n",
+        "  return <span class=\"second\">Second</span>;\n",
+        "}\n",
+    );
+    std::fs::write(components_dir.join("WidgetB.tsx"), widget_b).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let page_fixture = concat!(
+        "// @runsOn server\n",
+        "import { WidgetA } from '../components/WidgetA';\n",
+        "import { WidgetB } from '../components/WidgetB';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (<div><h1>Before</h1><WidgetA client:hydrate /><hr /><WidgetB client:hydrate /><h2>After</h2></div>);\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), page_fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    if !status.status.success() {
+        panic!("build failed: {}", String::from_utf8_lossy(&status.stderr));
+    }
+
+    let html = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+
+    // Each island's mount() call MUST target its specific data-hydrate placeholder
+    assert!(
+        html.contains("mount(document.querySelector('[data-hydrate=\"WidgetA\"]'), () => WidgetA({}))"),
+        "WidgetA mount should target [data-hydrate=\"WidgetA\"], got:\n{}",
+        &html
+    );
+    assert!(
+        html.contains("mount(document.querySelector('[data-hydrate=\"WidgetB\"]'), () => WidgetB({}))"),
+        "WidgetB mount should target [data-hydrate=\"WidgetB\"], got:\n{}",
+        &html
+    );
+
+    // The old pattern (generic root) must NOT appear
+    assert!(
+        !html.contains("getElementById('root')"),
+        "mount script should NOT use generic getElementById('root'); islands must target their specific placeholder"
+    );
+
+    // Verify DOM order: static content between islands is preserved in the SSR output
+    let before_pos = html.find("<h1>Before</h1>").expect("static <h1>Before</h1> should be present");
+    let widget_a_pos = html.find("data-hydrate=\"WidgetA\"").expect("WidgetA placeholder should be present");
+    let hr_pos = html.find("<hr").expect("<hr/> between islands should be present");
+    let widget_b_pos = html.find("data-hydrate=\"WidgetB\"").expect("WidgetB placeholder should be present");
+    let after_pos = html.find("<h2>After</h2>").expect("static <h2>After</h2> should be present");
+
+    assert!(before_pos < widget_a_pos, "static <h1>Before</h1> must come before WidgetA placeholder");
+    assert!(widget_a_pos < hr_pos, "WidgetA placeholder must come before <hr/>");
+    assert!(hr_pos < widget_b_pos, "<hr/> must come before WidgetB placeholder");
+    assert!(widget_b_pos < after_pos, "WidgetB placeholder must come before static <h2>After</h2>");
+}
+
 #[test]
 fn destructured_arrow_param_in_handler() {
     let fixture = concat!(

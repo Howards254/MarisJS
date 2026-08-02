@@ -454,9 +454,11 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
         for (name, path) in client_roots {
             html.push_str(&format!("    import {{ {} }} from '{}';\n", name, path));
         }
-        html.push_str("    const root = document.getElementById('root');\n");
         for (name, _path) in client_roots {
-            html.push_str(&format!("    mount(root, () => {}({{}}));\n", name));
+            html.push_str(&format!(
+                "    mount(document.querySelector('[data-hydrate=\"{}\"]'), () => {}({{}}));\n",
+                name, name
+            ));
         }
     }
     html.push_str("  </script>\n</body>\n</html>\n");
