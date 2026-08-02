@@ -36,6 +36,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      - name: Install Playwright browser (Chromium)
+        run: npx playwright install chromium
+
       - run: cargo test
 
       - name: SPEC.md drift check

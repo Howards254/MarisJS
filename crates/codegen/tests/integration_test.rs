@@ -1799,10 +1799,9 @@ fn hydrate_islands_target_correct_data_hydrate_placeholder() {
 
 #[test]
 fn hydrate_islands_verified_by_playwright_dom_positions() {
-    // This test requires `npx playwright` to be available (devDependency).
-    // If Playwright isn't installed, skip without failing — the static codegen
-    // test above (hydrate_islands_target_correct_data_hydrate_placeholder)
-    // still guards the fix at the code-generation level.
+    // Requires both the `playwright` npm package and an installed browser
+    // binary (Chromium). The npm package alone isn't enough — the browser
+    // binary under ~/.cache/ms-playwright must also exist.
     let playwright_available = std::process::Command::new("npx")
         .arg("playwright")
         .arg("--version")
@@ -1812,8 +1811,18 @@ fn hydrate_islands_verified_by_playwright_dom_positions() {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if !playwright_available {
-        eprintln!("SKIP: playwright not installed — skipping real-browser DOM test");
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pw_cache = std::path::PathBuf::from(home).join(".cache/ms-playwright");
+    let browser_found = pw_cache.exists()
+        && std::fs::read_dir(&pw_cache)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_str().map_or(false, |n| n.starts_with("chromium")))
+            })
+            .unwrap_or(false);
+
+    if !playwright_available || !browser_found {
+        eprintln!("SKIP: playwright or Chromium browser not installed — skipping real-browser DOM test");
         return;
     }
 
