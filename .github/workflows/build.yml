@@ -36,6 +36,13 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: playwright-chromium-
+
       - name: Install Playwright browser (Chromium)
         run: npx playwright install chromium
 
@@ -69,11 +76,16 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      # x86_64-musl: native gcc + rust-lld, fully static
+      - name: Install musl C compiler
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # x86_64-musl: musl-gcc CC + rust-lld linker, fully static
       - name: Build (x86_64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
         env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
       # Run full test suite against musl-compiled test bins (unit + integration)
@@ -81,6 +93,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: cargo test --target ${{ matrix.target }}
         env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
 
       # aarch64-musl: cross gcc + rust-lld, fully static (no QEMU needed)
