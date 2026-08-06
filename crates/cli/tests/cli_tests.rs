@@ -371,6 +371,14 @@ fn dev_server_serves_image_correct_mime() {
         "export function Index(props: IndexProps) { return <div>test</div>; }\n",
     )).unwrap();
 
+    // Images live in the SOURCE dir (real user scenario) — build must copy
+    // them into dist so the dev server can serve them.
+    std::fs::write(dir.path().join("logo.png"), b"PNG_PLACEHOLDER").unwrap();
+    std::fs::write(dir.path().join("icon.jpg"), b"JPG_PLACEHOLDER").unwrap();
+    std::fs::write(dir.path().join("favicon.ico"), b"ICO_PLACEHOLDER").unwrap();
+    std::fs::write(dir.path().join("graphic.svg"), b"<svg></svg>").unwrap();
+    std::fs::write(dir.path().join("photo.webp"), b"WEBP_PLACEHOLDER").unwrap();
+
     let bin = env!("CARGO_BIN_EXE_marisjs");
     let out = dir.path().join("dist");
     let status = ProcCommand::new(bin)
@@ -381,6 +389,10 @@ fn dev_server_serves_image_correct_mime() {
         .output()
         .unwrap();
     assert!(status.status.success(), "build failed: {}", String::from_utf8_lossy(&status.stderr));
+    assert!(
+        out.join("logo.png").exists(),
+        "build should copy static assets from source into dist"
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -398,10 +410,11 @@ fn dev_server_serves_image_correct_mime() {
         .spawn()
         .unwrap();
 
-    // Wait for server to be ready after its initial build
+    // Wait for server to be ready after its initial build (Node prerender
+    // spawns can be slow under parallel-suite load)
     let started = Instant::now();
     let mut ready = false;
-    while started.elapsed() < Duration::from_secs(10) {
+    while started.elapsed() < Duration::from_secs(30) {
         if TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", port).parse().unwrap(),
             Duration::from_millis(200),
@@ -413,12 +426,8 @@ fn dev_server_serves_image_correct_mime() {
     }
     assert!(ready, "dev server did not start on port {} within 10s", port);
 
-    // Place images in dist AFTER the initial build completes (build_all wipes dist/)
-    std::fs::write(out.join("logo.png"), b"PNG_PLACEHOLDER").unwrap();
-    std::fs::write(out.join("icon.jpg"), b"JPG_PLACEHOLDER").unwrap();
-    std::fs::write(out.join("favicon.ico"), b"ICO_PLACEHOLDER").unwrap();
-    std::fs::write(out.join("graphic.svg"), b"<svg></svg>").unwrap();
-    std::fs::write(out.join("photo.webp"), b"WEBP_PLACEHOLDER").unwrap();
+    // Build already copied the assets from source into dist during the
+    // initial build — the dev server serves them straight from dist.
 
     let test_cases = [
         ("/logo.png", "image/png"),

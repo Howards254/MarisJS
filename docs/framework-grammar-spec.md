@@ -182,9 +182,24 @@ directory tree maps directly to URL routes:
   filename, strip the extension, and strip a trailing `/index` if present.
 - Client components (non-page files) can live anywhere outside `pages/`, or inside
   `pages/` as helper components — their location does not affect routing.
+- **Canonical route → file mapping.** The route string is lowercased (URL convention),
+  but the compiled output path keeps the source's on-disk casing. `pages/Docs/Api/Signals.tsx`
+  maps to route `/docs/api/signals`, prerendered HTML at `docs/api/signals.html`, compiled
+  module at `pages/Docs/Api/Signals.mjs`. The `routes.json` manifest records the real path
+  (`mjs` field) for every route — the compiler, dev server, and adapter-node all read this
+  mapping instead of reconstructing file paths from route strings (reconstructing with
+  first-segment capitalization breaks for nested routes).
+- **Depth-aware relative references.** Every root-relative reference inside a page's HTML
+  (import map runtime, CSS `<link>` hrefs, client module imports) is prefixed with `../`
+  once per route segment so it resolves from the page's actual output location: a page at
+  `/docs/api/signals` (3 segments) uses `../../../` prefixes.
 - Pages are pre-rendered to static HTML during `marisjs build` by invoking the server
   component via Node.js. The generated HTML includes an import map so browser-side code
   resolves `@marisjs/runtime` to `./runtime.mjs` without any `node_modules` dependency.
+- **Folder-URL convention (static output).** `@marisjs/adapter-static` writes each route to
+  a folder with an `index.html` (`/docs` → `docs/index.html`, `/docs/api/signals` →
+  `docs/api/signals/index.html`) and rewrites `routes.json` to match. URL depth is
+  preserved, so the compiler's depth-aware references resolve unchanged.
 
 **Page metadata (`<head>` content):**
 

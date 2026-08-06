@@ -35,10 +35,35 @@ function capitalizeFirst(s) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
+// A page served at /docs/api/signals (3 segments) sits 3 directories below
+// the dist root, so root-relative references (runtime.mjs, CSS, client
+// modules) must be prefixed with ../../../ to resolve in the browser.
+function depthPrefix(routePath) {
+  const segs = routePath.split('/').filter(Boolean).length;
+  return '../'.repeat(segs);
+}
+
+// Codegen emits the server html string entity-escaped (so it survives the
+// JSON round trip during prerendering); the compiler's prerender path
+// unescapes it before writing the file. SSR must do the same, or browsers
+// render literal &lt;h1&gt; text. Mirrors unescape_html in crates/cli.
+function unescapeHtml(s) {
+  return s
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&quot;', '"')
+    .replaceAll('&amp;', '&');
+}
+
 function htmlShell(serverHtml, route) {
-  const cssLinks = (route.css || []).map(f => `  <link rel="stylesheet" href="/${f}">`).join('\n');
+  const prefix = depthPrefix(route.path);
+  const runtime = prefix ? `${prefix}runtime.mjs` : './runtime.mjs';
+  const cssLinks = (route.css || []).map(f => `  <link rel="stylesheet" href="${prefix}${f}">`).join('\n');
   const clientImports = (route.clientModules || []).map(m =>
-    `    import { ${m.name} } from '${m.path}';`
+    // A relative module specifier MUST start with ./ ../ or / — at the
+    // root (no depth prefix) that means an explicit "./".
+    `    import { ${m.name} } from '${prefix ? prefix : './'}${m.path}';`
   ).join('\n');
   const clientMounts = (route.clientModules || []).map(m =>
     `    mount(document.querySelector('[data-hydrate="${m.name}"]'), () => ${m.name}({}));`
@@ -50,7 +75,7 @@ function htmlShell(serverHtml, route) {
   <script type="importmap">
   {
     "imports": {
-      "@marisjs/runtime": "./runtime.mjs"
+      "@marisjs/runtime": ${JSON.stringify(runtime)}
     }
   }
   </script>
@@ -58,7 +83,7 @@ ${cssLinks}
 </head>
 <body>
   <div id="root">
-  ${serverHtml}
+  ${unescapeHtml(serverHtml)}
   </div>
   <script type="module">
     import { mount } from '@marisjs/runtime';
@@ -76,7 +101,10 @@ const server = createServer(async (req, res) => {
 
     if (route) {
       if (route.mode === 'server') {
-        const pageFile = join(DIST, route.file.replace('.html', '.mjs'));
+        // Use the real compiled path from the manifest (source-preserved
+        // casing) — reconstructing it from the route string with
+        // capitalizeFirst breaks for nested routes like /docs/api/signals.
+        const pageFile = join(DIST, route.mjs || route.file.replace('.html', '.mjs'));
         if (existsSync(pageFile)) {
           try {
             const stem = basename(pageFile, '.mjs');

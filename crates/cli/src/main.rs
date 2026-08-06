@@ -64,6 +64,22 @@ struct ComponentMeta {
     css_imports: Vec<String>,
 }
 
+/// One built page route. `html_file` follows the URL convention (lowercase,
+/// depth-consistent: `docs/api/signals.html`), while `mjs_rel` is the REAL
+/// compiled output path (source-preserved casing: `pages/Docs/Api/Signals.mjs`).
+/// Reconstructing file paths from route strings (with capitalize_first) caused
+/// case mismatches for nested routes — this record is the single source of
+/// truth for route → real file mapping, shared by the compiler, dev server,
+/// adapter-node (via routes.json), and adapter-static.
+struct PageRoute {
+    route: String,
+    html_file: String,
+    mjs_rel: String,
+    page_roots: Vec<(String, String)>,
+    css_files: Vec<String>,
+    has_data: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -150,7 +166,7 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create out dir: {}", e))?;
 
-    let mut page_routes: Vec<(String, String, Vec<(String, String)>, Vec<String>, bool)> = Vec::new();
+    let mut page_routes: Vec<PageRoute> = Vec::new();
     let mut component_meta: HashMap<PathBuf, ComponentMeta> = HashMap::new();
 
     walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut component_meta)?;
@@ -190,7 +206,7 @@ fn write_reload_timestamp(out_dir: &Path) {
 
 fn walk_and_build(
     base: &Path, current: &Path, out_base: &Path, count: &mut usize,
-    page_routes: &mut Vec<(String, String, Vec<(String, String)>, Vec<String>, bool)>,
+    page_routes: &mut Vec<PageRoute>,
     component_meta: &mut HashMap<PathBuf, ComponentMeta>,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(current).map_err(|e| format!("read_dir: {}", e))? {
@@ -216,6 +232,16 @@ fn walk_and_build(
                 }
                 return Err(format!("validation failed in {}: {} error(s)", rel.display(), diagnostics.len()));
             }
+            // Safety net: every import must resolve to an existing file in the
+            // source tree. Catches case mismatches and typos the emission logic
+            // can't detect.
+            let import_diags = validator::validate_imports(&component, rel, base);
+            if !import_diags.is_empty() {
+                for d in &import_diags {
+                    eprintln!("    {}:{} — {}: {} (fix: {})", d.line.unwrap_or(0), d.column.unwrap_or(0), d.code, d.message, d.fix_hint);
+                }
+                return Err(format!("import validation failed in {}: {} error(s)", rel.display(), import_diags.len()));
+            }
             let js = codegen::generate(&component)
                 .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
 
@@ -235,6 +261,9 @@ fn walk_and_build(
             if is_page && component.runs_on == Some(parser::RunsOn::Server) {
                 let route = page_file_to_route(rel);
                 let html_file = route_to_html_file(&route);
+                // REAL output path (source-preserved casing), NOT reconstructed
+                // from the route string — this is the canonical mapping.
+                let mjs_rel = normalize_path(&rel.with_extension("mjs"));
 
                 // Collect hydrate roots for THIS page specifically
                 let mut page_roots: Vec<(String, String)> = Vec::new();
@@ -244,12 +273,30 @@ fn walk_and_build(
                         page_roots.push((root_name, import_path));
                     }
                 }
-                page_routes.push((route, html_file, page_roots, Vec::new(), component.has_data_call));
+                page_routes.push(PageRoute {
+                    route,
+                    html_file,
+                    mjs_rel,
+                    page_roots,
+                    css_files: Vec::new(),
+                    has_data: component.has_data_call,
+                });
             }
 
             std::fs::write(&out_path, js)
                 .map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
             *count += 1;
+        } else if path.is_file() {
+            // Static assets (images, fonts, etc.) are copied through so the
+            // dev server and adapters can serve them.
+            let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
+            let dest = out_base.join(rel);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
+            }
+            std::fs::copy(&path, &dest)
+                .map_err(|e| format!("copy asset {}: {}", rel.display(), e))?;
+            eprintln!("  copied asset {}", rel.display());
         }
     }
     Ok(())
@@ -260,16 +307,18 @@ fn walk_and_build(
 /// Resolves the transitive CSS for each page by walking the component dependency tree.
 /// Copies CSS files into the output directory preserving relative structure.
 fn resolve_page_css(
-    page_routes: Vec<(String, String, Vec<(String, String)>, Vec<String>, bool)>,
+    page_routes: Vec<PageRoute>,
     component_meta: &HashMap<PathBuf, ComponentMeta>,
     source_dir: &Path,
     out_dir: &Path,
-) -> Result<Vec<(String, String, Vec<(String, String)>, Vec<String>, bool)>, String> {
+) -> Result<Vec<PageRoute>, String> {
     let mut result = Vec::new();
 
-    for (route, html_file, roots, _, has_data) in page_routes {
-        // Determine which file is the page: convert route back to file path
-        let page_rel = route_to_page_file(&route);
+    for mut page in page_routes {
+        // Use the page's real source path (recorded at build time) — the
+        // component_meta keys are the actual on-disk rel paths, so the
+        // case must match the source tree exactly.
+        let page_rel = page.mjs_rel.trim_end_matches(".mjs").to_string() + ".tsx";
         let page_path = PathBuf::from(&page_rel);
 
         let mut css_files: Vec<String> = Vec::new();
@@ -291,7 +340,8 @@ fn resolve_page_css(
             }
         }
 
-        result.push((route, html_file, roots, css_files, has_data));
+        page.css_files = css_files;
+        result.push(page);
     }
 
     Ok(result)
@@ -368,13 +418,32 @@ fn normalize_pathbuf(p: &Path) -> PathBuf {
     PathBuf::from(normalize_path(p))
 }
 
-fn route_to_page_file(route: &str) -> String {
-    if route == "/" {
-        "pages/Index.tsx".to_string()
-    } else {
-        let name = route.trim_start_matches('/');
-        format!("pages/{}.tsx", capitalize_first(name))
-    }
+fn route_to_html_file(route: &str) -> String {
+    if route == "/" { "index.html".to_string() }
+    else { format!("{}.html", route.trim_start_matches('/')) }
+}
+
+/// Depth prefix for relative references inside a page's HTML. A page rendered
+/// at `/docs/api/signals` (3 segments) lives 3 directories below the dist
+/// root, so every root-relative reference (`runtime.mjs`, CSS, client modules)
+/// must be prefixed with `../../../` to resolve correctly in the browser.
+fn depth_prefix(route: &str) -> String {
+    let segs = route.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).count();
+    "../".repeat(segs)
+}
+
+/// Resolves a hydrate-root component's compiled output path, relative to the
+/// dist root (e.g. `pages/components/Widget.mjs`). The depth prefix is applied
+/// at emission time (see generate_page_html / adapter htmlShell).
+fn resolve_client_import(server_rel: &Path, root_name: &str, imports: &[parser::ImportInfo]) -> Result<String, String> {
+    let source = imports.iter()
+        .find(|i| i.imported_names.contains(&root_name.to_string()))
+        .map(|i| i.source.clone())
+        .ok_or_else(|| format!("client root '{}' referenced but no import found", root_name))?;
+    let import_src = format!("{}.mjs", source.trim_end_matches(".tsx").trim_end_matches(".ts"));
+    let server_parent = server_rel.with_extension("mjs").parent().unwrap_or(Path::new(".")).to_path_buf();
+    let resolved = server_parent.join(&import_src);
+    Ok(normalize_path(&resolved))
 }
 
 fn page_file_to_route(rel: &Path) -> String {
@@ -389,42 +458,26 @@ fn page_file_to_route(rel: &Path) -> String {
     format!("/{}", path)
 }
 
-fn route_to_html_file(route: &str) -> String {
-    if route == "/" { "index.html".to_string() }
-    else { format!("{}.html", route.trim_start_matches('/')) }
-}
-
-fn resolve_client_import(server_rel: &Path, root_name: &str, imports: &[parser::ImportInfo]) -> Result<String, String> {
-    let source = imports.iter()
-        .find(|i| i.imported_names.contains(&root_name.to_string()))
-        .map(|i| i.source.clone())
-        .ok_or_else(|| format!("client root '{}' referenced but no import found", root_name))?;
-    let import_src = format!("{}.mjs", source.trim_end_matches(".tsx").trim_end_matches(".ts"));
-    let server_parent = server_rel.with_extension("mjs").parent().unwrap_or(Path::new(".")).to_path_buf();
-    let resolved = server_parent.join(&import_src);
-    let import_path = if resolved.starts_with(".") { resolved.to_str().unwrap_or("").to_string() } else { format!("./{}", resolved.display()) };
-    Ok(import_path)
-}
-
 // ── pre-render pages ──────────────────────────────────────────────────
 
-fn prerender_pages(out_dir: &Path, page_routes: &[(String, String, Vec<(String, String)>, Vec<String>, bool)]) -> Result<(), String> {
-    for (route, html_file, page_roots, css_files, _has_data) in page_routes {
-        let html_path = out_dir.join(html_file);
+fn prerender_pages(out_dir: &Path, page_routes: &[PageRoute]) -> Result<(), String> {
+    for page in page_routes {
+        let html_path = out_dir.join(&page.html_file);
         if let Some(parent) = html_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
         }
-        let html = generate_page_html(out_dir, route, page_roots, css_files)?
-            .unwrap_or_else(|| format!("<h1>{} — page not found</h1>", route));
-        std::fs::write(&html_path, html).map_err(|e| format!("write {}: {}", html_file, e))?;
-        eprintln!("  prerendered {} → {}", route, html_file);
+        let html = generate_page_html(out_dir, page)?
+            .unwrap_or_else(|| format!("<h1>{} — page not found</h1>", page.route));
+        std::fs::write(&html_path, html).map_err(|e| format!("write {}: {}", page.html_file, e))?;
+        eprintln!("  prerendered {} → {}", page.route, page.html_file);
     }
     Ok(())
 }
 
-fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, String)], css_files: &[String]) -> Result<Option<String>, String> {
-    // Find the .mjs file for this route and execute it via Node to get server HTML
-    let mjs_path = route_to_mjs_path(out_dir, route);
+fn generate_page_html(out_dir: &Path, page: &PageRoute) -> Result<Option<String>, String> {
+    // The .mjs path comes from the manifest record (source-preserved casing),
+    // NOT reconstructed from the route string.
+    let mjs_path = out_dir.join(&page.mjs_rel);
     let server_html = if mjs_path.exists() {
         Some(prerender_with_node(out_dir, &mjs_path)?)
     } else {
@@ -433,28 +486,40 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
 
     let Some((html_content, head_content)) = server_html else { return Ok(None); };
 
+    // Every root-relative reference must be prefixed by the route depth so it
+    // resolves from the page's actual location in the output tree.
+    let prefix = depth_prefix(&page.route);
+    let runtime = if prefix.is_empty() { "./runtime.mjs".to_string() } else { format!("{}runtime.mjs", prefix) };
+
     let mut html = String::new();
     html.push_str("<!DOCTYPE html>\n<html>\n<head>\n");
-    html.push_str("  <script type=\"importmap\">\n  {\n    \"imports\": {\n      \"@marisjs/runtime\": \"./runtime.mjs\"\n    }\n  }\n  </script>\n");
+    html.push_str(&format!("  <script type=\"importmap\">\n  {{\n    \"imports\": {{\n      \"@marisjs/runtime\": \"{}\"\n    }}\n  }}\n  </script>\n", runtime));
     if let Some(head) = head_content {
         for line in head.lines() {
             html.push_str(&format!("  {}\n", line));
         }
     }
-    for css_file in css_files {
-        html.push_str(&format!("  <link rel=\"stylesheet\" href=\"{}\">\n", css_file));
+    for css_file in &page.css_files {
+        html.push_str(&format!("  <link rel=\"stylesheet\" href=\"{}{}\">\n", prefix, css_file));
     }
     html.push_str("</head>\n<body>\n");
     html.push_str("  <div id=\"root\">\n");
     html.push_str(&format!("  {}\n", unescape_html(&html_content)));
     html.push_str("  </div>\n");
     html.push_str("  <script type=\"module\">\n");
-    if !client_roots.is_empty() {
+    if !page.page_roots.is_empty() {
         html.push_str("    import { mount } from '@marisjs/runtime';\n");
-        for (name, path) in client_roots {
-            html.push_str(&format!("    import {{ {} }} from '{}';\n", name, path));
+        for (name, path) in &page.page_roots {
+            // A relative module specifier MUST start with ./ ../ or / —
+            // at the root (no depth prefix) that means an explicit "./".
+            let import_ref = if prefix.is_empty() {
+                format!("./{}", path)
+            } else {
+                format!("{}{}", prefix, path)
+            };
+            html.push_str(&format!("    import {{ {} }} from '{}';\n", name, import_ref));
         }
-        for (name, _path) in client_roots {
+        for (name, _path) in &page.page_roots {
             html.push_str(&format!(
                 "    mount(document.querySelector('[data-hydrate=\"{}\"]'), () => {}({{}}));\n",
                 name, name
@@ -463,15 +528,6 @@ fn generate_page_html(out_dir: &Path, route: &str, client_roots: &[(String, Stri
     }
     html.push_str("  </script>\n</body>\n</html>\n");
     Ok(Some(html))
-}
-
-fn route_to_mjs_path(out_dir: &Path, route: &str) -> std::path::PathBuf {
-    if route == "/" {
-        out_dir.join("pages/Index.mjs")
-    } else {
-        let name = route.trim_start_matches('/');
-        out_dir.join("pages").join(format!("{}.mjs", capitalize_first(name)))
-    }
 }
 
 fn unescape_html(s: &str) -> String {
@@ -553,6 +609,8 @@ struct ClientModuleEntry {
 struct RouteEntry<'a> {
     path: &'a str,
     file: &'a str,
+    #[serde(rename = "mjs")]
+    mjs: &'a str,
     mode: &'a str,
     css: &'a [String],
     #[serde(rename = "clientModules", skip_serializing_if = "Vec::is_empty")]
@@ -566,17 +624,18 @@ struct RoutesManifest<'a> {
     routes: Vec<RouteEntry<'a>>,
 }
 
-fn generate_routes_json(out_dir: &Path, page_routes: &[(String, String, Vec<(String, String)>, Vec<String>, bool)]) -> Result<(), String> {
-    let entries: Vec<RouteEntry> = page_routes.iter().map(|(route, html_file, client_roots, css_files, has_data)| {
-        let modules: Vec<ClientModuleEntry> = client_roots.iter().map(|(name, path)| {
+fn generate_routes_json(out_dir: &Path, page_routes: &[PageRoute]) -> Result<(), String> {
+    let entries: Vec<RouteEntry> = page_routes.iter().map(|page| {
+        let modules: Vec<ClientModuleEntry> = page.page_roots.iter().map(|(name, path)| {
             ClientModuleEntry { name: name.clone(), path: path.clone() }
         }).collect();
-        let mode = if *has_data { "server" } else { "static" };
+        let mode = if page.has_data { "server" } else { "static" };
         RouteEntry {
-            path: route,
-            file: html_file,
+            path: &page.route,
+            file: &page.html_file,
+            mjs: &page.mjs_rel,
             mode,
-            css: css_files,
+            css: &page.css_files,
             client_modules: modules,
         }
     }).collect();
@@ -677,9 +736,9 @@ fn start_file_watcher(source_dir: std::path::PathBuf, tx: mpsc::Sender<()>) -> R
         if let Ok(event) = res {
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                    if event.paths.iter().any(|p| p.extension().map_or(false, |e| e == "tsx")) {
-                        let _ = tx.send(());
-                    }
+                    // Any change triggers a rebuild: tsx files are recompiled,
+                    // new/edited assets (images, css, fonts) are re-copied.
+                    let _ = tx.send(());
                 }
                 _ => {}
             }

@@ -38,18 +38,20 @@ Every marisjs adapter starts the same way: read `routes.json`.
     {
       "path": "/",
       "file": "index.html",
+      "mjs": "pages/Index.mjs",
       "mode": "server",
       "css": ["styles/main.css"],
       "clientModules": [
-        { "name": "Cart", "path": "./components/Cart.mjs" },
-        { "name": "Header", "path": "./components/Header.mjs" }
+        { "name": "Cart", "path": "components/Cart.mjs" },
+        { "name": "Header", "path": "components/Header.mjs" }
       ]
     },
     {
-      "path": "/about",
-      "file": "about.html",
+      "path": "/docs/api/signals",
+      "file": "docs/api/signals.html",
+      "mjs": "pages/Docs/Api/Signals.mjs",
       "mode": "static",
-      "css": []
+      "css": ["pages/components/Widget.css"]
     }
   ]
 }
@@ -58,16 +60,27 @@ Every marisjs adapter starts the same way: read `routes.json`.
 From this manifest alone you can answer every question the adapter needs to answer:
 
 | Question | Answer from manifest |
-|----------|---------------------|
+|----------|----------------------|
 | What URL paths exist? | `routes[].path` |
-| What file do I serve for `/about`? | `routes[1].file` → `about.html` |
-| Does `/about` need SSR? | `routes[1].mode` → `"static"` (no) |
-| Does `/` need SSR? | `routes[0].mode` → `"server"` (yes) |
-| Which CSS files does `/` need? | `routes[0].css` |
-| Which client components hydrate on `/`? | `routes[0].clientModules` |
+| What file do I serve for `/docs/api/signals`? | `routes[1].file` → `docs/api/signals.html` |
+| Where is the page module for SSR? | `routes[].mjs` → real compiled path (source-preserved casing; do NOT reconstruct it from the route string) |
+| Does a route need SSR? | `routes[].mode` → `"static"` (no) or `"server"` (yes) |
+| Which CSS files does a route need? | `routes[].css` |
+| Which client components hydrate on a route? | `routes[].clientModules` |
 
 The answer to "what file do I serve" is always in the manifest. You never need to
 inspect the output directory yourself.
+
+> **Depth-aware references.** The compiler emits every reference inside a page's HTML
+> (import map runtime, CSS links, client module imports) relative to the page's output
+> location — `/docs/api/signals` gets `../../../`-prefixed paths. Adapters must preserve
+> the URL depth when serving (see the folder-URL convention below); do not rewrite the
+> page's relative paths to absolute ones.
+>
+> **Folder-URL convention (`@marisjs/adapter-static`).** Static output writes each route
+> to a folder: `/docs` → `docs/index.html`, `/docs/api/signals` → `docs/api/signals/index.html`.
+> The copied `routes.json` is rewritten so `routes[].file` matches. URL depth is preserved,
+> so the page's depth-aware relative references resolve unchanged.
 
 ## Step 2: Decide which modes you'll support
 

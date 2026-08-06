@@ -1,5 +1,7 @@
 //! Walks the AST from parser and checks it against every rule in docs/framework-grammar-spec.md Sections 2–7. Produces a Vec<Diagnostic>, nothing else. Does not generate code.
 
+use std::path::{Path, PathBuf};
+
 use parser::{
     BodyStmtKind, ComponentFile, ExportKind, JsxAttrValue, JsxExpression, JsxNode, RunsOn,
     TopLevelBinding, TypeAnnotation,
@@ -610,6 +612,64 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_css_imports(file, &mut diagnostics);
     check_handler_jsx(file, &mut diagnostics);
     diagnostics
+}
+
+/// §2: Every import must resolve to an existing file in the source tree.
+/// This is a build-time safety net for the relative-import emission logic:
+/// it catches case mismatches, typos, and moves the compiler's emission can't
+/// detect (the compiler emits the specifier as-written in source, relative to
+/// the generated output's location). Requires the file's own source path and
+/// the project source root — unlike `validate`, it does file-system checks.
+pub fn validate_imports(file: &ComponentFile, file_rel: &Path, source_dir: &Path) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let file_parent = file_rel.parent().unwrap_or(Path::new(""));
+
+    for imp in &file.imports {
+        if imp.is_css {
+            continue;
+        }
+        // Only relative file imports are validated — bare specifiers and
+        // scoped packages (@marisjs/runtime, jsdom, ...) are external
+        // modules resolved by the runtime, not files in the source tree.
+        if !(imp.source.starts_with("./") || imp.source.starts_with("../")) {
+            continue;
+        }
+        // Resolve the import relative to this file's directory, normalizing
+        // ./ and ../ segments, then look for the compiled sibling (.tsx).
+        let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+        let resolved = normalize_path(&file_parent.join(trimmed));
+        let candidate = source_dir.join(&resolved).with_extension("tsx");
+        if !candidate.exists() {
+            diagnostics.push(Diagnostic::new(
+                "IMPORT_NOT_FOUND",
+                format!(
+                    "import '{}' does not resolve to an existing file (resolved to {})",
+                    imp.source,
+                    resolved.display()
+                ),
+                "Fix the import path so it points to a real .tsx file in the project.",
+                Some(imp.line),
+                Some(imp.column),
+            ));
+        }
+    }
+
+    diagnostics
+}
+
+fn normalize_path(p: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(s) => components.push(s.to_os_string()),
+            _ => {}
+        }
+    }
+    components.iter().collect()
 }
 
 #[cfg(test)]
@@ -1853,5 +1913,95 @@ mod tests {
         let mut diags = Vec::new();
         check_handler_jsx(&file, &mut diags);
         assert!(diags.is_empty(), "normal handler should not produce HANDLER_JSX");
+    }
+
+    // ── import existence validation (nested-route safety net) ─────────────
+
+    fn make_import_file() -> ComponentFile {
+        let mut file = make_valid_file();
+        file.imports.push(ImportInfo {
+            source: "./Widget".into(),
+            imported_names: vec!["Widget".into()],
+            line: 2,
+            column: 1,
+            is_css: false,
+        });
+        file
+    }
+
+    #[test]
+    fn import_exists_in_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages = dir.path().join("pages");
+        std::fs::create_dir(&pages).unwrap();
+        std::fs::write(pages.join("Widget.tsx"), "// @runsOn client\n").unwrap();
+        let file = make_import_file();
+        let diags = validate_imports(&file, Path::new("pages/Shop.tsx"), dir.path());
+        assert!(diags.is_empty(), "existing import should pass, got: {:?}", diags);
+    }
+
+    #[test]
+    fn import_missing_in_same_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = make_import_file();
+        let diags = validate_imports(&file, Path::new("pages/Shop.tsx"), dir.path());
+        assert_code(&diags, "IMPORT_NOT_FOUND");
+        assert!(
+            diags[0].message.contains("Widget"),
+            "message should name the import, got: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn nested_import_resolves_through_parent_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let components = dir.path().join("pages/components");
+        std::fs::create_dir_all(&components).unwrap();
+        std::fs::write(components.join("Widget.tsx"), "// @runsOn client\n").unwrap();
+        let mut file = make_valid_file();
+        file.imports.push(ImportInfo {
+            source: "../../components/Widget".into(),
+            imported_names: vec!["Widget".into()],
+            line: 2,
+            column: 1,
+            is_css: false,
+        });
+        let diags = validate_imports(&file, Path::new("pages/Docs/Api/Signals.tsx"), dir.path());
+        assert!(diags.is_empty(), "parent-dir import should pass, got: {:?}", diags);
+    }
+
+    #[test]
+    fn import_with_explicit_tsx_extension_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages = dir.path().join("pages");
+        std::fs::create_dir(&pages).unwrap();
+        std::fs::write(pages.join("Widget.tsx"), "// @runsOn client\n").unwrap();
+        let mut file = make_valid_file();
+        file.imports.push(ImportInfo {
+            source: "./Widget.tsx".into(),
+            imported_names: vec!["Widget".into()],
+            line: 2,
+            column: 1,
+            is_css: false,
+        });
+        let diags = validate_imports(&file, Path::new("pages/Shop.tsx"), dir.path());
+        assert!(diags.is_empty(), "explicit .tsx import should pass, got: {:?}", diags);
+    }
+
+    #[test]
+    fn css_imports_are_skipped_by_import_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = make_import_file();
+        file.imports.push(ImportInfo {
+            source: "./nonexistent.css".into(),
+            imported_names: vec![],
+            line: 3,
+            column: 1,
+            is_css: true,
+        });
+        let diags = validate_imports(&file, Path::new("pages/Shop.tsx"), dir.path());
+        let only_widget = diags.iter().all(|d| d.code == "IMPORT_NOT_FOUND" && d.message.contains("Widget"));
+        assert!(only_widget, "CSS import should be skipped, got: {:?}", diags);
     }
 }

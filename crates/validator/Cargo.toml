@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 parser = { path = "../parser" }
+
+[dev-dependencies]
+tempfile = "3"

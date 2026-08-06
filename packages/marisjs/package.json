@@ -1,6 +1,6 @@
 {
   "name": "marisjs",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "marisjs — reactive component framework CLI compiler",
   "type": "module",
   "bin": {
@@ -14,11 +14,11 @@
     "prepack": "cp ../../docs/framework-grammar-spec.md SPEC.md"
   },
   "optionalDependencies": {
-    "marisjs-linux-x64": "0.1.3",
-    "marisjs-linux-arm64": "0.1.3",
-    "marisjs-darwin-x64": "0.1.3",
-    "marisjs-darwin-arm64": "0.1.3",
-    "marisjs-win32-x64": "0.1.3"
+    "marisjs-linux-x64": "0.1.4",
+    "marisjs-linux-arm64": "0.1.4",
+    "marisjs-darwin-x64": "0.1.4",
+    "marisjs-darwin-arm64": "0.1.4",
+    "marisjs-win32-x64": "0.1.4"
   },
   "engines": {
     "node": ">=18"

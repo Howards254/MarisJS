@@ -1887,10 +1887,12 @@ fn hydrate_islands_verified_by_playwright_dom_positions() {
         .spawn()
         .unwrap();
 
-    // Wait for server
+    // Wait for server — the dev server binds only after its initial build
+    // (which spawns Node for prerendering), so under parallel-suite load this
+    // can take a while.
     let start = std::time::Instant::now();
     let mut ready = false;
-    while start.elapsed() < std::time::Duration::from_secs(10) {
+    while start.elapsed() < std::time::Duration::from_secs(30) {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{}", port).parse().unwrap(),
             std::time::Duration::from_millis(200),
@@ -2921,4 +2923,337 @@ console.log('PASS');
 "#;
 
     run_node(&dir, runner);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Nested route path handling (bug class: /docs/api/signals at 2+ levels)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Writes a project with a two-level nested route. The page file uses
+/// source-preserved casing (pages/Docs/Api/Signals.tsx → route /docs/api/signals)
+/// and imports a hydrate island from a sibling directory with parent-dir
+/// traversal (../../components/Widget), which exercises relative import
+/// resolution at depth. The island owns a CSS file (transitive CSS collection).
+fn write_nested_fixture(dir: &tempfile::TempDir, server_mode: bool) {
+    let src = dir.path();
+    std::fs::create_dir_all(src.join("pages/Docs/Api")).unwrap();
+    std::fs::create_dir_all(src.join("pages/components")).unwrap();
+    std::fs::create_dir_all(src.join("images")).unwrap();
+
+    std::fs::write(src.join("pages/Index.tsx"), concat!(
+        "// @runsOn server\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) { return <div>Home</div>; }\n",
+    ))
+    .unwrap();
+
+    std::fs::write(src.join("pages/components/Widget.tsx"), concat!(
+        "// @runsOn client\n",
+        "import './Widget.css';\n",
+        "type WidgetProps = { label: string };\n",
+        "export function Widget(props: WidgetProps) {\n",
+        "  return (\n",
+        "    <div class=\"widget\"><span class=\"widget-label\">{props.label}</span></div>\n",
+        "  );\n",
+        "}\n",
+    ))
+    .unwrap();
+
+    std::fs::write(src.join("pages/components/Widget.css"), ".widget { color: green; }\n").unwrap();
+
+    let signals = if server_mode {
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from '../../components/Widget';\n",
+            "type SignalsProps = {};\n",
+            "export function Signals(props: SignalsProps) {\n",
+            "  const items = await data(async () => [{ id: 1, name: 'Alpha' }, { id: 2, name: 'Beta' }]);\n",
+            "  return (\n",
+            "    <div class=\"signals-page\">\n",
+            "      <h1>Signals API</h1>\n",
+            "      <ul>\n",
+            "        <For each={items} key={(x) => x.id}>\n",
+            "          {(x) => <li>{x.name}</li>}\n",
+            "        </For>\n",
+            "      </ul>\n",
+            "      <Widget label=\"Go\" client:hydrate />\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n",
+        )
+    } else {
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from '../../components/Widget';\n",
+            "type SignalsProps = {};\n",
+            "export function Signals(props: SignalsProps) {\n",
+            "  return (\n",
+            "    <div class=\"signals-page\">\n",
+            "      <h1>Signals API</h1>\n",
+            "      <Widget label=\"Go\" client:hydrate />\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n",
+        )
+    };
+    std::fs::write(src.join("pages/Docs/Api/Signals.tsx"), signals).unwrap();
+    std::fs::write(src.join("images/logo.png"), b"PNGDATA").unwrap();
+}
+
+fn build_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let out = dir.path().join("dist");
+    let status = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    out
+}
+
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+fn wait_for_port(port: u16) {
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("port {} did not open within 10s", port);
+}
+
+fn http_get(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        path, port
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+/// Bug #1 + #2 + #3: a route 2 levels deep must resolve to the REAL compiled
+/// file (source-preserved casing), emit its transitive CSS, and reference
+/// imports at the correct relative depth from the page's output location.
+#[test]
+fn nested_route_two_levels_resolves_files_css_and_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_nested_fixture(&dir, false);
+    let out = build_fixture(&dir);
+
+    // (1) Correct file resolution: the real output path exists with
+    // source-preserved casing, and the prerendered page is NOT the
+    // "page not found" placeholder.
+    assert!(
+        out.join("pages/Docs/Api/Signals.mjs").exists(),
+        "real mjs output should exist at pages/Docs/Api/Signals.mjs"
+    );
+    assert!(
+        !out.join("pages/Docs/Api/signals.mjs").exists(),
+        "no case-mangled mjs file should exist"
+    );
+
+    let html = std::fs::read_to_string(out.join("docs/api/signals.html")).unwrap();
+    assert!(
+        html.contains("Signals API") && !html.contains("page not found"),
+        "prerendered HTML should contain real SSR content, got: {}",
+        html
+    );
+
+    // (2) Correct CSS links present, at the right depth (3 segments → ../../../).
+    assert!(
+        html.contains("../../../pages/components/Widget.css"),
+        "CSS link should be depth-aware, got: {}",
+        html
+    );
+    assert!(
+        out.join("pages/components/Widget.css").exists(),
+        "transitive CSS should be copied to dist"
+    );
+
+    // (3) Correct relative imports at depth: import map + client module.
+    assert!(
+        html.contains("\"@marisjs/runtime\": \"../../../runtime.mjs\""),
+        "import map should be depth-aware, got: {}",
+        html
+    );
+    assert!(
+        html.contains("import { Widget } from '../../../pages/components/Widget.mjs';"),
+        "client import should be depth-aware, got: {}",
+        html
+    );
+    assert!(
+        out.join("pages/components/Widget.mjs").exists(),
+        "hydrate island module should exist in dist"
+    );
+
+    // The manifest carries the canonical route → real file mapping.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("routes.json")).unwrap()).unwrap();
+    let route = manifest["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "/docs/api/signals")
+        .expect("manifest should contain /docs/api/signals");
+    assert_eq!(route["mjs"], "pages/Docs/Api/Signals.mjs");
+    assert_eq!(route["file"], "docs/api/signals.html");
+    assert_eq!(route["css"][0], "pages/components/Widget.css");
+    assert_eq!(route["clientModules"][0]["path"], "pages/components/Widget.mjs");
+
+    // Static assets from src/ are copied into dist (dev server + adapters).
+    assert!(
+        out.join("images/logo.png").exists(),
+        "static assets should be copied into dist"
+    );
+}
+
+/// Bug #4: adapter-node SSR must serve the nested route using the manifest's
+/// real mjs path and emit depth-aware references, and unescape the SSR html
+/// the same way the compiler's prerender path does.
+#[test]
+fn adapter_node_ssr_serves_nested_route_with_depth_aware_paths() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_nested_fixture(&dir, true);
+    let out = build_fixture(&dir);
+
+    let port = free_port();
+    let adapter = workspace_root().join("packages/adapter-node/server.mjs");
+    let mut child = ProcCommand::new("node")
+        .arg(&adapter)
+        .arg(&out)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn adapter-node");
+    wait_for_port(port);
+
+    let response = http_get(port, "/docs/api/signals");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "nested route should 200, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+
+    // SSR content is unescaped (not literal &lt; entities).
+    assert!(
+        response.contains("<h1>Signals API</h1>") && response.contains("<li>Alpha</li>"),
+        "SSR html should be unescaped with real data, got: {}",
+        response
+    );
+    assert!(
+        !response.contains("&lt;h1&gt;"),
+        "SSR html must not be entity-escaped"
+    );
+
+    // Depth-aware references from the adapter shell.
+    assert!(
+        response.contains("\"@marisjs/runtime\": \"../../../runtime.mjs\""),
+        "SSR import map should be depth-aware, got: {}",
+        response
+    );
+    assert!(
+        response.contains("../../../pages/components/Widget.css"),
+        "SSR CSS link should be depth-aware, got: {}",
+        response
+    );
+    assert!(
+        response.contains("import { Widget } from '../../../pages/components/Widget.mjs';"),
+        "SSR client import should be depth-aware, got: {}",
+        response
+    );
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// adapter-static folder-URL convention: /docs/api/signals must land at
+/// docs/api/signals/index.html (URL depth preserved, so the compiler's
+/// depth-aware relative paths resolve unchanged), with routes.json rewritten
+/// to match.
+#[test]
+fn adapter_static_uses_folder_url_convention_for_nested_route() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_nested_fixture(&dir, false);
+    let out = build_fixture(&dir);
+
+    let public = dir.path().join("public");
+    let status = Command::new("node")
+        .arg(workspace_root().join("packages/adapter-static/cli.mjs"))
+        .arg(&out)
+        .arg(&public)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "adapter-static failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    // Folder-URL output at the same depth as the URL (/docs/api/signals).
+    assert!(
+        public.join("docs/api/signals/index.html").exists(),
+        "nested route should be written to docs/api/signals/index.html"
+    );
+    assert!(
+        !public.join("docs/api/signals.html").exists(),
+        "flat html should not be copied when folder-URL convention applies"
+    );
+    assert!(public.join("index.html").exists(), "root stays index.html");
+
+    // Relative asset paths stay correct at the folder-URL depth (3 segments).
+    let html = std::fs::read_to_string(public.join("docs/api/signals/index.html")).unwrap();
+    assert!(
+        html.contains("\"@marisjs/runtime\": \"../../../runtime.mjs\""),
+        "import map should survive folder-URL move, got: {}",
+        html
+    );
+    assert!(
+        html.contains("../../../pages/components/Widget.css")
+            && html.contains("../../../pages/components/Widget.mjs"),
+        "CSS and client module references should survive folder-URL move, got: {}",
+        html
+    );
+
+    // routes.json rewritten to match the folder-URL layout.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(public.join("routes.json")).unwrap()).unwrap();
+    let route = manifest["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "/docs/api/signals")
+        .expect("manifest should contain /docs/api/signals");
+    assert_eq!(route["file"], "docs/api/signals/index.html");
+    assert_eq!(manifest["routes"][0]["file"], "index.html");
 }

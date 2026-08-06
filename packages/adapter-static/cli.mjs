@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { readFileSync, existsSync, mkdirSync, cpSync, readdirSync, statSync, rmSync } from 'node:fs';
-import { resolve, join, dirname, relative } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, cpSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { resolve, join, dirname } from 'node:path';
 
 const args = process.argv.slice(2);
 if (args.length < 2) {
@@ -50,21 +50,33 @@ if (serverRoutes.length > 0) {
 
 console.log(`Validating static build: ${manifest.routes.length} route(s), all mode "static"`);
 
-// Collect files to copy: route HTML files, CSS files listed in manifest,
-// client component .mjs files, runtime.mjs, and any other static assets.
-const filesToCopy = new Set();
+// Folder-URL convention: /docs → docs/index.html, /docs/api/signals →
+// docs/api/signals/index.html. The page's HTML is emitted by the compiler
+// with depth-aware relative references (../../../ prefix for a route 3
+// segments deep), so moving it from docs.html to docs/index.html preserves
+// the URL depth and every reference resolves unchanged. Root "/" stays
+// index.html.
+function folderUrlDest(route) {
+  if (route.path === '/') return 'index.html';
+  const rel = route.path.replace(/^\/+/, '').replace(/\/+$/, '');
+  return `${rel}/index.html`;
+}
+
+// srcRel → destRel. Route HTML files go through the folder-URL mapping;
+// everything else keeps its relative structure.
+const filesToCopy = new Map();
 
 // Route HTML files
 for (const route of manifest.routes) {
   const htmlPath = join(INPUT, route.file);
   if (existsSync(htmlPath)) {
-    filesToCopy.add(route.file);
+    filesToCopy.set(route.file, folderUrlDest(route));
   }
   // CSS files
   for (const css of (route.css || [])) {
     const cssPath = join(INPUT, css);
     if (existsSync(cssPath)) {
-      filesToCopy.add(css);
+      filesToCopy.set(css, css);
     }
   }
   // Client module .mjs files
@@ -72,16 +84,16 @@ for (const route of manifest.routes) {
     const normalized = mod.path.replace(/^\.\//, '').replace(/[.][.]\//g, '');
     const modPath = join(INPUT, normalized);
     if (existsSync(modPath)) {
-      filesToCopy.add(normalized);
+      filesToCopy.set(normalized, normalized);
     }
   }
 }
 
 // Runtime
-filesToCopy.add('runtime.mjs');
+filesToCopy.set('runtime.mjs', 'runtime.mjs');
 
-// routes.json (for client-side routing if needed)
-filesToCopy.add('routes.json');
+// routes.json (rewritten below to match folder URLs)
+filesToCopy.set('routes.json', 'routes.json');
 
 // Walk for any other static files not in manifest (images, fonts, etc.)
 function collectStaticFiles(dir, base = '') {
@@ -99,7 +111,11 @@ function collectStaticFiles(dir, base = '') {
     if (statSync(full).isDirectory()) {
       collectStaticFiles(full, rel);
     } else {
-      filesToCopy.add(rel);
+      // Don't clobber entries already mapped (e.g. route HTML files that
+      // go through the folder-URL convention).
+      if (!filesToCopy.has(rel)) {
+        filesToCopy.set(rel, rel);
+      }
     }
   }
 }
@@ -111,14 +127,25 @@ rmSync(OUTPUT, { recursive: true, force: true });
 mkdirSync(OUTPUT, { recursive: true });
 
 let copied = 0;
-for (const rel of filesToCopy) {
-  const src = join(INPUT, rel);
-  const dest = join(OUTPUT, rel);
+for (const [srcRel, destRel] of filesToCopy) {
+  const src = join(INPUT, srcRel);
+  const dest = join(OUTPUT, destRel);
   if (!existsSync(src)) continue;
 
   mkdirSync(dirname(dest), { recursive: true });
   cpSync(src, dest);
   copied++;
+}
+
+// Rewrite routes.json in the output so its `file` entries match the
+// folder-URL layout (client-side routing reads this manifest).
+const outManifestPath = join(OUTPUT, 'routes.json');
+if (existsSync(outManifestPath)) {
+  const outManifest = JSON.parse(readFileSync(outManifestPath, 'utf-8'));
+  for (const r of outManifest.routes) {
+    r.file = folderUrlDest(r);
+  }
+  writeFileSync(outManifestPath, JSON.stringify(outManifest, null, 2));
 }
 
 console.log(`Done: copied ${copied} file(s) to ${OUTPUT}`);
