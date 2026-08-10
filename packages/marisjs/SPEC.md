@@ -523,55 +523,29 @@ objects to CSS strings at compile time, or (b) add a validator check that reject
 style syntax with a clear error directing users to use string styles
 (`style="background:red;padding:1rem"`).
 
-**#7 — Island props not serialized (severity: high-priority candidate)**
+**#7 (resolved 2026-08-10) — Island props now serialized through SSR**
 
-`client:hydrate` islands always receive an empty props object `{}` at the mount call site,
-regardless of what the server page passes in JSX. A server page writing
-`<Widget label="Go" client:hydrate />` has the `label` prop silently dropped — the
-compiled mount call is `mount(..., () => Widget({}))`. This affects every `client:hydrate`
-island unconditionally, not a subset of cases. There is no workaround other than
-avoiding server-passed props entirely (all data must be fetched independently on the
-client side).
+`client:hydrate` islands previously received an empty props object `{}` at the mount call
+site: `<Widget label="Go" client:hydrate />` compiled to `mount(..., () => Widget({}))`,
+silently dropping every prop. Fixed by serializing the REAL props at SSR render time:
 
-**Minimal reproduction:**
+- Server codegen emits the hydrate placeholder as `<div data-hydrate="Widget" data-props='...'>`
+  where the attribute is `JSON.stringify(<props object>)` computed when the server page
+  executes — so dynamic values (from `data()`, signals, expressions) work, not just literals.
+- The mount call reads them back: `mount(el, () => Widget(el.dataset.props ? JSON.parse(el.dataset.props) : {}))`.
+  The `{}` fallback keeps hand-written HTML shells (and HTML from other compilers) working.
+- The runtime `mount(rootElement, componentFn)` now passes `rootElement` to the component
+  factory so the props reader can use it.
+- The compiler prerender path and both adapters (node SSR shell + static export, which
+  copies the prerendered HTML unchanged) emit/consume the same `data-props` contract.
 
-```tsx
-// components/Widget.tsx
-// @runsOn client
-type WidgetProps = { label: string };
-export function Widget(props: WidgetProps) {
-  return <span>{props.label}</span>;
-}
-```
-
-```tsx
-// pages/Index.tsx
-// @runsOn server
-import { Widget } from '../components/Widget';
-
-export function Index(props: IndexProps) {
-  const message = await data(async () => 'Hello from server');
-  return <Widget label={message} client:hydrate />;
-}
-```
-
-The server prerender emits `<div data-hydrate="Widget"></div>` (not the rendered
-component), and the client mount calls `Widget({})` — the `label` prop is lost.
-The hydrated island renders with `props.label === undefined`.
-
-**Impact:** server/client data composition — the primary pattern for passing
-server-fetched data into interactive components — does not work. Every
-`client:hydrate` island must be entirely self-contained today. This is a real
-limitation on practical composition; fixing it would unlock server-driven
-island initialization.
-
-**Fix candidates:** (a) generate the mount call with the actual props expression
-from the server source, serializing scalar props to JSON-embeddable literals;
-(b) JSON-serialize all props into a `<script type="application/json">` block
-in the HTML shell and deserialize at mount time; (c) mark the gap as
-unresolvable in v1 and document it as a language rule (server pages may not
-pass non-empty props to `client:hydrate` islands) until a broader hydration
-overhaul in Layer 2.
+Regression coverage: `nested_route_two_levels_resolves_files_css_and_imports` asserts the
+serialized attribute; `adapter_node_ssr_serves_nested_route_with_depth_aware_paths` asserts
+both the attribute and the props-reading mount call; `adapter_static_uses_folder_url_convention_for_nested_route`
+asserts props survive the folder-URL move. Live browser verification (fresh npm install of
+the published binary + fixed local build, real Chromium) confirms a static-prop island
+(`label="Go"`) and a dynamic-prop island (`label={items.length === 2 ? 'TwoItems' : 'Other'}`
+derived from `data()`) both hydrate with correct text after SSR.
 
 **#1 (resolved 2026-07-28) — Block-bodied For arrows now fully supported**
 Parser fix: `extract_arrow_body_jsx` walks block statements to find the return JSX
@@ -580,6 +554,70 @@ and captures preceding function/const declarations via `span_to_snippet`. Codege
 with TS annotations stripped. Each per-item `_rX` invocation creates fresh closures.
 Regression test `for_block_body_handler_is_per_item_scoped` confirms delete-on-second-item
 only removes the second item (not the first).
+
+**#8 (resolved 2026-08-10) — Duplicate island imports crashed pages**
+
+Using the SAME `client:hydrate` island twice on one page emitted two `import { Widget } from '...'`
+statements for one identifier — a SyntaxError that aborted the page's module script, so the
+second (and all subsequent) islands never mounted. Found via live production testing.
+Fix: `collect_hydrate_roots` dedupes by component name (one import per island component),
+and the mount script iterates ALL instances —
+
+```js
+for (const el of document.querySelectorAll('[data-hydrate="Widget"]')) {
+  mount(el, () => Widget(el.dataset.props ? JSON.parse(el.dataset.props) : {}));
+}
+```
+
+— so N instances (including islands inside `<For>` loops) each mount with their own
+SSR-serialized `data-props`. Both adapters emit the same loop; `clientModules` in routes.json
+is deduped. Regression tests: `same_island_twice_emits_single_import_and_two_props` (static
+assertions: exactly one import, two distinct prop payloads) and
+`duplicate_island_mounts_both_instances_in_browser` (real Chromium: page loads with zero
+script errors, both instances hydrate with their own labels).
+
+**#9 (resolved 2026-08-10) — Server attribute expressions were stringified**
+
+`class={expr}`, `href={expr}`, and any other JSX attribute expression in a `@runsOn server`
+component was emitted as the LITERAL source text (`class="{expr}"`) into the SSR html instead
+of being evaluated — while client codegen evaluates them via `setAttribute`. Found via live
+production testing. Fix: server codegen now builds the opening tag from interleaved static
+string parts and evaluated expression parts (`'<div class="' + (expr) + '">'`), with boolean
+attributes using presence semantics (`cond ? ' disabled=""' : ''`) mirroring the client's
+setAttribute/removeAttribute pair. Regression test:
+`server_expression_attributes_evaluate_in_ssr_html` covers class/href expressions, per-item
+expressions inside `<For>`, truthy/falsy boolean attributes, fragments, and asserts no literal
+expression source leaks into the html.
+
+**Parity audit (2026-08-10) — client/server codegen feature matrix**
+
+Following four client/server parity gaps surfacing one at a time (data() `.value`, DerivedConst
+reactivity, the async-await fix, and #8/#9 above), every codegen feature with both a client and
+a server path was audited against tests:
+
+| Feature | Client | Server | Notes |
+|---|---|---|---|
+| Text nodes | ✓ tested | ✓ tested | |
+| Static attrs | ✓ tested | ✓ tested | |
+| Expression attrs | ✓ tested | ✓ tested (was #9) | |
+| Boolean attrs | ✓ tested (new) | ✓ tested | presence semantics both paths |
+| Event handlers | ✓ tested | ✓ rejected (new) | server html has no JS — validator now rejects with SERVER_EVENT_HANDLER |
+| Conditional/ternary | ✓ tested | ✓ tested | element-position added to #9 test |
+| ForEach | ✓ tested | ✓ tested | |
+| Fragments | ✓ tested (new) | ✓ tested (new) | client_fragment_renders_children_inline + #9 test |
+| Components & props | ✓ tested | ✓ tested | props objects evaluated both paths |
+| Hydrate islands | ✓ tested | ✓ tested | props serialization + instance dedup (#7, #8) |
+| Signals/computed | ✓ tested | ✓ rejected (new) | validator now rejects with SERVER_SIGNAL — server codegen has no reactive runtime |
+| data() | n/a (rejected CLIENT_DATA_CALL) | ✓ tested | |
+| Derived consts | ✓ tested | ✓ tested | |
+| head injection | n/a | ✓ tested | |
+| CSS imports | ✓ tested | rejected (INVALID_CSS_IMPORT) | by design |
+
+Beyond attribute expressions (#9), the audit found and fixed two more parity gaps: signals in
+server files passed validation then crashed prerender with a ReferenceError (now rejected with
+`SERVER_SIGNAL`), and `on*` handlers in server files were silently dropped from SSR html (now
+rejected with `SERVER_EVENT_HANDLER`). Known, deliberately-accepted divergence: `style` object
+attributes render `[object Object]` on both paths (documented separately).
 
 ---
 

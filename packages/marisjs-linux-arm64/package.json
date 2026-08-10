@@ -1,6 +1,6 @@
 {
   "name": "marisjs-linux-arm64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "marisjs CLI binary for Linux arm64",
   "os": [
     "linux"

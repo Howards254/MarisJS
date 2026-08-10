@@ -213,6 +213,14 @@ fn walk_and_build(
         let entry = entry.map_err(|e| format!("entry: {}", e))?;
         let path = entry.path();
         if path.is_dir() {
+            // Never descend into dependency/vcs directories — their contents
+            // are neither components nor assets, and copying node_modules
+            // wholesale into dist bloats builds massively.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name == "node_modules" || name == ".git" || name == ".marisjs" {
+                    continue;
+                }
+            }
             walk_and_build(base, &path, out_base, count, page_routes, component_meta)?;
         } else if path.extension().map_or(false, |ext| ext == "tsx") {
             let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
@@ -509,7 +517,11 @@ fn generate_page_html(out_dir: &Path, page: &PageRoute) -> Result<Option<String>
     html.push_str("  <script type=\"module\">\n");
     if !page.page_roots.is_empty() {
         html.push_str("    import { mount } from '@marisjs/runtime';\n");
+        let mut seen = std::collections::HashSet::new();
         for (name, path) in &page.page_roots {
+            if !seen.insert(name.clone()) {
+                continue; // exactly ONE import per island component
+            }
             // A relative module specifier MUST start with ./ ../ or / —
             // at the root (no depth prefix) that means an explicit "./".
             let import_ref = if prefix.is_empty() {
@@ -520,8 +532,12 @@ fn generate_page_html(out_dir: &Path, page: &PageRoute) -> Result<Option<String>
             html.push_str(&format!("    import {{ {} }} from '{}';\n", name, import_ref));
         }
         for (name, _path) in &page.page_roots {
+            // Mount EVERY instance: a page may use the same island several
+            // times (or inside a <For>), so target all matching placeholders.
+            // Each placeholder carries its own data-props, serialized at SSR
+            // render time (fallback {} for HTML not produced by this compiler).
             html.push_str(&format!(
-                "    mount(document.querySelector('[data-hydrate=\"{}\"]'), () => {}({{}}));\n",
+                "    for (const el of document.querySelectorAll('[data-hydrate=\"{}\"]')) {{ mount(el, () => {}(el.dataset.props ? JSON.parse(el.dataset.props) : {{}})); }}\n",
                 name, name
             ));
         }
@@ -734,6 +750,19 @@ fn start_file_watcher(source_dir: std::path::PathBuf, tx: mpsc::Sender<()>) -> R
     use notify::{Event, EventKind, RecursiveMode, Watcher};
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
         if let Ok(event) = res {
+            // Ignore dependency/vcs noise so installing packages doesn't
+            // trigger rebuild loops when the project root is the watch root.
+            let is_noise = event.paths.iter().any(|p| {
+                p.components().any(|c| match c {
+                    std::path::Component::Normal(n) => {
+                        n == "node_modules" || n == ".git" || n == ".marisjs"
+                    }
+                    _ => false,
+                })
+            });
+            if is_noise {
+                return;
+            }
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                     // Any change triggers a rebuild: tsx files are recompiled,

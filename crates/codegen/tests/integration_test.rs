@@ -1768,12 +1768,12 @@ fn hydrate_islands_target_correct_data_hydrate_placeholder() {
 
     // Each island's mount() call MUST target its specific data-hydrate placeholder
     assert!(
-        html.contains("mount(document.querySelector('[data-hydrate=\"WidgetA\"]'), () => WidgetA({}))"),
+        html.contains("for (const el of document.querySelectorAll('[data-hydrate=\"WidgetA\"]')) { mount(el, () => WidgetA(el.dataset.props ? JSON.parse(el.dataset.props) : {})); }"),
         "WidgetA mount should target [data-hydrate=\"WidgetA\"], got:\n{}",
         &html
     );
     assert!(
-        html.contains("mount(document.querySelector('[data-hydrate=\"WidgetB\"]'), () => WidgetB({}))"),
+        html.contains("for (const el of document.querySelectorAll('[data-hydrate=\"WidgetB\"]')) { mount(el, () => WidgetB(el.dataset.props ? JSON.parse(el.dataset.props) : {})); }"),
         "WidgetB mount should target [data-hydrate=\"WidgetB\"], got:\n{}",
         &html
     );
@@ -2533,7 +2533,77 @@ if (w1[0].includes('50px') && w1[1].includes('100px')) {
     run_node(&dir, runner);
 }
 
+
+#[test]
+fn client_boolean_attr_presence_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type Props = {};\n",
+        "export function Btn(props: Props) {\n",
+        "  const on = signal(true);\n",
+        "  return <button disabled={on.value}>Go</button>;\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Btn", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Btn } from './Btn.mjs';
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document; global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const btn = Btn({}); root.appendChild(btn);
+if (!btn.hasAttribute('disabled')) { console.error('FAIL: truthy signal should set disabled'); process.exit(1); }
+btn._signals.on.set(false);
+await new Promise(r => setTimeout(r, 50));
+if (btn.hasAttribute('disabled')) { console.error('FAIL: falsy signal should remove disabled'); process.exit(1); }
+btn._signals.on.set(true);
+await new Promise(r => setTimeout(r, 50));
+if (!btn.hasAttribute('disabled')) { console.error('FAIL: re-set should re-add disabled'); process.exit(1); }
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+
+#[test]
+fn client_fragment_renders_children_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type Props = {};\n",
+        "export function Frag(props: Props) {\n",
+        "  return (<>\n",
+        "    <span class=\"a\">A</span>\n",
+        "    <span class=\"b\">B</span>\n",
+        "  </>);\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Frag", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Frag } from './Frag.mjs';
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document; global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const result = Frag({}); root.appendChild(result);
+const spans = root.querySelectorAll('span');
+if (spans.length !== 2) { console.error('FAIL: expected 2 fragment children, got ' + spans.length); process.exit(1); }
+if (spans[0].textContent !== 'A' || spans[1].textContent !== 'B') { console.error('FAIL: fragment children order/content'); process.exit(1); }
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
 // ── Regression: .value property assignment on input elements ───────
+
+
 
 /// Verifies that reactive `value` bindings use direct DOM property
 /// assignment (`el.value = ...`) rather than `setAttribute('value', ...)`.
@@ -3112,6 +3182,14 @@ fn nested_route_two_levels_resolves_files_css_and_imports() {
         "hydrate island module should exist in dist"
     );
 
+    // Island props are serialized into the placeholder at SSR time so the
+    // client-side mount can rehydrate with the SAME props (not {}).
+    assert!(
+        html.contains("data-props='{\"label\":\"Go\"}'"),
+        "island props should be serialized into the hydrate placeholder, got: {}",
+        html
+    );
+
     // The manifest carries the canonical route → real file mapping.
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("routes.json")).unwrap()).unwrap();
@@ -3191,6 +3269,16 @@ fn adapter_node_ssr_serves_nested_route_with_depth_aware_paths() {
         "SSR client import should be depth-aware, got: {}",
         response
     );
+    assert!(
+        response.contains("data-props='{\"label\":\"Go\"}'"),
+        "SSR output should serialize island props, got: {}",
+        response
+    );
+    assert!(
+        response.contains("for (const el of document.querySelectorAll('[data-hydrate=\"Widget\"]')) { mount(el, () => Widget(el.dataset.props ? JSON.parse(el.dataset.props) : {})); }"),
+        "SSR mount should read props back from data-props, got: {}",
+        response
+    );
 
     child.kill().unwrap();
     let _ = child.wait();
@@ -3244,6 +3332,11 @@ fn adapter_static_uses_folder_url_convention_for_nested_route() {
         "CSS and client module references should survive folder-URL move, got: {}",
         html
     );
+    assert!(
+        html.contains("data-props='{\"label\":\"Go\"}'"),
+        "serialized island props should survive folder-URL move, got: {}",
+        html
+    );
 
     // routes.json rewritten to match the folder-URL layout.
     let manifest: serde_json::Value =
@@ -3256,4 +3349,256 @@ fn adapter_static_uses_folder_url_convention_for_nested_route() {
         .expect("manifest should contain /docs/api/signals");
     assert_eq!(route["file"], "docs/api/signals/index.html");
     assert_eq!(manifest["routes"][0]["file"], "index.html");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Bug class: server/client codegen parity (found via live production testing)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Bug: the same client island used twice on one page emitted TWO `import`
+/// statements for the same identifier — a SyntaxError that aborted the page's
+/// module script. Regression: exactly one import per island component, and
+/// BOTH instances mounted (each with its own SSR-serialized data-props).
+#[test]
+fn same_island_twice_emits_single_import_and_two_props() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components_dir = dir.path().join("components");
+    std::fs::create_dir(&components_dir).unwrap();
+    std::fs::write(components_dir.join("Widget.tsx"), concat!(
+        "// @runsOn client\n",
+        "type WidgetProps = { label: string };\n",
+        "export function Widget(props: WidgetProps) {\n",
+        "  return <div class=\"widget\"><span class=\"widget-label\">{props.label}</span></div>;\n",
+        "}\n",
+    )).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Index.tsx"), concat!(
+        "// @runsOn server\n",
+        "import { Widget } from '../components/Widget';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <div>\n",
+        "      <Widget label=\"Alpha\" client:hydrate />\n",
+        "      <Widget label=\"Beta\" client:hydrate />\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+
+    // Exactly ONE import per island component (duplicates are a SyntaxError).
+    let import_count = html.matches("import { Widget } from").count();
+    assert_eq!(import_count, 1, "must emit exactly one import, got {}:\n{}", import_count, html);
+
+    // Both instances present, each with its OWN serialized props.
+    assert!(html.contains("data-props='{\"label\":\"Alpha\"}'"), "first instance props, got: {}", html);
+    assert!(html.contains("data-props='{\"label\":\"Beta\"}'"), "second instance props, got: {}", html);
+    // Two placeholder DIVS (the mount-loop selector string also contains
+    // data-hydrate="Widget" but is not a placeholder element).
+    assert_eq!(
+        html.matches("data-hydrate=\"Widget\" data-props").count(),
+        2,
+        "two placeholders expected:\n{}",
+        html
+    );
+
+    // Mounts target ALL instances via querySelectorAll.
+    assert!(
+        html.contains("for (const el of document.querySelectorAll('[data-hydrate=\"Widget\"]'))"),
+        "mounts must iterate every instance, got:\n{}",
+        html
+    );
+
+    // routes.json lists the client module once.
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("routes.json")).unwrap()).unwrap();
+    let modules = manifest["routes"][0]["clientModules"].as_array().unwrap();
+    assert_eq!(modules.len(), 1, "clientModules must be deduped, got: {:?}", modules);
+    assert_eq!(modules[0]["name"], "Widget");
+}
+
+/// Bug: JSX attribute expressions in `@runsOn server` components were
+/// stringified into the literal source text (`class="{expr}"`) instead of
+/// evaluated — while client codegen evaluates them. Regression: the SSR html
+/// must contain the EVALUATED values for class={expr}, href={expr}, per-item
+/// expressions, and boolean-presence attributes.
+#[test]
+fn server_expression_attributes_evaluate_in_ssr_html() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Menu.tsx"), concat!(
+        "// @runsOn server\n",
+        "type MenuProps = {};\n",
+        "export function Menu(props: MenuProps) {\n",
+        "  const items = await data(async () => [{ id: 1, name: 'Coffee' }, { id: 2, name: 'Tea' }]);\n",
+        "  return (\n",
+        "    <ul class={items.length > 1 ? 'multi' : 'single'}>\n",
+        "      <For each={items} key={(x) => x.id}>\n",
+        "        {(x) => <li><a href={'/drinks/' + x.id} class={x.id === 1 ? 'hot' : 'cold'}>{x.name}</a></li>}\n",
+        "      </For>\n",
+        "      <input disabled={items.length === 0} />\n",
+        "      <input disabled={items.length > 0} />\n",
+        "      <><span>FragA</span><span>FragB</span></>\n",
+        "      {items.length > 1 ? <p class=\"many\">Many</p> : <p>One</p>}\n",
+        "    </ul>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("menu.html")).unwrap();
+
+    // Expressions must be EVALUATED, not stringified as literal source text.
+    assert!(html.contains("<ul class=\"multi\">"), "class expr evaluated, got: {}", html);
+    assert!(html.contains("<a href=\"/drinks/1\" class=\"hot\">"), "href+class exprs per item 1, got: {}", html);
+    assert!(html.contains("<a href=\"/drinks/2\" class=\"cold\">"), "href+class exprs per item 2, got: {}", html);
+
+    // No literal expression source may leak into the html.
+    assert!(!html.contains("{items.length"), "no stringified expr source, got: {}", html);
+    assert!(!html.contains("${"), "no template-literal leak, got: {}", html);
+
+    // Boolean attribute presence semantics: falsy → omitted, truthy → present.
+    assert!(html.contains("<input>"), "falsy boolean expr omits the attribute, got: {}", html);
+    assert!(html.contains("<input disabled=\"\">"), "truthy boolean expr emits the attribute, got: {}", html);
+
+    // Fragments render their children inline on the server path too.
+    assert!(html.contains("<span>FragA</span><span>FragB</span>"), "fragment children in SSR html, got: {}", html);
+
+    // Conditional-in-children (ternary returning elements) on the server path.
+    assert!(html.contains("<p class=\"many\">Many</p>"), "conditional element SSR html, got: {}", html);
+    assert!(!html.contains("<p>One</p>"), "unselected branch must not render, got: {}", html);
+}
+
+/// Real-browser half of the duplicate-island regression: the page module must
+/// execute WITHOUT a SyntaxError (duplicate import) and both islands must
+/// mount with their own props. Skips gracefully when Playwright/Chromium are
+/// unavailable, like hydrate_islands_verified_by_playwright_dom_positions.
+#[test]
+fn duplicate_island_mounts_both_instances_in_browser() {
+    let playwright_available = std::process::Command::new("npx")
+        .arg("playwright")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pw_cache = std::path::PathBuf::from(home).join(".cache/ms-playwright");
+    let browser_found = pw_cache.exists()
+        && std::fs::read_dir(&pw_cache)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok())
+                    .any(|e| e.file_name().to_str().map_or(false, |n| n.starts_with("chromium")))
+            })
+            .unwrap_or(false);
+
+    if !playwright_available || !browser_found {
+        eprintln!("SKIP: playwright or Chromium browser not installed — skipping real-browser duplicate-island test");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components_dir = dir.path().join("components");
+    std::fs::create_dir(&components_dir).unwrap();
+    std::fs::write(components_dir.join("Widget.tsx"), concat!(
+        "// @runsOn client\n",
+        "type WidgetProps = { label: string };\n",
+        "export function Widget(props: WidgetProps) {\n",
+        "  return <div class=\"widget\"><span class=\"widget-label\">{props.label}</span></div>;\n",
+        "}\n",
+    )).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Index.tsx"), concat!(
+        "// @runsOn server\n",
+        "import { Widget } from '../components/Widget';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <div>\n",
+        "      <Widget label=\"Alpha\" client:hydrate />\n",
+        "      <Widget label=\"Beta\" client:hydrate />\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = std::process::Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "build failed: {}", String::from_utf8_lossy(&status.stderr));
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut server = std::process::Command::new(&bin)
+        .arg("dev")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let mut ready = false;
+    while start.elapsed() < std::time::Duration::from_secs(30) {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", port).parse().unwrap(),
+            std::time::Duration::from_millis(200),
+        ).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(ready, "dev server did not start on port {}", port);
+
+    let spec = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/duplicate-island.spec.mjs");
+    let status = std::process::Command::new("npx")
+        .arg("playwright")
+        .arg("test")
+        .arg(spec)
+        .arg("--reporter=line")
+        .env("MARISJS_DEV_URL", format!("http://127.0.0.1:{}", port))
+        .status()
+        .unwrap_or_else(|e| {
+            server.kill().unwrap();
+            let _ = server.wait();
+            panic!("failed to run playwright: {}", e);
+        });
+
+    server.kill().unwrap();
+    let _ = server.wait();
+
+    assert!(
+        status.success(),
+        "playwright duplicate-island spec failed (exit {:?})",
+        status.code()
+    );
 }

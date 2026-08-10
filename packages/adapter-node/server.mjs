@@ -60,13 +60,20 @@ function htmlShell(serverHtml, route) {
   const prefix = depthPrefix(route.path);
   const runtime = prefix ? `${prefix}runtime.mjs` : './runtime.mjs';
   const cssLinks = (route.css || []).map(f => `  <link rel="stylesheet" href="${prefix}${f}">`).join('\n');
-  const clientImports = (route.clientModules || []).map(m =>
+  const seenImports = new Set();
+  const clientImports = (route.clientModules || []).filter(m => {
+    if (seenImports.has(m.name)) return false; // exactly ONE import per island
+    seenImports.add(m.name);
+    return true;
+  }).map(m =>
     // A relative module specifier MUST start with ./ ../ or / — at the
     // root (no depth prefix) that means an explicit "./".
     `    import { ${m.name} } from '${prefix ? prefix : './'}${m.path}';`
   ).join('\n');
   const clientMounts = (route.clientModules || []).map(m =>
-    `    mount(document.querySelector('[data-hydrate="${m.name}"]'), () => ${m.name}({}));`
+    // Mount EVERY instance of the island (multiple uses / inside <For>);
+    // each placeholder carries its own data-props from SSR render time.
+    `    for (const el of document.querySelectorAll('[data-hydrate="${m.name}"]')) { mount(el, () => ${m.name}(el.dataset.props ? JSON.parse(el.dataset.props) : {})); }`
   ).join('\n');
 
   return `<!DOCTYPE html>

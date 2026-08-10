@@ -1,6 +1,6 @@
 {
   "name": "@marisjs/adapter-node",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Plain Node.js HTTP server adapter for marisjs build output",
   "type": "module",
   "bin": {

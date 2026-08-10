@@ -119,7 +119,7 @@ export function bind(fn) {
 }
 
 export function mount(rootElement, componentFn) {
-  const result = componentFn();
+  const result = componentFn(rootElement);
   if (result instanceof Node) {
     rootElement.appendChild(result);
   } else if (result != null) {

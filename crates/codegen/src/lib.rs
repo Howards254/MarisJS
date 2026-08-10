@@ -214,7 +214,12 @@ pub fn collect_child_component_tags(node: &JsxNode) -> Vec<String> {
 fn collect_hydrate(node: &JsxNode, names: &mut Vec<String>) {
     match node {
         JsxNode::Element { tag, is_hydrate_root, children, .. } => {
-            if *is_hydrate_root { names.push(tag.clone()); }
+            // Dedupe by component name: a page using the same island twice
+            // must import it ONCE (a duplicate import is a SyntaxError) and
+            // mount every instance via querySelectorAll.
+            if *is_hydrate_root && !names.contains(tag) {
+                names.push(tag.clone());
+            }
             for child in children { collect_hydrate(child, names); }
         }
         JsxNode::Conditional { cons, alt, .. } => {
@@ -236,7 +241,14 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
         }
         JsxNode::Element { tag, attrs, children, is_hydrate_root, is_component } => {
             if *is_hydrate_root {
-                output.push_str(&format!("'<div data-hydrate=\"{}\"></div>'", tag));
+                // Emit the REAL props object (computed at SSR render time, so
+                // dynamic values work) into the placeholder. The client-side
+                // mount call reads them back via dataset.props.
+                let props_arg = build_props_object(attrs)?;
+                output.push_str(&format!(
+                    "'<div data-hydrate=\"{}\" data-props=\\'' + JSON.stringify({}) + '\\'></div>'",
+                    tag, props_arg
+                ));
                 return Ok(());
             }
             if *is_component {
@@ -256,14 +268,9 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
                 output.push(')');
                 return Ok(());
             }
-            let attr_str = build_attr_string(attrs);
-            let open = if attr_str.is_empty() {
-                format!("<{}>", tag)
-            } else {
-                format!("<{} {}>", tag, attr_str)
-            };
+            let open_js = gen_open_tag_js(tag, attrs);
             let close = format!("</{}>", tag);
-            output.push_str(&format!("('{}'", html_escape(&open)));
+            output.push_str(&format!("({}", open_js));
             for child in children {
                 output.push_str(" + ");
                 gen_html_node(child, output, parent_is_async)?;
@@ -286,22 +293,45 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
     Ok(())
 }
 
-fn build_attr_string(attrs: &[parser::JsxAttr]) -> String {
-    let mut s = String::new();
+/// Builds a JS expression that produces the opening tag string for a server
+/// (html-string) render. Static attribute values are embedded (entity-escaped
+/// at compile time); EXPRESSION values are EVALUATED at render time, matching
+/// the client codegen's behavior (which calls setAttribute with the value).
+/// Boolean attributes use presence semantics, mirroring the client's
+/// setAttribute/removeAttribute pair.
+fn gen_open_tag_js(tag: &str, attrs: &[parser::JsxAttr]) -> String {
+    let mut toks: Vec<String> = Vec::new();
+    let mut static_acc = format!("<{}", tag);
     for attr in attrs {
-        if attr.name.starts_with("on") && attr.name.chars().nth(2).map_or(false, |c| c.is_uppercase()) {
+        if is_event_attr(&attr.name).is_some() {
             continue;
         }
         match &attr.value {
             JsxAttrValue::String(value) => {
-                s.push_str(&format!(" {}=\"{}\"", attr.name, html_attr_escape(value)));
+                static_acc.push_str(&format!(" {}=\"{}\"", attr.name, html_attr_escape(value)));
             }
             JsxAttrValue::Expr(expr) => {
-                s.push_str(&format!(" {}=\"${{{}}}\"", attr.name, expr));
+                if !static_acc.is_empty() {
+                    toks.push(format!("'{}'", html_escape(&static_acc)));
+                    static_acc.clear();
+                }
+                if is_boolean_attr(&attr.name) {
+                    toks.push(format!("({} ? \" {}=\\\"\\\"\" : \"\")", expr, attr.name));
+                } else {
+                    toks.push(format!("\" {}=\\\"\" + ({}) + \"\\\"\"", attr.name, expr));
+                }
             }
         }
     }
-    s
+    static_acc.push('>');
+    if !static_acc.is_empty() {
+        toks.push(format!("'{}'", html_escape(&static_acc)));
+    }
+    if toks.is_empty() {
+        "'<>'".to_string()
+    } else {
+        format!("({})", toks.join(" + "))
+    }
 }
 
 fn html_escape(s: &str) -> String {

@@ -251,6 +251,7 @@ spec alone never needs to:
 | The import map | Fixed format. Copy it from the spec's HTML shell template. |
 | Route derivation from filenames | The manifest has URL paths. You never see filenames except the ones in `routes[].file`. |
 | How client hydration works | The compiler embeds `mount()` calls in the HTML. Your adapter just includes them in the shell. |
+| Island props + multiple instances | SSR placeholders carry `data-props` (JSON serialized at render time); mounts iterate `querySelectorAll('[data-hydrate="X"]')` so one island used N times mounts N instances, each with its own props. Shells that emit their own mount script must use the same pattern (see `packages/adapter-node/server.mjs`). |
 
 ## Checklist for any new adapter
 

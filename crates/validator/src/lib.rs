@@ -331,6 +331,67 @@ pub fn check_data_call_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diag
     }
 }
 
+/// §6: Reject reactivity and event wiring in `@runsOn server` files. The server
+/// codegen emits a static HTML string with no signal/computed wiring and no
+/// event listeners, so both would silently break or do nothing:
+///  - a signal referenced in server JSX would be an undefined identifier at
+///    prerender time (ReferenceError);
+///  - an on* handler attribute is dropped from the SSR html (no JS runs there).
+pub fn check_server_boundaries(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.runs_on != Some(RunsOn::Server) {
+        return;
+    }
+
+    for sig in &file.signals {
+        diagnostics.push(Diagnostic::new(
+            "SERVER_SIGNAL",
+            format!(
+                "signal/computed `{}` in @runsOn server file — reactive state is client-only. Server components render static HTML and have no reactive runtime.",
+                sig.name
+            ),
+            "Remove the signal and compute the value with data() or a plain const, or split the component: keep the reactive part in a @runsOn client island.",
+            None,
+            None,
+        ));
+    }
+
+    if let Some(tree) = &file.render_tree {
+        collect_server_events(tree, diagnostics);
+    }
+}
+
+fn collect_server_events(node: &parser::JsxNode, diagnostics: &mut Vec<Diagnostic>) {
+    match node {
+        parser::JsxNode::Element { attrs, children, .. } => {
+            for attr in attrs {
+                if let Some(rest) = attr.name.strip_prefix("on") {
+                    if rest.starts_with(|c: char| c.is_uppercase()) {
+                        diagnostics.push(Diagnostic::new(
+                            "SERVER_EVENT_HANDLER",
+                            format!(
+                                "on* handler `{}` in @runsOn server file — event listeners cannot run in server-rendered HTML and are silently dropped. Put the handler on a @runsOn client island instead.",
+                                attr.name
+                            ),
+                            "Move the interactive element into a @runsOn client component used with client:hydrate, or remove the handler.",
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            for child in children {
+                collect_server_events(child, diagnostics);
+            }
+        }
+        parser::JsxNode::Conditional { cons, alt, .. } => {
+            collect_server_events(cons, diagnostics);
+            collect_server_events(alt, diagnostics);
+        }
+        parser::JsxNode::ForEach { body, .. } => collect_server_events(body, diagnostics),
+        _ => {}
+    }
+}
+
 /// §3 rule 3: Component body statements must appear in the fixed order:
 /// signals/computed → derived consts → event handlers → single return.
 ///
@@ -574,8 +635,7 @@ pub fn check_unsupported_constructs(file: &ComponentFile, diagnostics: &mut Vec<
 /// §8: Helper functions in component body must not contain JSX in their bodies.
 /// JSX in handlers is not compiled by the codegen — it's emitted verbatim, causing
 /// runtime SyntaxErrors or silent stringification.
-pub fn check_handler_jsx(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
-    for (i, has_jsx) in file.handler_has_jsx.iter().enumerate() {
+pub fn check_handler_jsx(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {    for (i, has_jsx) in file.handler_has_jsx.iter().enumerate() {
         if *has_jsx {
             let handler_name = file.handler_decls
                 .get(i)
@@ -606,6 +666,7 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_conditional_rendering_form(file, &mut diagnostics);
     check_list_rendering_form(file, &mut diagnostics);
     check_data_call_boundary(file, &mut diagnostics);
+    check_server_boundaries(file, &mut diagnostics);
     check_statement_ordering(file, &mut diagnostics);
     check_unwrapped_signal_prop(file, &mut diagnostics);
     check_unsupported_constructs(file, &mut diagnostics);
@@ -676,8 +737,9 @@ fn normalize_path(p: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use parser::{
-        ComponentFile, ExportInfo, ExportKind, ImportInfo, JsxExprInfo, JsxExpression, PropsInfo,
-        RunsOn, TopLevelBinding, TypeAnnotation, BodyStmt, BodyStmtKind, ParserError,
+        ComponentFile, ExportInfo, ExportKind, ImportInfo, JsxAttr, JsxAttrValue, JsxExprInfo,
+        JsxExpression, JsxNode, PropsInfo, RunsOn, SignalDecl, SignalKind, TopLevelBinding,
+        TypeAnnotation, BodyStmt, BodyStmtKind, ParserError,
     };
 
     fn make_file() -> ComponentFile {
@@ -1225,6 +1287,92 @@ mod tests {
         check_data_call_boundary(&file, &mut diags);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "CLIENT_DATA_CALL");
+    }
+
+    // ── check_server_boundaries ─────────────────────────────────────────
+
+    #[test]
+    fn server_signal_is_rejected() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Server),
+            runs_on_count: 1,
+            signals: vec![SignalDecl {
+                name: "count".to_string(),
+                kind: SignalKind::Signal,
+                initial_value: "0".to_string(),
+            }],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_server_boundaries(&file, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "SERVER_SIGNAL");
+    }
+
+    #[test]
+    fn client_signal_is_allowed() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Client),
+            runs_on_count: 1,
+            signals: vec![SignalDecl {
+                name: "count".to_string(),
+                kind: SignalKind::Signal,
+                initial_value: "0".to_string(),
+            }],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_server_boundaries(&file, &mut diags);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn server_event_handler_is_rejected() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Server),
+            runs_on_count: 1,
+            render_tree: Some(parser::JsxNode::Element {
+                tag: "button".to_string(),
+                attrs: vec![
+                    parser::JsxAttr {
+                        name: "onClick".to_string(),
+                        value: parser::JsxAttrValue::Expr("() => {}".to_string()),
+                    },
+                ],
+                children: vec![],
+                is_hydrate_root: false,
+                is_component: false,
+            }),
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_server_boundaries(&file, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "SERVER_EVENT_HANDLER");
+    }
+
+    #[test]
+    fn server_plain_attribute_is_allowed() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Server),
+            runs_on_count: 1,
+            render_tree: Some(parser::JsxNode::Element {
+                tag: "a".to_string(),
+                attrs: vec![
+                    parser::JsxAttr {
+                        name: "href".to_string(),
+                        value: parser::JsxAttrValue::String("/x".to_string()),
+                    },
+                ],
+                children: vec![],
+                is_hydrate_root: false,
+                is_component: false,
+            }),
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_server_boundaries(&file, &mut diags);
+        assert!(diags.is_empty());
     }
 
     // ── check_statement_ordering ────────────────────────────────────────
