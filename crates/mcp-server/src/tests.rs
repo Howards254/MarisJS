@@ -139,6 +139,125 @@ fn fixtures_dir() -> String {
         assert_eq!(result.errors[0].code, "PARSE_ERROR");
     }
 
+    // ── Input contract: explicit { path } / { source } variants ────
+    //
+    // The tool no longer guesses path-vs-source from the string's content
+    // (the old heuristic misclassified paths containing "\n", "export ", or
+    // "// @runsOn"). These tests exercise the actual interface: serde
+    // deserialization + dispatch, plus the generated JSON schema.
+
+    fn deserialize_and_dispatch(input: &str) -> Value {
+        let parsed: ValidateInput = serde_json::from_str(input).unwrap();
+        let result = dispatch(parsed);
+        serde_json::to_value(&result).unwrap()
+    }
+
+    #[test]
+    fn test_input_schema_is_explicit_oneof() {
+        let schema = schemars::schema_for!(ValidateInput);
+        let schema_json = serde_json::to_value(&schema).unwrap();
+
+        // MCP requires the inputSchema root to be type "object" (the server
+        // panics otherwise). The contract must be two unambiguous variants
+        // (oneOf), never a single ambiguous string field, and strict
+        // (additionalProperties: false — both variants or unknown fields
+        // rejected).
+        assert_eq!(schema_json["type"], "object", "MCP root type object, got: {}", schema_json);
+        let properties = schema_json["properties"].as_object().expect("properties");
+        assert_eq!(properties.len(), 2, "both variants described: {}", schema_json);
+        assert_eq!(schema_json["additionalProperties"], false);
+
+        let one_of = schema_json["oneOf"].as_array().expect("oneOf in schema");
+        assert_eq!(one_of.len(), 2, "exactly two input variants: {:?}", one_of);
+
+        let mut variants: Vec<String> = one_of
+            .iter()
+            .map(|v| {
+                let required = v["required"].as_array().unwrap();
+                assert_eq!(required.len(), 1);
+                required[0].as_str().unwrap().to_string()
+            })
+            .collect();
+        variants.sort();
+        assert_eq!(variants, vec!["path".to_string(), "source".to_string()]);
+    }
+
+    #[test]
+    fn test_path_mode_dispatches_to_file_validation() {
+        // The path deliberately contains "export " — the exact substring the
+        // old heuristic used to guess "this is source code". Path mode must
+        // ignore the content and validate from disk (file-read failure here,
+        // since the file does not exist).
+        let output = deserialize_and_dispatch(r#"{"path": "/nonexistent/export dir/comp.tsx"}"#);
+        assert_eq!(output["valid"], false);
+        let error = error_by_code(&output, "PARSE_ERROR");
+        assert!(
+            error["message"].as_str().unwrap().contains("Failed to read"),
+            "path mode must attempt a FILE read, got: {}",
+            error["message"]
+        );
+    }
+
+    #[test]
+    fn test_source_mode_dispatches_to_source_validation() {
+        let source = "// @runsOn client\ntype P = { name: string };\nexport function inline(props: P) { return <div>{props.name}</div>; }\n";
+        let output = deserialize_and_dispatch(&format!(r#"{{"source": {}}}"#, serde_json::to_string(source).unwrap()));
+        assert_eq!(output["valid"], true, "valid inline source, got: {}", output);
+        assert!(output["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_single_line_source_without_heuristic_markers() {
+        // One-line source with NO newline, NO "export ", NO "@runsOn" — the
+        // old heuristic sent this to FILE validation ("Failed to read ...").
+        // Source mode must validate it as code and report real diagnostics.
+        let output = deserialize_and_dispatch(
+            r#"{"source": "type P = {}; function foo(props: P) {}"}"#,
+        );
+        assert_eq!(output["valid"], false);
+        let errors = output["errors"].as_array().unwrap();
+        assert!(
+            !errors.iter().any(|e| e["code"] == "PARSE_ERROR"),
+            "must be a validation result, not a file-read failure: {}",
+            output
+        );
+        assert!(
+            errors.iter().any(|e| e["code"] == "MISSING_RUNSON"),
+            "expected MISSING_RUNSON diagnostic, got: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_input_is_rejected() {
+        // Both variants at once — the caller must state exactly one intent.
+        let both = serde_json::from_str::<ValidateInput>(
+            r#"{"path": "/tmp/a.tsx", "source": "// @runsOn client"}"#,
+        );
+        assert!(both.is_err(), "path+source together must be rejected");
+
+        // Neither variant provided.
+        let neither = serde_json::from_str::<ValidateInput>(r#"{}"#);
+        assert!(neither.is_err(), "empty input must be rejected");
+
+        // The error must be ACTIONABLE — it must tell the caller what to do,
+        // not surface serde's internal "did not match any variant of untagged
+        // enum ValidateInput" (which names a Rust type and gives no guidance).
+        for err in [both, neither] {
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.contains("exactly one of `path` or `source`"),
+                "actionable guidance expected, got: {}",
+                msg
+            );
+            assert!(
+                !msg.contains("untagged enum"),
+                "no internal Rust type may leak: {}",
+                msg
+            );
+        }
+    }
+
     // ── PARSE_ERROR shape (same as CLI exit code 2 path) ───────────
 
     #[test]

@@ -120,8 +120,10 @@ Being upfront about this matters more than sounding finished:
   build output anywhere Node.js runs, and `@marisjs/adapter-static` produces a plain static
   directory for any static host; Vercel/Netlify-specific adapters are future work.
 - **No CSS scoping.** Styles are global — two components using the same class name will
-  silently collide. See the spec's Section 2a for the recommended (unenforced) naming
-  convention.
+  collide, but the build warns (`CSS_CLASS_COLLISION`, naming both files and the class)
+  when the same class is defined in two stylesheets loaded into one page — unless the
+  overlap is the established intentional pattern (see the spec's Section 2a for the
+  recommended, unenforced, naming convention).
 - **A meaningful subset of everyday JavaScript is unsupported and will fail validation
   loudly** rather than compiling into broken output: loops, `switch`/`try`/`catch`, class
   expressions, tagged templates, and a few other constructs. This is deliberate scope, not

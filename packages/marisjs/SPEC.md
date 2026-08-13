@@ -96,11 +96,24 @@ import type { CartProps } from "./types";
   on every page. The pattern for a single CSS file loaded on all pages is the site-wide
   stylesheet convention described immediately below.)
   This is a known, deliberate v1 limitation: it keeps the runtime simple (the compiler
-  copies the `.css` file verbatim to the output directory with no transformation). A future
-  phase may add scoping if collisions become a real debugging burden in practice.
-  Until then, the recommended convention is to prefix class names with the component name
-  (e.g. `.Cart-header` rather than `.header`), but this is not enforced by any validator
-  rule   — two components using the same class name will silently collide at runtime.
+  copies the `.css` file verbatim to the output directory with no transformation), and —
+  decisively — **automatic scoping is not planned in any future phase**. Class-name
+  rewriting (CSS Modules-style or otherwise) would break compatibility with external CSS
+  frameworks (Tailwind, Bootstrap, etc.) that depend on exact, predictable global class
+  names. Instead of scoping, collision RISK is made visible: at build time, when the same
+  class name is defined in two different `.css` files both transitively imported into the
+  same page, the build prints a `CSS_CLASS_COLLISION` warning naming both files and the
+  colliding class (a warning, never a build error — colliding class names across two
+  libraries is sometimes intentional and harmless). The check is calibrated not to fire on
+  the established intentional-overlap patterns: (1) the cascade-order override pattern — a
+  descendant component's stylesheet redefining a class from an ancestor component's
+  stylesheet (the ancestor's file loads first in the per-page `<link>` order, so the later
+  stylesheet deliberately wins); (2) the site-wide stylesheet convention below — a
+  stylesheet imported by a component rendered on more than one page is the base layer that
+  page-specific stylesheets legitimately refine. The recommended convention remains to
+  prefix class names with the component name (e.g. `.Cart-header` rather than `.header`),
+  but this is not enforced by any validator rule — two components using the same class name
+  will silently collide at runtime (visible only via the build warning above).
 
 **Site-wide stylesheet convention:**
 
@@ -506,22 +519,141 @@ rules — but each needs an answer before the compiler is built:
 These were discovered during the benchmark comparison (Phase D2) and are tracked here
 rather than being silently worked around:
 
-**#2 — Module-level consts not emitted in compiled output**
-`const` declarations at module level (outside the component function) are not captured
-by the parser and not emitted by codegen. If a component references a module-level const
-in JSX (e.g. `<For each={products}>`), the generated JS references an undefined variable.
-Existing example apps do not use this pattern (audited 20 files, zero occurrences), so
-no apps are currently broken. Fix: add module-level const capture to the parser's
-`ComponentFile` struct and emit them in codegen.
+**#2 (resolved 2026-08-13) — Module-level consts emitted in module scope**
 
-**#6 — Object-based style attributes compiled as `[object Object]`**
-JSX `style={{ background: 'red', padding: '1rem' }}` is parsed as an expression containing
-a JS object literal. Codegen emits `setAttribute('style', { ... })` which stringifies to
-`[object Object]`. The codegen has no special handling for style objects — it treats them
-as generic expression attributes. Fix: either (a) add codegen support to convert style
-objects to CSS strings at compile time, or (b) add a validator check that rejects object
-style syntax with a clear error directing users to use string styles
-(`style="background:red;padding:1rem"`).
+`const` declarations at module level (outside the component function) were not captured by
+the parser and not emitted by codegen, so referencing one in JSX (e.g. `<For each={products}>`)
+produced a `ReferenceError` at runtime. Fixed by capturing module-level consts in the parser's
+`ComponentFile` (the same `strip_var_ts` mechanism used for in-component derived consts,
+stripping TS annotations) and emitting them at module scope of the generated output, above
+the component function, on BOTH the client and server codegen paths (each verified
+independently — this project's history of client/server parity gaps says don't assume one
+path implies the other).
+
+Regression coverage: `client_component_references_module_level_const` asserts the const is
+emitted ABOVE the component function (with TS annotations stripped) and then EXECUTES the
+generated module in jsdom, asserting the rendered DOM; `server_page_references_module_level_const`
+builds through the real CLI and asserts the prerendered html contains the evaluated const
+values. The pre-fix state was confirmed failing on both paths (missing emit + `ReferenceError:
+sections is not defined` during prerender).
+
+**#6 (resolved 2026-08-13) — style={{...}} objects serialize to CSS strings**
+
+JSX `style={{ background: 'red', padding: '1rem' }}` previously compiled to
+`setAttribute('style', { ... })` which stringified to `[object Object]`. Fixed by adding a
+runtime `styleString` serializer (`@marisjs/runtime`) that converts objects to CSS strings —
+camelCase keys → kebab-case properties (`backgroundColor` → `background-color`), values
+joined as `property: value;` — and wiring it into BOTH codegen paths:
+
+- Client: any DOM element `style` expression attribute emits `setAttribute('style', styleString(expr))`.
+  Object literals, computed signals (`style={boxStyle.value}`), and string values (passthrough,
+  so `style={cond ? 'a:1' : 'b:2'}` keeps working) are all handled. When the expression reads
+  a signal (`.value`), the call is wrapped in the existing `bind()` mechanism, so the style
+  updates LIVE on signal change. `styleString` is imported only when the tree contains a style
+  expression (no dead imports).
+- Server: the prerendered html embeds `styleString(expr)` at render time, evaluated in the
+  same expression pipeline as every other attribute expression.
+
+Regression coverage: `client_static_style_object_serializes_to_css_string` (static object —
+asserts the exact style attribute string AND `getComputedStyle`), `client_reactive_style_object_updates_computed_style`
+(one value read from a signal — computed width + backgroundColor verified after signal
+changes), `client_computed_style_object_updates_computed_style` (computed() form — same live
+checks), and `server_style_object_serializes_in_prerendered_html` (CLI build — html contains
+the serialized CSS string, no `[object Object]`). The pre-fix state was confirmed failing on
+all four paths with the exact `[object Object]` symptom. Note: jsdom's `getComputedStyle` does
+not refresh values for elements in detached trees (probe-verified), so the reactive tests
+attach their tree to `document.body` like real usage.
+
+**#10 (resolved 2026-08-13) — CSS collision visibility (replaces "CSS scoping" from the benchmark fix list)**
+
+The original finding suggested CSS scoping as a gap. Deliberate decision (architect +
+owner): **no automatic class-name rewriting, under any framing** — it would break
+compatibility with external CSS frameworks (Tailwind, Bootstrap, etc.) that depend on
+exact, predictable global class names. Instead, collision risk is made visible rather than
+silent: a build-time check detects when the same class name is defined in two different
+`.css` files both transitively imported into the same page, and emits a
+`CSS_CLASS_COLLISION` warning (never a hard error) naming both source files and the
+colliding class.
+
+Implementation: a new `validator::css_collision` module — `extract_class_names` (a
+comment/string/number-aware `.class` selector extractor, so `1.5em`, `url(...)`, and
+`content: ".x"` never count as definitions) plus `find_css_class_collisions` — wired into
+the CLI build. For each page, the transitive closure walk (now `collect_page_css_closure`)
+records each stylesheet's import site, every component in the closure, and the
+child→parent map; the check runs after all pages are walked. Calibration against the two
+established intentional-overlap patterns (see §2a): a pair is exempt when the importing
+components stand in a strict ancestor/descendant relation (the cascade-order override
+pattern — the ancestor's file loads first in the `<link>` order, the descendant's
+redefinition is deliberate), or when either importing component renders on more than one
+page (the Layout site-wide stylesheet convention — the shared stylesheet is the base layer
+others refine).
+
+Regression coverage: validator unit tests (extraction edge cases: compound/list/
+descendant selectors, comments, strings, numeric `1.5em`/`.5em` and `url()` dots, keyframes,
+attribute-selector values, CSS escapes; finder: sibling collision fires, ancestor override
+silent, site-wide silent, mixed page finds only the genuine collision) and three full-CLI
+integration tests — `css_class_collision_warns_for_sibling_components_with_same_class`
+(two sibling components both defining `.header` → warning names both files and the class,
+build still succeeds), `css_class_collision_silent_for_ancestor_override_pattern` (the
+B2/B2.3 Base.css/Override.css `.box` shape → no warning), and
+`css_class_collision_silent_for_site_wide_layout_stylesheet` (Layout's `styles.css` and a
+Button's `Button.css` both defining `.btn`, Layout rendered on two pages → no warning).
+All three scenarios were verified manually against the real CLI binary before being locked
+in as tests; the pre-existing `transitive_css_collected_and_linked_in_page_html` fixture
+keeps passing unchanged (it IS the override pattern).
+
+**#11 (resolved 2026-08-14) — Follow-up hardening round (independent verification pass)**
+
+An independent debugging-agent pass over Fixes 1–3 found one blocking issue and three
+real-but-lower-severity issues. All fixed in this round:
+
+**Prop-drill depth (blocking).** `chain_reads_signal` only recognized a DIRECT `props`
+base, so `props.count.value` (1 level) was reactive but `props.nested.count.value` (2),
+`props.deeply.nested.count.value` (3), and deeper chains silently rendered once and never
+updated again — the base was a `MemberExpr`, not the bare `props` identifier, so the
+check fell through to the signal-name test and missed the props root. Fixed by replacing
+the fixed-shape match with a general iterative walk of the entire member chain to its
+root: reactive iff the chain ultimately originates from the `props` identifier at ANY
+depth, or ends in a known signal/computed name (historical behavior for
+`store.list.count.value` preserved; a non-string index like `props[idx].value` no longer
+defeats the props-root check). No fixed ceiling remains — depth is irrelevant by
+construction. Regression coverage: `props_drilled_signal_value_reactive_at_any_depth`
+asserts 1, 2, 3, AND 4 levels (`props.one.value` … `props.four.a.b.c.d.value`) all emit
+`bind()` (pre-fix: exactly 1 of 4) and all update live in jsdom when their parent
+signals change; the pre-existing `plain_object_value_field_is_not_reactive` still passes
+(no bind for non-signal chains).
+
+**Style serializer edge cases.** Two silent-invalid-CSS bugs in `styleString()`:
+null/undefined property values were emitted literally (`"color: null;"` — invalid CSS
+that silently does nothing) and bare numbers on dimensional properties (`{ width: 100 }`
+→ `"width: 100;"`) were missing their unit. Fixed: null/undefined values omit the
+property entirely (React's no-value convention), and numeric values get an automatic
+`px` unless the property is on React's well-established unitless-exempt list
+(`opacity`, `zIndex`, `lineHeight`, `flexGrow`, the full `isUnitlessNumber` set —
+reused, not invented). Both codegen paths were verified independently (parity
+discipline): `client_style_null_values_omitted_and_numeric_dimensional_gets_px`
+(asserts the exact style attribute AND that computed styles resolve — bare "width: 100;"
+is ignored by browsers, so computed width === '100px' proves the px is real) and
+`server_style_numeric_px_and_null_omitted_in_prerendered_html` (prerendered HTML has
+`width: 120px`, no `null`/`undefined`). The pre-existing static style test's expectation
+was updated (`font-size: 14` → `font-size: 14px`); all other pre-existing style tests
+use string values and were unaffected.
+
+**Server-const test independence.** `server_page_references_module_level_const` now
+asserts the server-emitted module directly (`pages/Menu.mjs` carries the consts at
+module scope with TS annotations stripped) in addition to the prerendered HTML — the
+fixture is a pure server component with no imports and no islands, so the client
+codegen path provably never runs for it and cannot "cover for" a server-only
+regression.
+
+**MCP error message quality.** Ambiguous `validate_component` input surfaced serde's
+internal message ("data did not match any variant of untagged enum ValidateInput") —
+a Rust type name with no guidance. `ValidateInput` now has a manual `Deserialize` that
+returns an actionable error: "Provide exactly one of `path` or `source` — both or
+neither were given." The strict oneOf schema is unchanged (still custom `schema_with`),
+unknown fields still rejected. `test_ambiguous_input_is_rejected` asserts the message
+contains the guidance and leaks no internal type; the stdio smoke test confirms the
+friendly message over the real MCP transport.
 
 **#7 (resolved 2026-08-10) — Island props now serialized through SSR**
 
@@ -600,6 +732,7 @@ a server path was audited against tests:
 | Text nodes | ✓ tested | ✓ tested | |
 | Static attrs | ✓ tested | ✓ tested | |
 | Expression attrs | ✓ tested | ✓ tested (was #9) | |
+| Style objects | ✓ tested (new) | ✓ tested (new) | CSS string serialization, reactive via bind (was #6) |
 | Boolean attrs | ✓ tested (new) | ✓ tested | presence semantics both paths |
 | Event handlers | ✓ tested | ✓ rejected (new) | server html has no JS — validator now rejects with SERVER_EVENT_HANDLER |
 | Conditional/ternary | ✓ tested | ✓ tested | element-position added to #9 test |
@@ -616,8 +749,9 @@ a server path was audited against tests:
 Beyond attribute expressions (#9), the audit found and fixed two more parity gaps: signals in
 server files passed validation then crashed prerender with a ReferenceError (now rejected with
 `SERVER_SIGNAL`), and `on*` handlers in server files were silently dropped from SSR html (now
-rejected with `SERVER_EVENT_HANDLER`). Known, deliberately-accepted divergence: `style` object
-attributes render `[object Object]` on both paths (documented separately).
+rejected with `SERVER_EVENT_HANDLER`). No known divergence remains: `style` object attributes
+previously rendered `[object Object]` on both paths — now serialized to CSS strings on both
+(resolved as #6, 2026-08-13).
 
 ---
 

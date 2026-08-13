@@ -1,5 +1,7 @@
 //! Walks the AST from parser and checks it against every rule in docs/framework-grammar-spec.md Sections 2–7. Produces a Vec<Diagnostic>, nothing else. Does not generate code.
 
+pub mod css_collision;
+
 use std::path::{Path, PathBuf};
 
 use parser::{

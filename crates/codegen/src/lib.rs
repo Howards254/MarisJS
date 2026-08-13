@@ -25,15 +25,19 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
     let mut output = String::new();
     let mut counter = AtomicCounter::new();
 
+    let props_param = component.props.as_ref().map(|p| p.name.as_str()).unwrap_or("props");
+
     let has_signal = component.signals.iter().any(|s| s.kind == SignalKind::Signal);
     let has_computed = component.signals.iter().any(|s| s.kind == SignalKind::Computed);
-    let needs_bind = tree_reads_signal(render_tree, &signal_names)
+    let needs_bind = tree_reads_signal(render_tree, &signal_names, props_param)
         || has_for_each_or_conditional(render_tree);
+    let needs_style = tree_has_style_expr(render_tree);
 
     let mut imports = Vec::new();
     if has_signal { imports.push("signal"); }
     if has_computed { imports.push("computed"); }
     if needs_bind { imports.push("bind"); }
+    if needs_style { imports.push("styleString"); }
 
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
@@ -48,6 +52,16 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
             "import {{ {} }} from '@marisjs/runtime';\n\n",
             imports.join(", ")
         ));
+    }
+
+    for mc in &component.module_consts {
+        for line in mc.lines() {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !component.module_consts.is_empty() {
+        output.push('\n');
     }
 
     output.push_str(&format!("export function {}(props) {{\n", component_name));
@@ -92,7 +106,7 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
         output.push('\n');
     }
 
-    let root_var = gen_node(render_tree, &mut output, &mut counter, 1, &signal_names)?;
+    let root_var = gen_node(render_tree, &mut output, &mut counter, 1, &signal_names, props_param)?;
 
     if !component.signals.is_empty() {
         let entries: Vec<String> = component.signals.iter().map(|s| s.name.clone()).collect();
@@ -148,6 +162,20 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
 
     if has_data {
         output.push_str("import { data } from '@marisjs/runtime';\n\n");
+    }
+
+    if tree_has_style_expr(render_tree) {
+        output.push_str("import { styleString } from '@marisjs/runtime';\n\n");
+    }
+
+    for mc in &component.module_consts {
+        for line in mc.lines() {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    if !component.module_consts.is_empty() {
+        output.push('\n');
     }
 
     let fn_prefix = if has_data { "async " } else { "" };
@@ -317,6 +345,10 @@ fn gen_open_tag_js(tag: &str, attrs: &[parser::JsxAttr]) -> String {
                 }
                 if is_boolean_attr(&attr.name) {
                     toks.push(format!("({} ? \" {}=\\\"\\\"\" : \"\")", expr, attr.name));
+                } else if attr.name == "style" {
+                    // style={expr} must evaluate to a CSS string — serialize
+                    // objects at render time (same styleString as the client).
+                    toks.push(format!("\" {}=\\\"\" + styleString({}) + \"\\\"\"", attr.name, expr));
                 } else {
                     toks.push(format!("\" {}=\\\"\" + ({}) + \"\\\"\"", attr.name, expr));
                 }
@@ -362,15 +394,39 @@ fn has_for_each_or_conditional(node: &JsxNode) -> bool {
     }
 }
 
-fn tree_reads_signal(node: &JsxNode, signal_names: &[String]) -> bool {
+/// True when the tree contains a DOM element with a style EXPRESSION attribute
+/// (`style={...}`), i.e. one that needs the runtime styleString serializer.
+/// String style attrs and component style PROPS are untouched by this.
+fn tree_has_style_expr(node: &JsxNode) -> bool {
     match node {
-        JsxNode::Expr(text) => is_reactive_expr(text, signal_names),
-        JsxNode::Conditional { test, .. } => is_reactive_expr(test, signal_names),
-        JsxNode::ForEach { each, .. } => is_reactive_expr(each, signal_names),
+        JsxNode::Element { attrs, children, is_component, is_hydrate_root, .. } => {
+            if !is_component
+                && !is_hydrate_root
+                && attrs.iter().any(|a| {
+                    a.name == "style" && matches!(a.value, JsxAttrValue::Expr(_))
+                })
+            {
+                return true;
+            }
+            children.iter().any(tree_has_style_expr)
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            tree_has_style_expr(cons) || tree_has_style_expr(alt)
+        }
+        JsxNode::ForEach { body, .. } => tree_has_style_expr(body),
+        _ => false,
+    }
+}
+
+fn tree_reads_signal(node: &JsxNode, signal_names: &[String], props_param: &str) -> bool {
+    match node {
+        JsxNode::Expr(text) => is_reactive_expr(text, signal_names, props_param),
+        JsxNode::Conditional { test, .. } => is_reactive_expr(test, signal_names, props_param),
+        JsxNode::ForEach { each, .. } => is_reactive_expr(each, signal_names, props_param),
         JsxNode::Element { children, attrs, .. } => {
-            children.iter().any(|c| tree_reads_signal(c, signal_names))
+            children.iter().any(|c| tree_reads_signal(c, signal_names, props_param))
                 || attrs.iter().any(|a| match &a.value {
-                    JsxAttrValue::Expr(text) => is_reactive_expr(text, signal_names),
+                    JsxAttrValue::Expr(text) => is_reactive_expr(text, signal_names, props_param),
                     _ => false,
                 })
         }
@@ -378,15 +434,12 @@ fn tree_reads_signal(node: &JsxNode, signal_names: &[String]) -> bool {
     }
 }
 
-fn reads_signal(expr: &str, signal_names: &[String]) -> bool {
-    for name in signal_names {
-        if expr.contains(&format!("{}.value", name)) { return true; }
-    }
-    false
-}
-
-fn is_reactive_expr(expr: &str, signal_names: &[String]) -> bool {
-    reads_signal(expr, signal_names) || expr.contains(".value")
+/// AST-based reactivity check: reads of known signal/computed `.value`
+/// properties (or props-drilled signals). See parser::expr_reads_signal_value
+/// for the exact semantics — no more text substring matching, so a plain
+/// object with an unrelated `.value` field is not reactive.
+fn is_reactive_expr(expr: &str, signal_names: &[String], props_param: &str) -> bool {
+    parser::expr_reads_signal_value(expr, signal_names, props_param)
 }
 
 fn is_signal_name(expr: &str, signal_names: &[String]) -> bool {
@@ -532,16 +585,17 @@ fn gen_node(
     counter: &mut AtomicCounter,
     indent: usize,
     signal_names: &[String],
+    props_param: &str,
 ) -> Result<String, String> {
     match node {
         JsxNode::Conditional { test, cons, alt } =>
-            gen_conditional(test, cons, alt, output, counter, indent, signal_names),
+            gen_conditional(test, cons, alt, output, counter, indent, signal_names, props_param),
         JsxNode::ForEach { each, key_fn, item_param, body, for_body_decls } =>
-            gen_for_each(each, key_fn, item_param, body, for_body_decls, output, counter, indent, signal_names),
+            gen_for_each(each, key_fn, item_param, body, for_body_decls, output, counter, indent, signal_names, props_param),
         JsxNode::Element { tag, attrs, children, is_hydrate_root, is_component } =>
-            gen_element(tag, attrs, children, *is_hydrate_root, *is_component, output, counter, indent, signal_names),
+            gen_element(tag, attrs, children, *is_hydrate_root, *is_component, output, counter, indent, signal_names, props_param),
         JsxNode::Text(text) => Ok(gen_text(text, output, counter, indent)),
-        JsxNode::Expr(expr) => Ok(gen_expr(expr, output, counter, indent, signal_names)),
+        JsxNode::Expr(expr) => Ok(gen_expr(expr, output, counter, indent, signal_names, props_param)),
     }
 }
 
@@ -555,6 +609,7 @@ fn gen_element(
     counter: &mut AtomicCounter,
     indent: usize,
     signal_names: &[String],
+    props_param: &str,
 ) -> Result<String, String> {
     if is_component {
         return gen_component_call(tag, attrs, output, counter, indent, signal_names);
@@ -563,11 +618,11 @@ fn gen_element(
 
     if tag.is_empty() {
         if children.len() == 1 {
-            return gen_node(&children[0], output, counter, indent, signal_names);
+            return gen_node(&children[0], output, counter, indent, signal_names, props_param);
         }
         writeln(output, indent, &format!("const {} = document.createDocumentFragment();", var));
         for child in children {
-            let cv = gen_node(child, output, counter, indent, signal_names)?;
+            let cv = gen_node(child, output, counter, indent, signal_names, props_param)?;
             writeln(output, indent, &format!("{}.appendChild({});", var, cv));
         }
         return Ok(var);
@@ -591,7 +646,7 @@ fn gen_element(
                 if is_boolean_attr(&attr.name) {
                     let set_op = format!("{}.setAttribute('{}', '')", var, attr.name);
                     let remove_op = format!("{}.removeAttribute('{}')", var, attr.name);
-                    if is_reactive_expr(expr, signal_names) {
+                    if is_reactive_expr(expr, signal_names, props_param) {
                         writeln(output, indent, &format!(
                             "bind(() => {{ if ({}) {{ {}; }} else {{ {}; }} }});",
                             expr, set_op, remove_op
@@ -603,12 +658,23 @@ fn gen_element(
                         ));
                     }
                 } else {
-                    let dom_op = if needs_property_assignment(&attr.name) {
+                    // style={{...}} objects and style={expr} must serialize to a
+                    // CSS string at runtime — an object coerced by setAttribute
+                    // renders "[object Object]". styleString handles object
+                    // literals, computed() results, and string values (passthrough).
+                    let dom_op = if attr.name == "style" {
+                        let op_value = format!("styleString({})", expr);
+                        if needs_property_assignment(&attr.name) {
+                            format!("{}.{} = {}", var, attr.name, op_value)
+                        } else {
+                            format!("{}.setAttribute('{}', {})", var, attr.name, op_value)
+                        }
+                    } else if needs_property_assignment(&attr.name) {
                         format!("{}.{} = {}", var, attr.name, expr)
                     } else {
                         format!("{}.setAttribute('{}', {})", var, attr.name, expr)
                     };
-                    if is_reactive_expr(expr, signal_names) {
+                    if is_reactive_expr(expr, signal_names, props_param) {
                         writeln(output, indent, &format!("bind(() => {{ {}; }});", dom_op));
                     } else {
                         writeln(output, indent, &format!("{};", dom_op));
@@ -630,7 +696,7 @@ fn gen_element(
             }
             JsxNode::Expr(expr) => {
                 let dom_op = format!("{}.textContent = {}", var, expr);
-                if is_reactive_expr(expr, signal_names) {
+                if is_reactive_expr(expr, signal_names, props_param) {
                     writeln(output, indent, &format!("bind(() => {{ {}; }});", dom_op));
                 } else {
                     writeln(output, indent, &format!("{};", dom_op));
@@ -642,7 +708,7 @@ fn gen_element(
         for child in children {
             match child {
                 JsxNode::Element { .. } | JsxNode::Conditional { .. } | JsxNode::ForEach { .. } => {
-                    let cv = gen_node(child, output, counter, indent, signal_names)?;
+                    let cv = gen_node(child, output, counter, indent, signal_names, props_param)?;
                     writeln(output, indent, &format!("{}.appendChild({});", var, cv));
                 }
                 JsxNode::Text(text) => {
@@ -650,7 +716,7 @@ fn gen_element(
                     writeln(output, indent, &format!("{}.appendChild({});", var, tv));
                 }
                 JsxNode::Expr(expr) => {
-                    let tv = gen_expr_text_node(expr, output, counter, indent, signal_names);
+                    let tv = gen_expr_text_node(expr, output, counter, indent, signal_names, props_param);
                     writeln(output, indent, &format!("{}.appendChild({});", var, tv));
                 }
             }
@@ -667,17 +733,17 @@ fn gen_text(text: &str, output: &mut String, counter: &mut AtomicCounter, indent
     var
 }
 
-fn gen_expr(expr: &str, output: &mut String, counter: &mut AtomicCounter, indent: usize, signal_names: &[String]) -> String {
+fn gen_expr(expr: &str, output: &mut String, counter: &mut AtomicCounter, indent: usize, signal_names: &[String], props_param: &str) -> String {
     let var = format!("txt{}", counter.next());
     writeln(output, indent, &format!("const {} = document.createTextNode({});", var, expr));
-    if is_reactive_expr(expr, signal_names) {
+    if is_reactive_expr(expr, signal_names, props_param) {
         writeln(output, indent, &format!("bind(() => {{ {}.nodeValue = {}; }});", var, expr));
     }
     var
 }
 
-fn gen_expr_text_node(expr: &str, output: &mut String, counter: &mut AtomicCounter, indent: usize, signal_names: &[String]) -> String {
-    gen_expr(expr, output, counter, indent, signal_names)
+fn gen_expr_text_node(expr: &str, output: &mut String, counter: &mut AtomicCounter, indent: usize, signal_names: &[String], props_param: &str) -> String {
+    gen_expr(expr, output, counter, indent, signal_names, props_param)
 }
 
 // ---------------------------------------------------------------------------
@@ -740,13 +806,14 @@ fn gen_conditional(
     counter: &mut AtomicCounter,
     indent: usize,
     signal_names: &[String],
+    props_param: &str,
 ) -> Result<String, String> {
     let anchor_var = format!("_an{}", counter.next());
     let frag_var = format!("_fr{}", counter.next());
     let curr_var = format!("_cu{}", counter.next());
 
-    let true_var = gen_node(cons, output, counter, indent + 1, signal_names)?;
-    let false_var = gen_node(alt, output, counter, indent + 1, signal_names)?;
+    let true_var = gen_node(cons, output, counter, indent + 1, signal_names, props_param)?;
+    let false_var = gen_node(alt, output, counter, indent + 1, signal_names, props_param)?;
 
     writeln(output, indent, &format!("const {} = document.createComment('');", anchor_var));
     writeln(output, indent, &format!("const {} = document.createDocumentFragment();", frag_var));
@@ -775,6 +842,7 @@ fn gen_for_each(
     counter: &mut AtomicCounter,
     indent: usize,
     signal_names: &[String],
+    props_param: &str,
 ) -> Result<String, String> {
     let anchor_var = format!("_fa{}", counter.next());
     let frag_var = format!("_ff{}", counter.next());
@@ -793,7 +861,7 @@ fn gen_for_each(
             writeln(output, render_indent, line);
         }
     }
-    let body_var = gen_node(body, output, counter, render_indent, signal_names)?;
+    let body_var = gen_node(body, output, counter, render_indent, signal_names, props_param)?;
     writeln(output, render_indent, &format!("return {};", body_var));
     writeln(output, indent, "}");
 

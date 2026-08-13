@@ -13,11 +13,80 @@ use rmcp::{
 use serde::Serialize;
 
 // ── Input ──────────────────────────────────────────────────────────
+//
+// Explicit, unambiguous input contract: the caller states its intent by
+// providing EXACTLY ONE of the two variants. There is no heuristic guessing
+// whether a string is a path or source code (the previous single-string
+// interface misclassified paths containing "\n", "export ", or "// @runsOn").
+// The JSON schema is an object with oneOf of the two variants — MCP-compliant
+// (root type "object") and strict (additionalProperties: false, so passing
+// both variants or an unknown field is rejected).
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct ValidateParams {
-    #[schemars(description = "Absolute path to a .tsx file, or raw TSX source code")]
-    source: String,
+#[derive(Debug, schemars::JsonSchema)]
+#[schemars(schema_with = "validate_input_schema")]
+enum ValidateInput {
+    Path { path: String },
+    Source { source: String },
+}
+
+// Manual Deserialize so ambiguous input produces an ACTIONABLE error instead
+// of serde's internal "data did not match any variant of untagged enum
+// ValidateInput" (which names a Rust type and tells the caller nothing about
+// what to do — this project's fail-loud standard: errors say what to do).
+// The schema is unaffected (still the strict oneOf object from
+// validate_input_schema); unknown fields are still rejected via
+// deny_unknown_fields on the raw shape.
+impl<'de> serde::Deserialize<'de> for ValidateInput {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            path: Option<String>,
+            source: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        match (raw.path, raw.source) {
+            (Some(path), None) => Ok(ValidateInput::Path { path }),
+            (None, Some(source)) => Ok(ValidateInput::Source { source }),
+            _ => Err(serde::de::Error::custom(
+                "Provide exactly one of `path` or `source` — both or neither were given.",
+            )),
+        }
+    }
+}
+
+fn validate_input_schema(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    use schemars::Schema;
+    use serde_json::{json, Map};
+
+    let string_prop = |description: &str| -> serde_json::Value {
+        json!({ "type": "string", "description": description })
+    };
+
+    let required_variant = |name: &str| -> serde_json::Value {
+        json!({ "required": [name] })
+    };
+
+    let mut obj = Map::new();
+    obj.insert("type".into(), json!("object"));
+    obj.insert(
+        "properties".into(),
+        json!({
+            "path": string_prop("Absolute path to an existing .tsx file to validate from disk"),
+            "source": string_prop("Raw TSX source code to validate in-memory (reported filename: inline.tsx)"),
+        }),
+    );
+    // Exactly one of the two fields; anything else is rejected.
+    obj.insert("additionalProperties".into(), json!(false));
+    obj.insert(
+        "oneOf".into(),
+        json!([
+            required_variant("path"),
+            required_variant("source"),
+        ]),
+    );
+    let _ = gen;
+    Schema::from(obj)
 }
 
 // ── Output (identical shape to CLI `marisjs validate`) ──────────────
@@ -44,9 +113,12 @@ struct Marisjs;
 
 #[tool_router(server_handler)]
 impl Marisjs {
-    #[tool(description = "Validate a marisjs .tsx component file. Accepts either an absolute file path or raw TSX source code. Returns { valid, errors: [{ line, column, code, message, fix_hint }] } — the same structured JSON that `marisjs validate` produces.")]
-    fn validate_component(&self, Parameters(params): Parameters<ValidateParams>) -> String {
-        let result = validate(&params.source);
+    #[tool(description = "Validate a marisjs .tsx component. Provide EXACTLY ONE of: 'path' (absolute path to an existing .tsx file) or 'source' (raw TSX source code, validated in-memory). Returns { valid, errors: [{ line, column, code, message, fix_hint }] } — the same structured JSON that `marisjs validate` produces.")]
+    fn validate_component(&self, Parameters(params): Parameters<ValidateInput>) -> String {
+        let result = match params {
+            ValidateInput::Path { path } => validate_file(&path),
+            ValidateInput::Source { source } => validate_source(&source),
+        };
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
             format!(r#"{{"valid":false,"errors":[{{"code":"INTERNAL","message":"{}","fix_hint":"","line":null,"column":null}}]}}"#, e)
         })
@@ -55,11 +127,11 @@ impl Marisjs {
 
 // ── Core validation logic (shared with CLI) ────────────────────────
 
-pub(crate) fn validate(source: &str) -> ValidateResult {
-    if source.contains('\n') || source.contains("export ") || source.contains("// @runsOn") {
-        validate_source(source)
-    } else {
-        validate_file(source)
+/// Total dispatch over the explicit input contract — no guessing.
+fn dispatch(input: ValidateInput) -> ValidateResult {
+    match input {
+        ValidateInput::Path { path } => validate_file(&path),
+        ValidateInput::Source { source } => validate_source(&source),
     }
 }
 

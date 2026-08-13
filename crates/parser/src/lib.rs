@@ -178,6 +178,7 @@ pub struct ComponentFile {
     pub handler_decls: Vec<String>,
     pub handler_has_jsx: Vec<bool>,
     pub derived_consts: Vec<String>,
+    pub module_consts: Vec<String>,
     pub unsupported_errors: Vec<ParserError>,
 }
 
@@ -204,6 +205,7 @@ impl ComponentFile {
             handler_decls: Vec::new(),
             handler_has_jsx: Vec::new(),
             derived_consts: Vec::new(),
+            module_consts: Vec::new(),
             unsupported_errors: Vec::new(),
         }
     }
@@ -365,6 +367,135 @@ fn parse_runs_on_comment(text: &str) -> Option<RunsOn> {
     None
 }
 
+/// AST-based reactivity detection: does `expr` read a known signal/computed
+/// identifier's `.value` property (or a signal drilled through the component's
+/// `props`, e.g. `props.tasks.value`)?
+///
+/// The expression is actually PARSED and its MemberExprs are walked, instead
+/// of substring-matching the source text, so the classic false positives are
+/// gone: a plain object's unrelated `.value` field (`config.value` where
+/// `config` is not a signal) and `.value` inside string literals
+/// (`'a.value.b'`) are correctly NOT reactive. Reads still detected:
+///   - `count.value` / `total.value` — identifier in `signal_names`
+///   - `store.list.count.value` — chain ending in a signal identifier
+///   - `props.tasks.value` / `props['tasks'].value` — drilled signal prop
+///   - nested reads anywhere: `arr[count.value]`, `Math.max(a.value, b.value)`
+///
+/// If the text cannot be parsed as an expression (JSX conditionals are
+/// separate JsxNode kinds, so this shouldn't happen for attr/text exprs),
+/// falls back to the historical text-containment check so behavior can never
+/// silently regress.
+pub fn expr_reads_signal_value(expr: &str, signal_names: &[String], props_param: &str) -> bool {
+    let syntax = Syntax::Typescript(TsConfig {
+        tsx: true,
+        ..Default::default()
+    });
+    let mut parser = Parser::new(
+        syntax,
+        StringInput::new(expr, BytePos(0), BytePos(expr.len() as u32)),
+        None,
+    );
+    match parser.parse_expr() {
+        Ok(parsed) => {
+            let mut visitor = SignalValueReader {
+                names: signal_names,
+                props_param,
+                found: false,
+            };
+            parsed.visit_with(&mut visitor);
+            visitor.found
+        }
+        Err(_) => {
+            signal_names.iter().any(|name| expr.contains(&format!("{}.value", name)))
+                || expr.contains(".value")
+        }
+    }
+}
+
+struct SignalValueReader<'a> {
+    names: &'a [String],
+    props_param: &'a str,
+    found: bool,
+}
+
+impl Visit for SignalValueReader<'_> {
+    fn visit_member_expr(&mut self, n: &MemberExpr) {
+        if is_value_prop(&n.prop) && chain_reads_signal(&n.obj, self.names, self.props_param) {
+            self.found = true;
+        }
+        n.visit_children_with(self);
+    }
+}
+
+fn is_value_prop(prop: &MemberProp) -> bool {
+    match prop {
+        MemberProp::Ident(id) => id.sym == "value",
+        MemberProp::Computed(computed) => {
+            matches!(&*computed.expr, Expr::Lit(Lit::Str(s)) if s.value == "value")
+        }
+        _ => false,
+    }
+}
+
+/// The object chain immediately left of a `.value` member. Reactive when the
+/// chain ultimately originates from the component's `props` parameter at ANY
+/// depth (drilled signal — the framework contract is "pass the signal by
+/// reference, read .value in the child", so `props.<name>.value` is a signal
+/// read by definition), or when it ends in a known signal/computed identifier.
+///
+/// The walk is fully general: it iterates the entire member-access chain to
+/// its root identifier, so depth never matters — `props.count.value` (1 level),
+/// `props.nested.count.value` (2), `props.deeply.nested.count.value` (3), and
+/// arbitrarily many more all resolve identically. There is no fixed-depth
+/// ceiling (regression: depth ≥ 2 silently rendered once and never updated).
+fn chain_reads_signal(obj: &Expr, names: &[String], props_param: &str) -> bool {
+    // The identifier of the LAST member before `.value` (None when the chain
+    // is a bare identifier like `count.value`). Kept so `store.list.count.value`
+    // still reacts when `count` is a known signal (historical behavior).
+    let mut rightmost: Option<String> = None;
+    let mut cur = obj;
+    loop {
+        match cur {
+            Expr::Ident(id) => {
+                if id.sym == props_param {
+                    return true;
+                }
+                if names.iter().any(|n| n == id.sym.as_str()) {
+                    return true;
+                }
+                return rightmost
+                    .as_ref()
+                    .map_or(false, |r| names.iter().any(|n| n == r));
+            }
+            Expr::Member(m) => {
+                match &m.prop {
+                    MemberProp::Ident(id) => {
+                        if rightmost.is_none() {
+                            rightmost = Some(id.sym.to_string());
+                        }
+                    }
+                    MemberProp::Computed(computed) => {
+                        match &*computed.expr {
+                            Expr::Lit(Lit::Str(s)) => {
+                                if rightmost.is_none() {
+                                    rightmost = Some(s.value.to_string());
+                                }
+                            }
+                            // A non-string index can't contribute a name, but
+                            // it must not defeat the props-root check either
+                            // (`props[idx].value` still originates from props).
+                            _ => {}
+                        }
+                    }
+                    MemberProp::PrivateName(_) => return false,
+                }
+                cur = &m.obj;
+            }
+            _ => return false,
+        }
+    }
+}
+
 struct Extractor<'a> {
     cm: &'a SourceMap,
     file: &'a mut ComponentFile,
@@ -524,7 +655,16 @@ impl Visit for Extractor<'_> {
                                 column: col,
                             },
                         ),
-                        _ => {}
+                        VarDeclKind::Const => {
+                            // Module-level const (e.g. a shared config array/object):
+                            // capture the source text (TS annotations stripped) the
+                            // same way in-component derived consts are captured, so
+                            // codegen can emit it at module scope of the output.
+                            if let Ok(src) = self.cm.span_to_snippet(n.span) {
+                                let stripped = strip_var_ts(&src, n.span, n);
+                                self.file.module_consts.push(stripped);
+                            }
+                        }
                     }
                 }
             }

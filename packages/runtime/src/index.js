@@ -133,3 +133,42 @@ export function data(fetcher) {
   }
   return fetcher();
 }
+
+// Properties that are unitless by definition — React's well-established
+// isUnitlessNumber list (react-dom CSSPropertyOperations), keyed by the
+// camelCase names used in JSX style objects. Numeric values on ANY OTHER
+// property get an automatic px unit; bare numbers on dimensional properties
+// ("width: 100;") are invalid CSS and silently ignored by browsers.
+const UNITLESS_PROPERTIES = new Set([
+  'animationIterationCount', 'aspectRatio', 'borderImageOutset', 'borderImageSlice',
+  'borderImageWidth', 'boxFlex', 'boxFlexGroup', 'boxOrdinalGroup', 'columnCount',
+  'columns', 'flex', 'flexGrow', 'flexPositive', 'flexShrink', 'flexNegative',
+  'flexOrder', 'gridArea', 'gridRow', 'gridRowEnd', 'gridRowSpan', 'gridRowStart',
+  'gridColumn', 'gridColumnEnd', 'gridColumnSpan', 'gridColumnStart', 'fontWeight',
+  'lineClamp', 'lineHeight', 'opacity', 'order', 'orphans', 'tabSize', 'widows',
+  'zIndex', 'zoom', 'fillOpacity', 'floodOpacity', 'stopOpacity',
+  'strokeDasharray', 'strokeDashoffset', 'strokeMiterlimit', 'strokeOpacity',
+  'strokeWidth',
+]);
+
+// Serializes a JSX style object to a CSS string: camelCase keys become
+// kebab-case properties (backgroundColor → background-color), values joined
+// as "property: value;". Strings pass through unchanged so `style="a:1"` and
+// `style={cond ? 'a:1' : 'b:2'}` keep working. Nullish/non-objects → ''.
+// null/undefined property VALUES are omitted entirely (never "color: null;").
+export function styleString(value) {
+  if (typeof value === 'string') return value;
+  if (value == null || typeof value !== 'object') return '';
+  const parts = [];
+  for (const key of Object.keys(value)) {
+    const v = value[key];
+    if (v == null) continue; // no value → omit the property
+    const prop = key.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+    if (typeof v === 'number' && v !== 0 && !UNITLESS_PROPERTIES.has(key)) {
+      parts.push(prop + ': ' + v + 'px;');
+    } else {
+      parts.push(prop + ': ' + v + ';');
+    }
+  }
+  return parts.join(' ');
+}

@@ -14,7 +14,23 @@ The binary is `target/release/marisjs-mcp`. It communicates over stdio using the
 
 ### `validate_component`
 
-Accepts a file path or raw TSX source code. Returns the exact same structured JSON that `marisjs validate` produces:
+Validates a marisjs `.tsx` component. The input contract is explicit — provide **exactly one** of two variants; the server never guesses whether a string is a path or code (the old single-string interface could misclassify a file path that happened to contain `\n`, `export `, or `// @runsOn`):
+
+```json
+{ "path": "/abs/path/to/Component.tsx" }
+```
+
+or
+
+```json
+{ "source": "// @runsOn client\ntype P = {};\nexport function inline(props: P) { return <div/>; }\n" }
+```
+
+- `path` — absolute path to an existing `.tsx` file, validated from disk (reported line/column match the file).
+- `source` — raw TSX source, validated in-memory (reported filename: `inline.tsx`).
+- Passing both variants, neither, or an unknown field is rejected by the schema (`oneOf` of two strict objects); the error is actionable, not a raw deserialization dump: "Provide exactly one of `path` or `source` — both or neither were given."
+
+Returns the exact same structured JSON that `marisjs validate` produces:
 
 ```json
 {

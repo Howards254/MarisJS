@@ -80,6 +80,28 @@ struct PageRoute {
     has_data: bool,
 }
 
+/// Everything the CSS collision check needs about one page's transitive
+/// closure: the ordered `<link>` files, each file's import site (the .tsx
+/// component that imports it), every component in the closure (for site-wide
+/// detection), and the parent map (child → parent) for ancestry checks.
+struct PageCssClosure {
+    css_files: Vec<String>,
+    sites: Vec<(String, PathBuf)>,
+    components: Vec<PathBuf>,
+    parents: HashMap<PathBuf, PathBuf>,
+}
+
+impl Default for PageCssClosure {
+    fn default() -> Self {
+        Self {
+            css_files: Vec::new(),
+            sites: Vec::new(),
+            components: Vec::new(),
+            parents: HashMap::new(),
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -314,27 +336,31 @@ fn walk_and_build(
 
 /// Resolves the transitive CSS for each page by walking the component dependency tree.
 /// Copies CSS files into the output directory preserving relative structure.
+/// After all pages are walked, runs the CSS class-collision check per page
+/// (CSS_COLLISION visibility — see validator::css_collision) and prints any
+/// warnings to stderr. Warnings never fail the build.
 fn resolve_page_css(
     page_routes: Vec<PageRoute>,
     component_meta: &HashMap<PathBuf, ComponentMeta>,
     source_dir: &Path,
     out_dir: &Path,
 ) -> Result<Vec<PageRoute>, String> {
-    let mut result = Vec::new();
+    let mut result: Vec<PageRoute> = Vec::new();
+    let mut closures: Vec<(usize, PageCssClosure)> = Vec::new();
 
-    for mut page in page_routes {
+    for (idx, mut page) in page_routes.into_iter().enumerate() {
         // Use the page's real source path (recorded at build time) — the
         // component_meta keys are the actual on-disk rel paths, so the
         // case must match the source tree exactly.
         let page_rel = page.mjs_rel.trim_end_matches(".mjs").to_string() + ".tsx";
         let page_path = PathBuf::from(&page_rel);
 
-        let mut css_files: Vec<String> = Vec::new();
+        let mut closure = PageCssClosure::default();
         let mut seen = HashSet::new();
-        collect_css_recursive(&page_path, component_meta, source_dir, &mut css_files, &mut seen);
+        collect_page_css_closure(&page_path, component_meta, &mut closure, &mut seen);
 
         // Copy each CSS file into the output directory
-        for css_path in &css_files {
+        for css_path in &closure.css_files {
             let css_rel = PathBuf::from(css_path);
             let dest = out_dir.join(&css_rel);
             if let Some(parent) = dest.parent() {
@@ -348,23 +374,81 @@ fn resolve_page_css(
             }
         }
 
-        page.css_files = css_files;
+        page.css_files = closure.css_files.clone();
+        closures.push((idx, closure));
         result.push(page);
+    }
+
+    // Site-wide detection: a component rendered by more than one page (the
+    // Layout convention) owns the base stylesheet layer that other stylesheets
+    // legitimately refine — overlaps involving it are expected, not collisions.
+    let mut page_count: HashMap<PathBuf, usize> = HashMap::new();
+    for (_, closure) in &closures {
+        for comp in &closure.components {
+            *page_count.entry(comp.clone()).or_insert(0) += 1;
+        }
+    }
+
+    // Collision visibility: warn (never error) when the same class name is
+    // defined in two different .css files loaded into the same page, unless
+    // the overlap is the established intentional pattern (cascade override or
+    // site-wide base layer).
+    for (idx, closure) in &closures {
+        let route = result[*idx].route.clone();
+        let mut files: Vec<validator::css_collision::CssFileRef> = Vec::new();
+        for (file, site) in &closure.sites {
+            let classes = match std::fs::read_to_string(source_dir.join(file)) {
+                Ok(content) => validator::css_collision::extract_class_names(&content),
+                Err(_) => std::collections::BTreeSet::new(),
+            };
+            files.push(validator::css_collision::CssFileRef {
+                file: PathBuf::from(file),
+                import_site: site.clone(),
+                classes,
+            });
+        }
+
+        let is_ancestor = |a: &Path, b: &Path| {
+            let mut cur = b.to_path_buf();
+            while let Some(parent) = closure.parents.get(&cur) {
+                if parent == a {
+                    return true;
+                }
+                cur = parent.clone();
+            }
+            false
+        };
+        let is_site_wide = |comp: &Path| page_count.get(comp).copied().unwrap_or(0) >= 2;
+
+        let collisions = validator::css_collision::find_css_class_collisions(
+            &files, &is_ancestor, &is_site_wide,
+        );
+        for col in collisions {
+            eprintln!(
+                "    warning[CSS_CLASS_COLLISION]: class \".{}\" is defined in both {} (imported by {}) and {} (imported by {}) — both stylesheets are loaded into page {}; the later <link> silently wins. If this overlap is unintentional, rename one of the classes (see the component-name prefix convention, spec §2a).",
+                col.class, col.file_a.display(), col.site_a.display(),
+                col.file_b.display(), col.site_b.display(), route
+            );
+        }
     }
 
     Ok(result)
 }
 
-fn collect_css_recursive(
+/// Walks a page's transitive component tree, recording the ordered CSS closure,
+/// each CSS file's import site, every component in the closure, and the
+/// parent map used by the collision check's ancestry test. The `seen` set
+/// breaks cycles and dedupes components reached via multiple render paths.
+fn collect_page_css_closure(
     comp_rel: &Path,
     component_meta: &HashMap<PathBuf, ComponentMeta>,
-    source_dir: &Path,
-    css_files: &mut Vec<String>,
+    closure: &mut PageCssClosure,
     seen: &mut HashSet<PathBuf>,
 ) {
     if !seen.insert(comp_rel.to_path_buf()) {
         return; // already visited
     }
+    closure.components.push(comp_rel.to_path_buf());
 
     if let Some(meta) = component_meta.get(comp_rel) {
         for css_import in &meta.css_imports {
@@ -373,8 +457,11 @@ fn collect_css_recursive(
             let resolved = comp_dir.join(css_import);
             // Normalize: strip leading ./ or ../
             let css_path = normalize_path(&resolved);
-            if !css_files.contains(&css_path) {
-                css_files.push(css_path);
+            if !closure.sites.iter().any(|(f, _)| *f == css_path) {
+                closure.sites.push((css_path.clone(), comp_rel.to_path_buf()));
+            }
+            if !closure.css_files.contains(&css_path) {
+                closure.css_files.push(css_path);
             }
         }
 
@@ -383,7 +470,8 @@ fn collect_css_recursive(
             let child_tags = codegen::collect_child_component_tags(tree);
             for tag in child_tags {
                 if let Some(child_rel) = resolve_component_import_path(&tag, &meta.imports, comp_rel) {
-                    collect_css_recursive(&child_rel, component_meta, source_dir, css_files, seen);
+                    closure.parents.insert(child_rel.clone(), comp_rel.to_path_buf());
+                    collect_page_css_closure(&child_rel, component_meta, closure, seen);
                 }
             }
         }

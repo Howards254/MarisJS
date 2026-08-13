@@ -1584,6 +1584,209 @@ fn transitive_css_collected_and_linked_in_page_html() {
 }
 
 #[test]
+fn css_class_collision_warns_for_sibling_components_with_same_class() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    // Two SIBLING components (page → ProductCard, page → ReviewCard), each
+    // with its own stylesheet, BOTH defining `.header` — a genuine
+    // unintentional collision: neither import site is an ancestor of the
+    // other, and neither component renders on more than one page.
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::write(dir.path().join("components/ProductCard.css"), ".header { color: red; }").unwrap();
+    std::fs::write(dir.path().join("components/ReviewCard.css"), ".header { font-weight: bold; }").unwrap();
+
+    let card_fixture = |name: &str, css: &str| format!(
+        "// @runsOn client\nimport \"{}\";\ntype P = {{ label: string; }};\nexport function {}(props: P) {{\n  return <div class=\"header\">{{props.label}}</div>;\n}}\n",
+        css, name
+    );
+    std::fs::write(
+        dir.path().join("components/ProductCard.tsx"),
+        card_fixture("ProductCard", "./ProductCard.css"),
+    ).unwrap();
+    std::fs::write(
+        dir.path().join("components/ReviewCard.tsx"),
+        card_fixture("ReviewCard", "./ReviewCard.css"),
+    ).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let page_fixture = concat!(
+        "// @runsOn server\n",
+        "import { ProductCard } from '../components/ProductCard';\n",
+        "import { ReviewCard } from '../components/ReviewCard';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <div class=\"page\">\n",
+        "      <ProductCard client:hydrate label={'a'} />\n",
+        "      <ReviewCard client:hydrate label={'b'} />\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), page_fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&status.stderr).to_string();
+
+    // The warning fires but the build still succeeds (warning, not error).
+    assert!(status.status.success(), "build must succeed: {}", stderr);
+    assert!(stderr.contains("CSS_CLASS_COLLISION"), "warning code expected: {}", stderr);
+    assert!(stderr.contains(".header"), "colliding class named: {}", stderr);
+    assert!(
+        stderr.contains("ProductCard.css") && stderr.contains("ReviewCard.css"),
+        "both source files named: {}",
+        stderr
+    );
+}
+
+#[test]
+fn css_class_collision_silent_for_ancestor_override_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    // The B2/B2.3 cascade-order pattern: Wrapper (ancestor) imports Base.css,
+    // StyledBox (descendant) imports Override.css, both defining `.box`. The
+    // ancestor's file loads FIRST in the <link> order (DFS tree walk), so the
+    // descendant's redefinition is an intentional override — must NOT warn.
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::write(dir.path().join("components/Base.css"), ".box { color: red; background: white; }").unwrap();
+    std::fs::write(dir.path().join("components/Override.css"), ".box { color: blue; }").unwrap();
+
+    let leaf_fixture = concat!(
+        "// @runsOn client\n",
+        "import \"./Override.css\";\n",
+        "type BoxProps = { label: string; };\n",
+        "export function StyledBox(props: BoxProps) {\n",
+        "  return (\n",
+        "    <div class=\"box\">{props.label}</div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(dir.path().join("components/StyledBox.tsx"), leaf_fixture).unwrap();
+
+    let mid_fixture = concat!(
+        "// @runsOn client\n",
+        "import \"./Base.css\";\n",
+        "import { StyledBox } from './StyledBox';\n",
+        "type WrapperProps = {};\n",
+        "export function Wrapper(props: WrapperProps) {\n",
+        "  return (\n",
+        "    <div class=\"wrapper\">\n",
+        "      <StyledBox label={'Hello'} />\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(dir.path().join("components/Wrapper.tsx"), mid_fixture).unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let page_fixture = concat!(
+        "// @runsOn server\n",
+        "import { Wrapper } from '../components/Wrapper';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <div class=\"page\">\n",
+        "      <Wrapper client:hydrate />\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), page_fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&status.stderr).to_string();
+
+    assert!(status.status.success(), "build failed: {}", stderr);
+    assert!(
+        !stderr.contains("CSS_CLASS_COLLISION"),
+        "cascade-override pattern must not warn: {}",
+        stderr
+    );
+}
+
+#[test]
+fn css_class_collision_silent_for_site_wide_layout_stylesheet() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    // The site-wide stylesheet convention (Layout pattern): Layout imports the
+    // shared styles.css (defining `.btn`), and a Button component (rendered
+    // alongside Layout on EVERY page) imports Button.css, also defining
+    // `.btn`. Layout renders on two pages → its stylesheet is the base layer
+    // the page-specific Button.css legitimately refines — must NOT warn.
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::write(dir.path().join("components/styles.css"), ".btn { padding: 4px; }\n.nav { display: block; }\n").unwrap();
+    std::fs::write(dir.path().join("components/Button.css"), ".btn { color: white; }\n").unwrap();
+
+    let layout_fixture = concat!(
+        "// @runsOn client\n",
+        "import \"./styles.css\";\n",
+        "type LayoutProps = {};\n",
+        "export function Layout(props: LayoutProps) {\n",
+        "  return <nav class=\"nav\">header</nav>;\n",
+        "}\n",
+    );
+    std::fs::write(dir.path().join("components/Layout.tsx"), layout_fixture).unwrap();
+
+    let button_fixture = concat!(
+        "// @runsOn client\n",
+        "import \"./Button.css\";\n",
+        "type ButtonProps = { label: string; };\n",
+        "export function Button(props: ButtonProps) {\n",
+        "  return <button class=\"btn\">{props.label}</button>;\n",
+        "}\n",
+    );
+    std::fs::write(dir.path().join("components/Button.tsx"), button_fixture).unwrap();
+
+    let page_fixture = |name: &str| format!(
+        "// @runsOn server\nimport {{ Layout }} from '../components/Layout';\nimport {{ Button }} from '../components/Button';\ntype P = {{}};\nexport function {}(props: P) {{\n  return (\n    <div>\n      <Layout client:hydrate />\n      <Button client:hydrate label={{\"go\"}} />\n    </div>\n  );\n}}\n",
+        name
+    );
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Index.tsx"), page_fixture("Index")).unwrap();
+    std::fs::write(pages_dir.join("About.tsx"), page_fixture("About")).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(&bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&status.stderr).to_string();
+
+    assert!(status.status.success(), "build failed: {}", stderr);
+    assert!(
+        !stderr.contains("CSS_CLASS_COLLISION"),
+        "site-wide Layout pattern must not warn: {}",
+        stderr
+    );
+}
+
+#[test]
 fn page_head_meta_is_injected_into_built_html() {
     let dir = tempfile::tempdir().unwrap();
     setup_test_dir(&dir);
@@ -3477,6 +3680,645 @@ fn server_expression_attributes_evaluate_in_ssr_html() {
     // Conditional-in-children (ternary returning elements) on the server path.
     assert!(html.contains("<p class=\"many\">Many</p>"), "conditional element SSR html, got: {}", html);
     assert!(!html.contains("<p>One</p>"), "unselected branch must not render, got: {}", html);
+}
+
+/// Client path regression for SPEC §8 #2: a const declared at MODULE level
+/// (outside the component function) must be captured by the parser and emitted
+/// at module scope of the generated output, above the component function.
+/// Verified by EXECUTING the generated module in jsdom — a ReferenceError
+/// happens at import time if the emission is missing.
+#[test]
+fn client_component_references_module_level_const() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type CatalogProps = {};\n",
+        "const products = [\n",
+        "  { id: 'latte', name: 'Latte', price: 3.5 },\n",
+        "  { id: 'espresso', name: 'Espresso', price: 2.0 },\n",
+        "];\n",
+        "const TAX_RATE: number = 0.2;\n",
+        "export function Catalog(props: CatalogProps) {\n",
+        "  return (\n",
+        "    <ul class=\"catalog\">\n",
+        "      <For each={products} key={(x) => x.id}>\n",
+        "        {(x) => <li>{x.name} — {x.price}</li>}\n",
+        "      </For>\n",
+        "      <p class=\"tax\">Tax: {TAX_RATE}</p>\n",
+        "    </ul>\n",
+        "  );\n",
+        "}\n",
+    );
+    let js = parse_validate_generate(&dir, "Catalog", fixture);
+
+    // The const must be emitted at module scope, ABOVE the component function,
+    // and with TS annotations stripped.
+    let fn_pos = js.find("export function Catalog").unwrap();
+    let products_pos = js.find("const products").expect("module const emitted");
+    let tax_pos = js.find("const TAX_RATE = 0.2").expect("ts annotation stripped");
+    assert!(products_pos < fn_pos, "const must precede the component fn:\n{}", js);
+    assert!(tax_pos < fn_pos, "const must precede the component fn:\n{}", js);
+    assert!(!js.contains("TAX_RATE: number"), "no TS annotation may leak:\n{}", js);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Catalog } from './Catalog.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const result = Catalog({});
+root.appendChild(result);
+
+const lis = root.querySelectorAll('li');
+const tax = root.querySelector('.tax');
+
+const ok = lis.length === 2
+    && lis[0].textContent.includes('Latte')
+    && lis[0].textContent.includes('3.5')
+    && lis[1].textContent.includes('Espresso')
+    && tax !== null
+    && tax.textContent.includes('0.2');
+
+if (!ok) {
+    console.error('FAIL', {
+        liCount: lis.length,
+        lis: Array.from(lis).map((l) => l.textContent),
+        tax: tax ? tax.textContent : null,
+    });
+    process.exit(1);
+}
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Server path regression for SPEC §8 #2: the same module-level const pattern
+/// on the SSR path. Verified by building through the real CLI and reading the
+/// prerendered html.
+#[test]
+fn server_page_references_module_level_const() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Menu.tsx"), concat!(
+        "// @runsOn server\n",
+        "type MenuProps = {};\n",
+        "const sections = ['Drinks', 'Desserts', 'Savory'];\n",
+        "const BADGE: string = 'fresh';\n",
+        "export function Menu(props: MenuProps) {\n",
+        "  return (\n",
+        "    <nav class=\"menu\">\n",
+        "      <For each={sections} key={(x) => x}>\n",
+        "        {(x) => <a class=\"sec\">{BADGE}: {x}</a>}\n",
+        "      </For>\n",
+        "    </nav>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("menu.html")).unwrap();
+
+    // The fixture is a PURE server component: no imports, no hydrate islands,
+    // no client components anywhere in its tree — the client codegen path is
+    // provably never invoked for this file, so a server-only regression cannot
+    // be "covered for" by the client implementation. Assert BOTH layers:
+    // (1) the server-emitted module itself carries the consts at module scope
+    // (direct server-path output — fails the instant server emission breaks),
+    // (2) the prerendered HTML contains the evaluated values (fails if the
+    // consts were emitted but not evaluated).
+    let mjs = std::fs::read_to_string(out.join("pages/Menu.mjs")).unwrap();
+    assert!(
+        mjs.contains("const sections = ['Drinks', 'Desserts', 'Savory'];"),
+        "server module must emit the sections const at module scope, got:\n{}",
+        mjs
+    );
+    assert!(
+        mjs.contains("const BADGE = 'fresh';"),
+        "server module must emit BADGE with the TS annotation stripped, got:\n{}",
+        mjs
+    );
+
+    // Both module consts must be evaluated during prerender — a missing emit
+    // produces a ReferenceError and an empty/broken page instead.
+    assert!(html.contains("<a class=\"sec\">fresh: Drinks</a>"), "section 1 rendered, got: {}", html);
+    assert!(html.contains("<a class=\"sec\">fresh: Desserts</a>"), "section 2 rendered, got: {}", html);
+    assert!(html.contains("<a class=\"sec\">fresh: Savory</a>"), "section 3 rendered, got: {}", html);
+    assert!(!html.contains("sections"), "no raw identifier may leak, got: {}", html);
+}
+
+/// Follow-up hardening (independent verification pass, 2026-08-14): style
+/// objects must not emit invalid CSS. (1) null/undefined property VALUES are
+/// omitted entirely (previously emitted literally as "background: null;" —
+/// invalid CSS that silently did nothing); (2) bare numbers on DIMENSIONAL
+/// properties get an automatic px unit ("width: 100;" is invalid CSS and is
+/// ignored by browsers), while React's unitless-exempt list (opacity, zIndex,
+/// lineHeight, flexGrow, ...) never gets px.
+#[test]
+fn client_style_null_values_omitted_and_numeric_dimensional_gets_px() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type BadgeProps = {};\n",
+        "export function Badge(props: BadgeProps) {\n",
+        "  return (\n",
+        "    <span class=\"badge\" style={{ width: 100, height: 50, fontSize: 16, background: null, color: undefined, opacity: 1, zIndex: 5, lineHeight: 1.5 }}>\n",
+        "      hi\n",
+        "    </span>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Badge", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Badge } from './Badge.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+// Attach to the live document: jsdom's getComputedStyle does not refresh
+// cached values for elements in DETACHED trees (probe-verified).
+dom.window.document.body.appendChild(root);
+const result = Badge({});
+root.appendChild(result);
+
+const el = root.querySelector('.badge');
+if (!el) { console.error('FAIL: no badge element'); process.exit(1); }
+
+const styleAttr = el.getAttribute('style');
+// null/undefined properties omitted; dimensional numbers got px; unitless
+// properties (opacity, zIndex, lineHeight) did NOT.
+const expected = 'width: 100px; height: 50px; font-size: 16px; opacity: 1; z-index: 5; line-height: 1.5;';
+if (styleAttr !== expected) {
+    console.error('FAIL style attr:', JSON.stringify(styleAttr), 'want:', JSON.stringify(expected));
+    process.exit(1);
+}
+if (styleAttr.includes('null') || styleAttr.includes('undefined')) {
+    console.error('FAIL: null/undefined leaked into style:', styleAttr);
+    process.exit(1);
+}
+
+// The px forms must be VALID CSS — otherwise computed styles come back empty
+// (bare "width: 100;" is ignored by browsers).
+const cs = dom.window.getComputedStyle(el);
+if (cs.width !== '100px') { console.error('FAIL computed width:', cs.width); process.exit(1); }
+if (cs.fontSize !== '16px') { console.error('FAIL computed font-size:', cs.fontSize); process.exit(1); }
+if (cs.opacity !== '1') { console.error('FAIL computed opacity:', cs.opacity); process.exit(1); }
+if (cs.lineHeight !== '1.5') { console.error('FAIL computed line-height:', cs.lineHeight); process.exit(1); }
+
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Server-path half of the style-serializer hardening: the prerendered HTML
+/// must also get px for bare dimensional numbers and omit null/undefined
+/// properties — never "width: 120;" or "background: null;".
+#[test]
+fn server_style_numeric_px_and_null_omitted_in_prerendered_html() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Menu.tsx"), concat!(
+        "// @runsOn server\n",
+        "type MenuProps = {};\n",
+        "export function Menu(props: MenuProps) {\n",
+        "  return (\n",
+        "    <nav class=\"menu\" style={{ width: 120, background: null, color: undefined, opacity: 1 }}>\n",
+        "      Menu\n",
+        "    </nav>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("menu.html")).unwrap();
+
+    assert!(
+        html.contains("style=\"width: 120px; opacity: 1;\""),
+        "px appended and null/undefined omitted in html, got: {}",
+        html
+    );
+    assert!(
+        !html.contains("null") && !html.contains("undefined"),
+        "no null/undefined may leak into html, got: {}",
+        html
+    );
+}
+
+/// Client path regression for SPEC §8 #6: a STATIC `style={{ ... }}` object
+/// must serialize to a proper CSS string (camelCase → kebab-case), never
+/// `[object Object]`. Verified against the DOM's actual computed style.
+#[test]
+fn client_static_style_object_serializes_to_css_string() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type BadgeProps = {};\n",
+        "export function Badge(props: BadgeProps) {\n",
+        "  return (\n",
+        "    <span class=\"badge\" style={{ backgroundColor: 'rgb(10, 20, 30)', padding: '4px 8px', fontSize: 14 }}>\n",
+        "      hi\n",
+        "    </span>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Badge", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Badge } from './Badge.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const result = Badge({});
+root.appendChild(result);
+
+const el = root.querySelector('.badge');
+if (!el) { console.error('FAIL: no badge element'); process.exit(1); }
+
+const styleAttr = el.getAttribute('style');
+    // fontSize: 14 is a bare dimensional number → px appended (follow-up
+    // hardening: "font-size: 14;" is invalid CSS and silently ignored).
+    const expected = 'background-color: rgb(10, 20, 30); padding: 4px 8px; font-size: 14px;';
+if (styleAttr !== expected) {
+    console.error('FAIL style attr:', JSON.stringify(styleAttr));
+    process.exit(1);
+}
+if (styleAttr.includes('[object Object]')) {
+    console.error('FAIL: serialized as [object Object]');
+    process.exit(1);
+}
+
+const computed = dom.window.getComputedStyle(el);
+if (computed.backgroundColor !== 'rgb(10, 20, 30)') {
+    console.error('FAIL computed backgroundColor:', computed.backgroundColor);
+    process.exit(1);
+}
+
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Client path regression for SPEC §8 #6: a REACTIVE style object (one value
+/// read from a signal) must be wrapped in bind() and update live after the
+/// signal changes — confirmed via the DOM's computed style, same rigor as the
+/// other reactive-attribute tests.
+#[test]
+fn client_reactive_style_object_updates_computed_style() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type PanelProps = {};\n",
+        "export function Panel(props: PanelProps) {\n",
+        "  const wide = signal(false);\n",
+        "  const color = signal('blue');\n",
+        "  return (\n",
+        "    <div class=\"panel\" style={{ width: wide.value ? '200px' : '100px', backgroundColor: color.value }}>\n",
+        "      p\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Panel", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Panel } from './Panel.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+// Attach to the live document: jsdom's getComputedStyle does not refresh
+// cached values for elements in DETACHED trees (probe-verified).
+dom.window.document.body.appendChild(root);
+const result = Panel({});
+root.appendChild(result);
+
+const el = root.querySelector('.panel');
+if (!el) { console.error('FAIL: no panel element'); process.exit(1); }
+
+const initial = el.getAttribute('style');
+if (initial !== 'width: 100px; background-color: blue;') {
+    console.error('FAIL initial style attr:', JSON.stringify(initial));
+    process.exit(1);
+}
+if (dom.window.getComputedStyle(el).backgroundColor !== 'rgb(0, 0, 255)') {
+    console.error('FAIL initial computed backgroundColor:', dom.window.getComputedStyle(el).backgroundColor);
+    process.exit(1);
+}
+
+result._signals.wide.set(true);
+await new Promise(r => setTimeout(r, 0));
+if (el.getAttribute('style') !== 'width: 200px; background-color: blue;') {
+    console.error('FAIL style attr after wide.set(true):', JSON.stringify(el.getAttribute('style')));
+    process.exit(1);
+}
+if (dom.window.getComputedStyle(el).width !== '200px') {
+    console.error('FAIL computed width after wide.set(true):', dom.window.getComputedStyle(el).width);
+    process.exit(1);
+}
+
+result._signals.color.set('red');
+await new Promise(r => setTimeout(r, 0));
+if (el.getAttribute('style') !== 'width: 200px; background-color: red;') {
+    console.error('FAIL style attr after color.set(red):', JSON.stringify(el.getAttribute('style')));
+    process.exit(1);
+}
+if (dom.window.getComputedStyle(el).backgroundColor !== 'rgb(255, 0, 0)') {
+    console.error('FAIL computed backgroundColor after color.set(red):', dom.window.getComputedStyle(el).backgroundColor);
+    process.exit(1);
+}
+
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Client path regression for SPEC §8 #6 with the computed() form: the style
+/// ATTRIBUTE expression evaluates to an object via a computed signal. Must be
+/// reactive (bind-wrapped) and update after the dependency changes.
+#[test]
+fn client_computed_style_object_updates_computed_style() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type BoxProps = {};\n",
+        "export function Box(props: BoxProps) {\n",
+        "  const accent = signal('green');\n",
+        "  const boxStyle = computed(() => ({ backgroundColor: accent.value, borderRadius: accent.value === 'green' ? '8px' : '0px' }));\n",
+        "  return <div class=\"box\" style={boxStyle.value}>x</div>;\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Box", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Box } from './Box.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+// Attach to the live document: jsdom's getComputedStyle does not refresh
+// cached values for elements in DETACHED trees (probe-verified).
+dom.window.document.body.appendChild(root);
+const result = Box({});
+root.appendChild(result);
+
+const el = root.querySelector('.box');
+if (!el) { console.error('FAIL: no box element'); process.exit(1); }
+
+const initial = el.getAttribute('style');
+if (initial !== 'background-color: green; border-radius: 8px;') {
+    console.error('FAIL initial style attr:', JSON.stringify(initial));
+    process.exit(1);
+}
+if (dom.window.getComputedStyle(el).backgroundColor !== 'rgb(0, 128, 0)') {
+    console.error('FAIL initial computed backgroundColor:', dom.window.getComputedStyle(el).backgroundColor);
+    process.exit(1);
+}
+
+result._signals.accent.set('red');
+await new Promise(r => setTimeout(r, 0));
+if (el.getAttribute('style') !== 'background-color: red; border-radius: 0px;') {
+    console.error('FAIL style attr after accent.set(red):', JSON.stringify(el.getAttribute('style')));
+    process.exit(1);
+}
+if (dom.window.getComputedStyle(el).backgroundColor !== 'rgb(255, 0, 0)') {
+    console.error('FAIL computed backgroundColor after accent.set(red):', dom.window.getComputedStyle(el).backgroundColor);
+    process.exit(1);
+}
+
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Server path regression for SPEC §8 #6 (parity — the project's history says
+/// never assume one path implies the other): the prerendered html must contain
+/// the style object serialized as a CSS string, evaluated at render time.
+#[test]
+fn server_style_object_serializes_in_prerendered_html() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    std::fs::write(pages_dir.join("Menu.tsx"), concat!(
+        "// @runsOn server\n",
+        "type MenuProps = {};\n",
+        "const THEME = { backgroundColor: 'navy' };\n",
+        "export function Menu(props: MenuProps) {\n",
+        "  return (\n",
+        "    <nav class=\"menu\" style={{ backgroundColor: 'navy', color: THEME.backgroundColor === 'navy' ? 'white' : 'black' }}>\n",
+        "      Menu\n",
+        "    </nav>\n",
+        "  );\n",
+        "}\n",
+    )).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("menu.html")).unwrap();
+
+    assert!(
+        html.contains("style=\"background-color: navy; color: white;\""),
+        "style object serialized in html, got: {}",
+        html
+    );
+    assert!(
+        !html.contains("[object Object]"),
+        "no [object Object] may leak into html, got: {}",
+        html
+    );
+}
+
+/// Follow-up hardening (independent verification pass, 2026-08-14): drilled
+/// signal props must be reactive at ANY member-access depth, not just one
+/// level. `props.one.value`, `props.two.inner.value`,
+/// `props.three.nested.count.value`, and `props.four.a.b.c.d.value` (1, 2, 3,
+/// and 4 levels — the 4th proves there is no fixed ceiling) must ALL be
+/// bind()-wrapped and update live when their parent signal changes. Pre-fix,
+/// chain_reads_signal only recognized a DIRECT props base, so every depth ≥ 2
+/// silently rendered once and never updated again.
+#[test]
+fn props_drilled_signal_value_reactive_at_any_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let child_fixture = concat!(
+        "// @runsOn client\n",
+        "type DeepProps = {\n",
+        "  one: string;\n",
+        "  two: { inner: string; };\n",
+        "  three: { nested: { count: string; }; };\n",
+        "  four: { a: { b: { c: { d: string; }; }; }; };\n",
+        "};\n",
+        "export function Deep(props: DeepProps) {\n",
+        "  return (\n",
+        "    <div>\n",
+        "      <span class=\"d1\">{props.one.value}</span>\n",
+        "      <span class=\"d2\">{props.two.inner.value}</span>\n",
+        "      <span class=\"d3\">{props.three.nested.count.value}</span>\n",
+        "      <span class=\"d4\">{props.four.a.b.c.d.value}</span>\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    let js = parse_validate_generate(&dir, "Deep", child_fixture);
+
+    // Every depth must be bind-wrapped — one per reactive text node, and the
+    // 4th proves the walk generalizes past any fixed ceiling.
+    let bind_count = js.matches("bind(").count();
+    assert!(
+        bind_count >= 4,
+        "all four depths must be reactive ({} bind() calls), got:\n{}",
+        bind_count, js
+    );
+
+    let parent_fixture = concat!(
+        "// @runsOn client\n",
+        "import { Deep } from './Deep';\n",
+        "type AppProps = {};\n",
+        "export function App(props: AppProps) {\n",
+        "  const one = signal('one');\n",
+        "  const two = signal('two');\n",
+        "  const three = signal('three');\n",
+        "  const four = signal('four');\n",
+        "  return <Deep one={one} two={{ inner: two }} three={{ nested: { count: three } }} four={{ a: { b: { c: { d: four } } } }} />;\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "App", parent_fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { App } from './App.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const result = App({});
+root.appendChild(result);
+
+const read = () => [
+    root.querySelector('.d1').textContent,
+    root.querySelector('.d2').textContent,
+    root.querySelector('.d3').textContent,
+    root.querySelector('.d4').textContent,
+].join(',');
+
+if (read() !== 'one,two,three,four') {
+    console.error('FAIL initial: ' + read());
+    process.exit(1);
+}
+
+// Mutate each signal, one depth at a time — every level must update live.
+result._signals.one.set('ONE');
+await new Promise(r => setTimeout(r, 0));
+result._signals.two.set('TWO');
+await new Promise(r => setTimeout(r, 0));
+result._signals.three.set('THREE');
+await new Promise(r => setTimeout(r, 0));
+result._signals.four.set('FOUR');
+await new Promise(r => setTimeout(r, 0));
+
+const now = read();
+if (now === 'ONE,TWO,THREE,FOUR') {
+    console.log('PASS');
+} else {
+    console.error('FAIL after sets: ' + now);
+    process.exit(1);
+}
+"#;
+
+    run_node(&dir, runner);
+}
+
+/// Regression for AST-based reactivity detection (SPEC §8 round 3): a plain
+/// non-signal object with an unrelated `.value` field — and a `.value` inside
+/// a string literal — must NOT be treated as reactive. No bind() wrapper may
+/// be emitted (substring matching on ".value" wrongly flagged both).
+#[test]
+fn plain_object_value_field_is_not_reactive() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type StatusProps = {};\n",
+        "const CONFIG = { value: 'dark', mode: 'night' };\n",
+        "export function Status(props: StatusProps) {\n",
+        "  return (\n",
+        "    <div>\n",
+        "      <span class=\"theme\">{CONFIG.value}</span>\n",
+        "      <span class=\"str\">{'a.value.b literal'}</span>\n",
+        "      <span class=\"attr\" data-v={CONFIG.value}>x</span>\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    let js = parse_validate_generate(&dir, "Status", fixture);
+
+    // The generated module must NOT contain any bind() call: none of these
+    // expressions reads a known signal/computed — CONFIG is a plain object.
+    assert!(
+        !js.contains("bind("),
+        "no bind wrapper for non-signal .value reads, got:\n{}",
+        js
+    );
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Status } from './Status.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+const result = Status({});
+root.appendChild(result);
+
+const theme = root.querySelector('.theme');
+const str = root.querySelector('.str');
+const attr = root.querySelector('.attr');
+
+const ok = theme !== null && theme.textContent === 'dark'
+    && str !== null && str.textContent === 'a.value.b literal'
+    && attr !== null && attr.getAttribute('data-v') === 'dark';
+
+if (!ok) {
+    console.error('FAIL', {
+        theme: theme ? theme.textContent : null,
+        str: str ? str.textContent : null,
+        dataV: attr ? attr.getAttribute('data-v') : null,
+    });
+    process.exit(1);
+}
+console.log('PASS');
+"#;
+
+    run_node(&dir, runner);
 }
 
 /// Real-browser half of the duplicate-island regression: the page module must

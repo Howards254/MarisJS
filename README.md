@@ -273,7 +273,9 @@ native binary at runtime.
 ## What marisjs does not yet do
 
 - **No CSS scoping.** Styles are global — two components using the same class name will
-  silently collide. See the spec's Section 2a for the recommended naming convention.
+  collide, but the build now warns (`CSS_CLASS_COLLISION`, naming both files and the
+  class) when the same class is defined in two stylesheets loaded into one page — unless
+  the overlap is the established intentional pattern (see the spec's Section 2a).
 - **A meaningful subset of everyday JavaScript is unsupported and will fail validation
   loudly** rather than compiling into broken output: loops, `switch`/`try`/`catch`, class
   expressions, tagged templates, and a few other constructs. This is deliberate scope, not
