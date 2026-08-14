@@ -54,6 +54,7 @@ struct ErrorOutput<'a> {
 struct ValidateOutput<'a> {
     valid: bool,
     errors: Vec<ErrorOutput<'a>>,
+    warnings: Vec<ErrorOutput<'a>>,
 }
 
 // ── build-time metadata ───────────────────────────────────────────────
@@ -78,6 +79,16 @@ struct PageRoute {
     page_roots: Vec<(String, String)>,
     css_files: Vec<String>,
     has_data: bool,
+}
+
+/// One built API route. `file` is the REAL compiled output path
+/// (source-preserved casing), `methods` the sanctioned HTTP methods
+/// exported by the file (the router 405s anything else).
+#[derive(Clone)]
+struct ApiRoute {
+    path: String,
+    file: String,
+    methods: Vec<String>,
 }
 
 /// Everything the CSS collision check needs about one page's transitive
@@ -108,13 +119,24 @@ fn main() {
         Command::Validate { file } => {
             match parser::parse_component_file(&file) {
                 Ok(component) => {
-                    let diagnostics = validator::validate(&component);
-                    let valid = diagnostics.is_empty();
-                    let errors: Vec<ErrorOutput> = diagnostics.iter().map(|d| ErrorOutput {
-                        line: d.line, column: d.column, code: d.code,
-                        message: &d.message, fix_hint: d.fix_hint,
-                    }).collect();
-                    println!("{}", serde_json::to_string_pretty(&ValidateOutput { valid, errors }).unwrap());
+                    // §7b: same dispatch as build — api/ files (or files
+                    // with @runsOn api) validate with the API rule set, not
+                    // the component rule set.
+                    let diagnostics = validator::validate_for_path(&component, std::path::Path::new(&file));
+                    let errors: Vec<ErrorOutput> = diagnostics.iter()
+                        .filter(|d| !d.is_warning)
+                        .map(|d| ErrorOutput {
+                            line: d.line, column: d.column, code: d.code,
+                            message: &d.message, fix_hint: d.fix_hint,
+                        }).collect();
+                    let warnings: Vec<ErrorOutput> = diagnostics.iter()
+                        .filter(|d| d.is_warning)
+                        .map(|d| ErrorOutput {
+                            line: d.line, column: d.column, code: d.code,
+                            message: &d.message, fix_hint: d.fix_hint,
+                        }).collect();
+                    let valid = errors.is_empty();
+                    println!("{}", serde_json::to_string_pretty(&ValidateOutput { valid, errors, warnings }).unwrap());
                     if !valid { std::process::exit(1); }
                 }
                 Err(e) => { eprintln!("Parse error: {}", e); std::process::exit(2); }
@@ -170,11 +192,125 @@ fn run_init() -> Result<(), String> {
     );
     std::fs::write(&pkg_path, pkg).map_err(|e| format!("write package.json: {}", e))?;
     eprintln!("  wrote package.json");
+
+    // §7a: the .gitignore excluding .env is the PRIMARY defense against
+    // accidental secret commits. Append when a .gitignore already exists.
+    let gitignore_path = cwd.join(".gitignore");
+    let mut gitignore = String::new();
+    if gitignore_path.exists() {
+        gitignore = std::fs::read_to_string(&gitignore_path).map_err(|e| format!("read .gitignore: {}", e))?;
+        if !gitignore.ends_with('\n') { gitignore.push('\n'); }
+    }
+    let env_line = ".env\n";
+    let already = gitignore.lines().any(|l| l.trim() == ".env");
+    if !already {
+        gitignore.push_str(env_line);
+        std::fs::write(&gitignore_path, gitignore).map_err(|e| format!("write .gitignore: {}", e))?;
+        eprintln!("  wrote .gitignore (excludes .env)");
+    } else {
+        eprintln!("  .gitignore already excludes .env");
+    }
+
+    // .env.example documents the keys a project expects — with NO real values
+    // (it is committed by design).
+    let example_path = cwd.join(".env.example");
+    if !example_path.exists() {
+        std::fs::write(&example_path, "# Copy to .env and fill in real values. .env is gitignored.\n# Example:\n# MY_API_KEY=changeme\n").map_err(|e| format!("write .env.example: {}", e))?;
+        eprintln!("  wrote .env.example");
+    }
+
     eprintln!("  next: mkdir -p src/pages && npm run dev");
     Ok(())
 }
 
 // ── build ──────────────────────────────────────────────────────────────
+
+/// §7a: Loads the project's environment snapshot for build/dev time.
+/// 1. Real process env (always wins — standard dotenv non-override: this is
+///    how CI injects real secrets without editing .env).
+/// 2. `.env` from the project root (the directory `marisjs` was invoked in),
+///    falling back to the source directory when different.
+/// Keys are taken verbatim (dotenv convention); `#` comments and quoted
+/// values are handled by the same tokenizer the tests exercise.
+fn load_env(source: &str) -> codegen::EnvMap {
+    let mut env: codegen::EnvMap = std::env::vars().collect();
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut candidates = vec![cwd.join(".env")];
+    let source_dir = Path::new(source);
+    if source_dir != cwd {
+        candidates.push(source_dir.join(".env"));
+    }
+    for candidate in candidates {
+        if let Ok(content) = std::fs::read_to_string(&candidate) {
+            for (k, v) in parse_dotenv(&content) {
+                // Non-override: a real process-env key is never shadowed.
+                env.entry(k).or_insert(v);
+            }
+            eprintln!("  loaded {}", candidate.display());
+            break;
+        }
+    }
+    env
+}
+
+/// dotenv tokenizer: `KEY=value` lines, `#` comments (own-line, plus inline
+/// after unquoted values), quoted values (single or double, escaped quotes),
+/// blank lines skipped. Keys are not validated beyond being non-empty —
+/// dotenv itself is permissive here.
+fn parse_dotenv(content: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = match line.split_once('=') {
+            Some((k, r)) => (k.trim(), r.trim()),
+            None => continue,
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let value = if rest.starts_with('"') {
+            // Scan for the closing quote, honoring escapes (\", \\).
+            let inner = &rest[1..];
+            let mut out = String::new();
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        if let Some(&next) = chars.peek() {
+                            if next == '"' || next == '\\' {
+                                out.push(next);
+                                chars.next();
+                            } else {
+                                out.push('\\');
+                            }
+                        } else {
+                            out.push('\\');
+                        }
+                    }
+                    _ => out.push(c),
+                }
+            }
+            out
+        } else if rest.starts_with('\'') {
+            let inner = &rest[1..];
+            let end = inner.find('\'').unwrap_or(inner.len());
+            inner[..end].to_string()
+        } else {
+            // Unquoted: strip trailing comment and whitespace.
+            match rest.find(" #") {
+                Some(i) => rest[..i].trim().to_string(),
+                None => rest.trim().to_string(),
+            }
+        };
+        out.push((key.to_string(), value));
+    }
+    out
+}
 
 fn build_all(source: &str, out: &str) -> Result<usize, String> {
     let source_dir = Path::new(source);
@@ -183,15 +319,18 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     }
     if !source_dir.is_dir() { return Err(format!("'{}' is not a directory", source)); }
 
+    let env = load_env(source);
+
     let mut count = 0usize;
     let out_dir = Path::new(out);
     let _ = std::fs::remove_dir_all(out_dir);
     std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create out dir: {}", e))?;
 
     let mut page_routes: Vec<PageRoute> = Vec::new();
+    let mut api_routes: Vec<ApiRoute> = Vec::new();
     let mut component_meta: HashMap<PathBuf, ComponentMeta> = HashMap::new();
 
-    walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut component_meta)?;
+    walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut api_routes, &mut component_meta, &env)?;
 
     // Write runtime (embedded at compile time)
     let runtime_dest = out_dir.join("runtime.mjs");
@@ -214,7 +353,7 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     prerender_pages(out_dir, &page_routes)?;
 
     // Generate routes.json manifest
-    generate_routes_json(out_dir, &page_routes)?;
+    generate_routes_json(out_dir, &page_routes, &api_routes)?;
     eprintln!("  generated routes.json");
 
     write_reload_timestamp(out_dir);
@@ -229,7 +368,9 @@ fn write_reload_timestamp(out_dir: &Path) {
 fn walk_and_build(
     base: &Path, current: &Path, out_base: &Path, count: &mut usize,
     page_routes: &mut Vec<PageRoute>,
+    api_routes: &mut Vec<ApiRoute>,
     component_meta: &mut HashMap<PathBuf, ComponentMeta>,
+    env: &codegen::EnvMap,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(current).map_err(|e| format!("read_dir: {}", e))? {
         let entry = entry.map_err(|e| format!("entry: {}", e))?;
@@ -243,9 +384,18 @@ fn walk_and_build(
                     continue;
                 }
             }
-            walk_and_build(base, &path, out_base, count, page_routes, component_meta)?;
-        } else if path.extension().map_or(false, |ext| ext == "tsx") {
+walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_meta, env)?;
+        } else if path.extension().map_or(false, |ext| ext == "tsx")
+            // §7b: api/ files compile from .ts OR .tsx (a route handler has no
+            // JSX — it is ordinary TypeScript). Everywhere else .ts is an
+            // unknown extension, never a component.
+            || (path.extension().map_or(false, |ext| ext == "ts")
+                && path.strip_prefix(base).map_or(false, |rel| {
+                    rel == Path::new("api") || rel.starts_with("api/")
+                }))
+        {
             let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
+            let is_api = rel == Path::new("api") || rel.starts_with("api/");
             let out_path = out_base.join(rel).with_extension("mjs");
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
@@ -255,12 +405,24 @@ fn walk_and_build(
             let file_path = path.to_str().ok_or("invalid path")?;
             let component = parser::parse_component_file(file_path)
                 .map_err(|e| format!("parse error in {}: {}", rel.display(), e))?;
-            let diagnostics = validator::validate(&component);
-            if !diagnostics.is_empty() {
-                for d in &diagnostics {
+            // §7b: api files get their own, smaller rule set — an API route
+            // handler is not a component (no props/ordering/signals/JSX
+            // checks). Everything else — pages and components — gets the full
+            // component rule set.
+            let diagnostics = if is_api {
+                validator::validate_api(&component)
+            } else {
+                validator::validate(&component)
+            };
+            let errors: Vec<&validator::Diagnostic> = diagnostics.iter().filter(|d| !d.is_warning).collect();
+            for d in diagnostics.iter().filter(|d| d.is_warning) {
+                eprintln!("    warning[{}]: {} (fix: {})", d.code, d.message, d.fix_hint);
+            }
+            if !errors.is_empty() {
+                for d in &errors {
                     eprintln!("    {}:{} — {}: {} (fix: {})", d.line.unwrap_or(0), d.column.unwrap_or(0), d.code, d.message, d.fix_hint);
                 }
-                return Err(format!("validation failed in {}: {} error(s)", rel.display(), diagnostics.len()));
+                return Err(format!("validation failed in {}: {} error(s)", rel.display(), errors.len()));
             }
             // Safety net: every import must resolve to an existing file in the
             // source tree. Catches case mismatches and typos the emission logic
@@ -272,54 +434,79 @@ fn walk_and_build(
                 }
                 return Err(format!("import validation failed in {}: {} error(s)", rel.display(), import_diags.len()));
             }
-            let js = codegen::generate(&component)
-                .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
 
-            // Store component metadata for transitive CSS collection
-            let css_paths: Vec<String> = component.imports.iter()
-                .filter(|i| i.is_css)
-                .map(|i| i.source.clone())
-                .collect();
-            component_meta.insert(rel.to_path_buf(), ComponentMeta {
-                render_tree: component.render_tree.clone(),
-                imports: component.imports.clone(),
-                css_imports: css_paths,
-            });
-
-            // Is this a page file? (under pages/ directory)
-            let is_page = rel.starts_with("pages") || rel.starts_with("pages/");
-            if is_page && component.runs_on == Some(parser::RunsOn::Server) {
-                let route = page_file_to_route(rel);
-                let html_file = route_to_html_file(&route);
-                // REAL output path (source-preserved casing), NOT reconstructed
-                // from the route string — this is the canonical mapping.
-                let mjs_rel = normalize_path(&rel.with_extension("mjs"));
-
-                // Collect hydrate roots for THIS page specifically
-                let mut page_roots: Vec<(String, String)> = Vec::new();
-                if let Some(ref tree) = component.render_tree {
-                    for root_name in codegen::collect_hydrate_roots(tree) {
-                        let import_path = resolve_client_import(rel, &root_name, &component.imports)?;
-                        page_roots.push((root_name, import_path));
-                    }
-                }
-                page_routes.push(PageRoute {
-                    route,
-                    html_file,
-                    mjs_rel,
-                    page_roots,
-                    css_files: Vec::new(),
-                    has_data: component.has_data_call,
+            if is_api {
+                let js = codegen::generate_api(&component, env)
+                    .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
+                std::fs::write(&out_path, js)
+                    .map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
+                // §7b: file-based routing — api/checkout.ts → /api/checkout.
+                // Supported methods ARE the exported handler names.
+                let route = api_file_to_route(rel);
+                let methods: Vec<String> = component.exports.iter()
+                    .filter(|e| e.kind == parser::ExportKind::NamedFunction)
+                    .map(|e| e.name.clone())
+                    .collect();
+                api_routes.push(ApiRoute {
+                    path: route,
+                    file: normalize_path(&rel.with_extension("mjs")),
+                    methods,
                 });
-            }
+                *count += 1;
+            } else {
+                let js = codegen::generate(&component, env)
+                    .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
 
-            std::fs::write(&out_path, js)
-                .map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
-            *count += 1;
+                // Store component metadata for transitive CSS collection
+                let css_paths: Vec<String> = component.imports.iter()
+                    .filter(|i| i.is_css)
+                    .map(|i| i.source.clone())
+                    .collect();
+                component_meta.insert(rel.to_path_buf(), ComponentMeta {
+                    render_tree: component.render_tree.clone(),
+                    imports: component.imports.clone(),
+                    css_imports: css_paths,
+                });
+
+                // Is this a page file? (under pages/ directory)
+                let is_page = rel.starts_with("pages") || rel.starts_with("pages/");
+                if is_page && component.runs_on == Some(parser::RunsOn::Server) {
+                    let route = page_file_to_route(rel);
+                    let html_file = route_to_html_file(&route);
+                    // REAL output path (source-preserved casing), NOT reconstructed
+                    // from the route string — this is the canonical mapping.
+                    let mjs_rel = normalize_path(&rel.with_extension("mjs"));
+
+                    // Collect hydrate roots for THIS page specifically
+                    let mut page_roots: Vec<(String, String)> = Vec::new();
+                    if let Some(ref tree) = component.render_tree {
+                        for root_name in codegen::collect_hydrate_roots(tree) {
+                            let import_path = resolve_client_import(rel, &root_name, &component.imports)?;
+                            page_roots.push((root_name, import_path));
+                        }
+                    }
+                    page_routes.push(PageRoute {
+                        route,
+                        html_file,
+                        mjs_rel,
+                        page_roots,
+                        css_files: Vec::new(),
+                        has_data: component.has_data_call,
+                    });
+                }
+
+                std::fs::write(&out_path, js)
+                    .map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
+                *count += 1;
+            }
         } else if path.is_file() {
             // Static assets (images, fonts, etc.) are copied through so the
-            // dev server and adapters can serve them.
+            // dev server and adapters can serve them. `.env` is NEVER copied:
+            // it holds build-time secrets, and dist/ is deployable output.
             let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
+            if rel.file_name().map_or(false, |n| n == ".env") {
+                continue;
+            }
             let dest = out_base.join(rel);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
@@ -554,6 +741,21 @@ fn page_file_to_route(rel: &Path) -> String {
     format!("/{}", path)
 }
 
+/// §7b: file-based API routing — api/checkout.ts → /api/checkout, nested
+/// like pages (api/billing/charge.ts → /api/billing/charge, api/Index.ts →
+/// /api). Unlike pages, the URL segment is the file name as written (API
+/// paths are case-sensitive by convention; no lowercasing).
+fn api_file_to_route(rel: &Path) -> String {
+    let s = rel.with_extension("").to_str().unwrap_or("").to_string();
+    let path = s.strip_prefix("api/").or_else(|| s.strip_prefix("api")).unwrap_or(&s);
+    if path.is_empty() || path == "Index" || path.ends_with("/Index") {
+        let parent = Path::new(&path).parent().and_then(|p| p.to_str()).unwrap_or("");
+        if parent.is_empty() { return "/api".to_string(); }
+        return format!("/api{}", parent);
+    }
+    format!("/api/{}", path)
+}
+
 // ── pre-render pages ──────────────────────────────────────────────────
 
 fn prerender_pages(out_dir: &Path, page_routes: &[PageRoute]) -> Result<(), String> {
@@ -726,9 +928,22 @@ struct RoutesManifest<'a> {
     version: u32,
     runtime: &'a str,
     routes: Vec<RouteEntry<'a>>,
+    #[serde(rename = "apiRoutes", skip_serializing_if = "Vec::is_empty")]
+    api_routes: Vec<ApiRouteEntry<'a>>,
 }
 
-fn generate_routes_json(out_dir: &Path, page_routes: &[PageRoute]) -> Result<(), String> {
+#[derive(Serialize)]
+struct ApiRouteEntry<'a> {
+    path: &'a str,
+    file: &'a str,
+    methods: &'a [String],
+}
+
+fn generate_routes_json(
+    out_dir: &Path,
+    page_routes: &[PageRoute],
+    api_routes: &[ApiRoute],
+) -> Result<(), String> {
     let entries: Vec<RouteEntry> = page_routes.iter().map(|page| {
         let modules: Vec<ClientModuleEntry> = page.page_roots.iter().map(|(name, path)| {
             ClientModuleEntry { name: name.clone(), path: path.clone() }
@@ -744,10 +959,17 @@ fn generate_routes_json(out_dir: &Path, page_routes: &[PageRoute]) -> Result<(),
         }
     }).collect();
 
+    let api_entries: Vec<ApiRouteEntry> = api_routes.iter().map(|api| ApiRouteEntry {
+        path: &api.path,
+        file: &api.file,
+        methods: &api.methods,
+    }).collect();
+
     let manifest = RoutesManifest {
         version: 1,
         runtime: "./runtime.mjs",
         routes: entries,
+        api_routes: api_entries,
     };
 
     let json = serde_json::to_string_pretty(&manifest).map_err(|e| format!("json: {}", e))?;
@@ -787,6 +1009,37 @@ fn load_routes(out_dir: &Path) -> HashMap<String, String> {
     map
 }
 
+/// §7b: loads the apiRoutes section of the manifest (dev server dispatch).
+fn load_api_routes(out_dir: &Path) -> Vec<ApiRoute> {
+    let path = out_dir.join("routes.json");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(entries) = manifest.get("apiRoutes").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = entry.get("path").and_then(|v| v.as_str())?.to_string();
+            let file = entry.get("file").and_then(|v| v.as_str())?.to_string();
+            let methods = entry
+                .get("methods")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ApiRoute { path, file, methods })
+        })
+        .collect()
+}
+
 // ── dev server ─────────────────────────────────────────────────────────
 
 fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
@@ -796,6 +1049,7 @@ fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
     let out_dir = Path::new(out).to_path_buf();
     let source_dir = Path::new(source).to_path_buf();
     let routes = load_routes(&out_dir);
+    let api_routes = load_api_routes(&out_dir);
 
     let (tx, rx) = mpsc::channel::<()>();
     start_file_watcher(source_dir.clone(), tx)?;
@@ -807,6 +1061,7 @@ fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
 
     let out_dir_clone = out_dir.clone();
     let routes_clone = routes.clone();
+    let api_routes_clone = api_routes.clone();
     let source_str = source.to_string();
     let out_str = out.to_string();
 
@@ -827,7 +1082,7 @@ fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
         }
 
         if let Ok((mut stream, _)) = listener.accept() {
-            handle_http(&out_dir_clone, &routes_clone, &mut stream);
+            handle_http(&out_dir_clone, &routes_clone, &api_routes_clone, &mut stream);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -883,15 +1138,54 @@ fn mime_for_ext(ext: &str) -> &'static str {
 }
 
 
-fn handle_http(out_dir: &Path, routes: &HashMap<String, String>, stream: &mut std::net::TcpStream) {
-    let mut buf = [0u8; 2048];
-    let n = stream.read(&mut buf).unwrap_or(0);
+fn handle_http(
+    out_dir: &Path,
+    routes: &HashMap<String, String>,
+    api_routes: &[ApiRoute],
+    stream: &mut std::net::TcpStream,
+) {
+    // Read the request head plus any body (Content-Length governs how much
+    // more to read after the header terminator — API routes read POST bodies).
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let n = stream.read(&mut tmp).unwrap_or(0);
     if n == 0 { return; }
+    buf.extend_from_slice(&tmp[..n]);
 
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let first_line = request.lines().next().unwrap_or("");
+    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    let header_len = header_end.map(|i| i + 4).unwrap_or(buf.len());
+    let content_length: usize = header_end
+        .map(|i| {
+            String::from_utf8_lossy(&buf[..i])
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase().strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                })
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let mut have = buf.len().saturating_sub(header_len);
+    while have < content_length {
+        let n = stream.read(&mut tmp).unwrap_or(0);
+        if n == 0 { break; }
+        buf.extend_from_slice(&tmp[..n]);
+        have += n;
+    }
+
+    let head = String::from_utf8_lossy(&buf[..header_len.min(buf.len())]).to_string();
+    let body = buf[header_len.min(buf.len())..].to_vec();
+
+    let first_line = head.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
+    let method = if parts.len() >= 1 { parts[0] } else { "GET" };
     let path = if parts.len() >= 2 { parts[1] } else { "/" };
+
+    // §7b: API routes dispatch FIRST — an /api/* path is never a static file.
+    if let Some(api) = api_routes.iter().find(|a| a.path == path) {
+        handle_api_route(out_dir, api, method, &head, &body, stream);
+        return;
+    }
 
     match path {
         "/__build_timestamp" => {
@@ -927,9 +1221,215 @@ fn handle_http(out_dir: &Path, routes: &HashMap<String, String>, stream: &mut st
     }
 }
 
+/// §7b dev-server dispatch: spawns Node with the compiled route module,
+/// hands it a standard Web Request (constructed from the raw HTTP line) via
+/// stdin JSON, and writes the returned Web Response back out. This exercises
+/// the exact handler contract used by adapter-node: `await handler(req)` →
+/// `Response`. The handler import runs in a fresh process per request — no
+/// cross-request state, no caching surprises (dev only; adapter-node keeps
+/// modules loaded, see its server.mjs).
+fn handle_api_route(
+    out_dir: &Path,
+    api: &ApiRoute,
+    method: &str,
+    head: &str,
+    body: &[u8],
+    stream: &mut std::net::TcpStream,
+) {
+    // 405 for methods the file does not export — supported methods ARE the
+    // export list, so this is decided entirely from the manifest.
+    if !api.methods.iter().any(|m| m == method) {
+        let allowed = api.methods.join(", ");
+        let resp = format!(
+            "HTTP/1.1 405 Method Not Allowed\r\nAllow: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n",
+            allowed
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
+
+    let mjs_path = out_dir.join(&api.file);
+    let abs = match std::fs::canonicalize(&mjs_path) {
+        Ok(p) => p,
+        Err(_) => {
+            let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            return;
+        }
+    };
+
+    // Forward the request headers (minus the request line and hop-by-hop
+    // framing) so the handler sees the real Host, Content-Type, etc.
+    let headers: Vec<String> = head
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            !lower.starts_with("content-length:") && !l.trim().is_empty()
+        })
+        .map(|l| l.to_string())
+        .collect();
+
+    let payload = serde_json::json!({
+        "method": method,
+        "path": head.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("/"),
+        "headers": headers,
+        "bodyBase64": if body.is_empty() { serde_json::Value::Null } else {
+            serde_json::Value::String(base64_encode(body))
+        },
+    })
+    .to_string();
+
+    let script = r#"
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const input = JSON.parse(readFileSync(0, 'utf8'));
+const handler = (await import(pathToFileURL(process.argv[1]).href))[input.method];
+if (!handler) {
+  console.log(JSON.stringify({ status: 405, headers: {}, body: '' }));
+  process.exit(0);
+}
+const headers = {};
+for (const line of input.headers) {
+  const i = line.indexOf(':');
+  if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+}
+const body = input.bodyBase64 ? Buffer.from(input.bodyBase64, 'base64') : undefined;
+const req = new Request('http://localhost' + input.path, { method: input.method, headers, body });
+try {
+  const res = await handler(req);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const outHeaders = {};
+  res.headers.forEach((v, k) => { outHeaders[k] = v; });
+  console.log(JSON.stringify({ status: res.status, headers: outHeaders, body: buf.toString('base64') }));
+} catch (e) {
+  console.log(JSON.stringify({ status: 500, headers: { 'content-type': 'text/plain;charset=UTF-8' }, body: Buffer.from(String((e && e.stack) || e)).toString('base64') }));
+  process.exit(0);
+}
+"#;
+
+    let child = ProcCommand::new("node")
+        .arg("--input-type=module")
+        .arg("-e")
+        .arg(script)
+        .arg(abs.to_str().unwrap_or(""))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let Ok(mut child) = child else {
+        let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output();
+    let Ok(out) = out else {
+        let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
+
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    if !stderr_text.trim().is_empty() {
+        eprintln!("  [api {} {}] node stderr: {}", method, api.path, stderr_text.trim());
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::json!({
+        "status": 500, "headers": {}, "body": ""
+    }));
+    let status = response.get("status").and_then(|v| v.as_u64()).unwrap_or(500);
+    let headers_obj = response.get("headers").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let body_b64 = response.get("body").and_then(|v| v.as_str()).unwrap_or("");
+
+    let mut head_out = format!(
+        "HTTP/1.1 {} {}\r\nAccess-Control-Allow-Origin: *\r\n",
+        status,
+        http_status_text(status)
+    );
+    for (k, v) in &headers_obj {
+        if let Some(vs) = v.as_str() {
+            // Never allow the handler to smuggle framing headers.
+            let lower = k.to_ascii_lowercase();
+            if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" {
+                continue;
+            }
+            head_out.push_str(&format!("{}: {}\r\n", k, vs));
+        }
+    }
+    let body_bytes = base64_decode(body_b64);
+    head_out.push_str(&format!("Content-Length: {}\r\n\r\n", body_bytes.len()));
+    let _ = stream.write_all(head_out.as_bytes());
+    let _ = stream.write_all(&body_bytes);
+}
+
+fn http_status_text(status: u64) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Status",
+    }
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(triple >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[triple as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+fn base64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in s.chars() {
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' => break,
+            _ => continue,
+        };
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8 & 0xFF);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod mime_tests {
-    use super::mime_for_ext;
+    use super::{api_file_to_route, mime_for_ext, parse_dotenv};
 
     #[test]
     fn known_mime_types() {
@@ -956,5 +1456,49 @@ mod mime_tests {
         assert_eq!(mime_for_ext("wasm"), "text/plain");
         assert_eq!(mime_for_ext("woff2"), "text/plain");
         assert_eq!(mime_for_ext(""), "text/plain");
+    }
+
+    // ── §7a dotenv tokenizer ────────────────────────────────────────────
+
+    #[test]
+    fn dotenv_parses_plain_values() {
+        let env = parse_dotenv("KEY=value\nEMPTY=\nNUMBER=42");
+        assert_eq!(env.len(), 3);
+        assert_eq!(env[0], ("KEY".into(), "value".into()));
+        assert_eq!(env[1], ("EMPTY".into(), "".into()));
+        assert_eq!(env[2], ("NUMBER".into(), "42".into()));
+    }
+
+    #[test]
+    fn dotenv_skips_comments_and_blanks() {
+        let env = parse_dotenv("# leading comment\n\nKEY=value # trailing comment\n  \n# another\nA=B");
+        assert_eq!(env, vec![("KEY".into(), "value".into()), ("A".into(), "B".into())]);
+    }
+
+    #[test]
+    fn dotenv_parses_quoted_values() {
+        let env = parse_dotenv(
+            "SINGLE='hello world'\nDOUBLE=\"a \\\"quoted\\\" value\"\nESCAPED=\"back\\\\slash\"",
+        );
+        assert_eq!(env.len(), 3);
+        assert_eq!(env[0], ("SINGLE".into(), "hello world".into()));
+        assert_eq!(env[1], ("DOUBLE".into(), "a \"quoted\" value".into()));
+        assert_eq!(env[2], ("ESCAPED".into(), "back\\slash".into()));
+    }
+
+    #[test]
+    fn dotenv_trims_whitespace_around_key_and_value() {
+        let env = parse_dotenv("  PADDED  =   spaced value  ");
+        assert_eq!(env, vec![("PADDED".into(), "spaced value".into())]);
+    }
+
+    // ── §7b api file routing ────────────────────────────────────────────
+
+    #[test]
+    fn api_routes_map_file_based_like_pages() {
+        assert_eq!(api_file_to_route(std::path::Path::new("api/checkout.ts")), "/api/checkout");
+        assert_eq!(api_file_to_route(std::path::Path::new("api/billing/charge.ts")), "/api/billing/charge");
+        assert_eq!(api_file_to_route(std::path::Path::new("api/Index.ts")), "/api");
+        assert_eq!(api_file_to_route(std::path::Path::new("api/webhooks/stripe.ts")), "/api/webhooks/stripe");
     }
 }

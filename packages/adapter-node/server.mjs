@@ -29,6 +29,7 @@ const mimeTypes = {
 };
 
 const routeMap = new Map(manifest.routes.map(r => [r.path, r]));
+const apiRouteMap = new Map((manifest.apiRoutes || []).map(r => [r.path, r]));
 
 function capitalizeFirst(s) {
   if (!s) return s;
@@ -106,6 +107,49 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const route = routeMap.get(url.pathname);
 
+    // §7b: API routes dispatch FIRST — an /api/* path is never a static
+    // file. The handler is a plain ESM function receiving the standard Web
+    // Request object and returning a Web Response (or a promise of one) —
+    // the same contract as marisjs dev.
+    const apiRoute = apiRouteMap.get(url.pathname);
+    if (apiRoute) {
+      const method = req.method.toUpperCase();
+      if (!apiRoute.methods.includes(method)) {
+        res.writeHead(405, { Allow: apiRoute.methods.join(', ') });
+        res.end();
+        return;
+      }
+      const apiFile = join(DIST, apiRoute.file);
+      if (existsSync(apiFile)) {
+        const module = await import(apiFile);
+        const handler = module[method];
+        if (typeof handler === 'function') {
+          // Pass the request body as a stream (async-iterable). Content-
+          // length is derived by undici — forwarding the raw header with a
+          // stream body makes the Request constructor throw, so drop framing
+          // and hop-by-hop headers.
+          const forwardedHeaders = { ...req.headers };
+          delete forwardedHeaders['content-length'];
+          delete forwardedHeaders['transfer-encoding'];
+          delete forwardedHeaders.connection;
+          const request = new Request(url, {
+            method,
+            headers: forwardedHeaders,
+            body: ['GET', 'HEAD'].includes(method) ? undefined : req,
+            // undici requires duplex for stream/async-iterable bodies.
+            duplex: 'half',
+          });
+          const response = await handler(request);
+          res.writeHead(response.status, Object.fromEntries(response.headers));
+          res.end(Buffer.from(await response.arrayBuffer()));
+          return;
+        }
+      }
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
+
     if (route) {
       if (route.mode === 'server') {
         // Use the real compiled path from the manifest (source-preserved
@@ -168,4 +212,5 @@ server.listen(PORT, () => {
   console.log(`marisjs adapter-node → http://localhost:${PORT}`);
   console.log(`Serving from: ${DIST}`);
   console.log(`Routes: ${manifest.routes.length}`);
+  console.log(`API routes: ${(manifest.apiRoutes || []).length}`);
 });

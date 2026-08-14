@@ -23,13 +23,30 @@ if (!existsSync(manifestPath)) {
 
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
 
-// ── Validate: no server routes ──────────────────────────────────────────
+// ── Validate: no server routes, no API routes ───────────────────────────
 
 const serverRoutes = [];
 for (const route of manifest.routes) {
   if (route.mode === 'server') {
     serverRoutes.push(route);
   }
+}
+
+// §7b: fail-loud — an API route executes server code per request; a static
+// host cannot run it. Same refusal pattern as server-mode routes.
+const apiRoutes = manifest.apiRoutes || [];
+if (apiRoutes.length > 0) {
+  console.error(`Error: build contains ${apiRoutes.length} API route(s) that require server-side execution.`);
+  console.error('This adapter only produces fully static output. The following API routes cannot be deployed statically:\n');
+  for (const r of apiRoutes) {
+    console.error(`  ${r.path} → ${r.file} (methods: ${r.methods.join(', ')})`);
+  }
+  console.error('\nThese routes execute handlers per request (e.g. env() reads, external fetches).');
+  console.error('Use one of these options:');
+  console.error('  1. Remove the api/ directory to make the build fully static.');
+  console.error('  2. Use @marisjs/adapter-node for a server that handles both pages and API routes.');
+  console.error('  3. Deploy the API routes separately (e.g. a platform adapter).');
+  process.exit(1);
 }
 
 if (serverRoutes.length > 0) {
@@ -104,6 +121,7 @@ function collectStaticFiles(dir, base = '') {
 
     // Skip server-side and internal directories
     if (rel.startsWith('pages/')) continue;
+    if (rel.startsWith('api/')) continue;
     if (rel.startsWith('node_modules/')) continue;
     if (entry === '__build_timestamp.txt') continue;
     if (rel === 'routes.json') continue;

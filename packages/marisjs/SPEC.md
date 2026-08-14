@@ -34,7 +34,8 @@ to one of these, it doesn't belong in the spec.
 
 ## 2. File-Level Rules
 
-- One component per file.
+- One component per file (exception: `@runsOn api` files — see §7b — which export one
+  function per HTTP method, not a component).
 - Filename must match the exported component name exactly (`Cart.tsx` exports `Cart`).
 - Every component file **must** begin with a directive comment declaring where it runs:
 
@@ -45,11 +46,17 @@ or
 ```tsx
 // @runsOn server
 ```
+or
+```tsx
+// @runsOn api
+```
 
   This is a real TSX comment — parses fine in any TS/TSX toolchain — but the framework's
   validator treats it as a mandatory, machine-read directive. No file may omit it. No file may
   have more than one `@runsOn` directive. There is no inference from filename, folder location,
-  or import site. This is the framework's single mechanism for the server/client boundary.
+  or import site. This is the framework's single mechanism for the server/client/api boundary:
+  `client` files run in the browser, `server` files render pages at prerender/SSR time,
+  `api` files are HTTP route handlers (see §7b).
 
 - Allowed top-level exports per file: exactly one `export function ComponentName(...)`. No
   default exports. No secondary named exports of helper functions from a component file —
@@ -213,6 +220,9 @@ directory tree maps directly to URL routes:
   a folder with an `index.html` (`/docs` → `docs/index.html`, `/docs/api/signals` →
   `docs/api/signals/index.html`) and rewrites `routes.json` to match. URL depth is
   preserved, so the compiler's depth-aware references resolve unchanged.
+- **API routes are a separate convention.** Pages routing is exactly as above; HTTP
+  API routes live under a top-level `api/` directory and map to `/api/*` URLs — see
+  §7b for the full rules.
 
 **Page metadata (`<head>` content):**
 
@@ -487,7 +497,89 @@ const products = await data(async () => {
 
 ---
 
-## 7. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)
+## 7. Environment Variables & API Routes
+
+### 7a. Environment Variables and Secrets
+
+The only sanctioned way to read an environment variable is the `env()` primitive:
+
+```tsx
+// @runsOn server
+const apiKey = env("STRIPE_SECRET_KEY");  // string | undefined
+```
+
+**Rules (validator-enforced):**
+
+- `env(key: string): string | undefined` — reads a value loaded from a `.env` file at
+  build/dev time (standard dotenv convention: `KEY=value` lines, `#` comments, quoted
+  values). The values are baked into the compiled server/api modules at build time —
+  `env()` reads the build-time snapshot; it does not touch `process.env` at runtime.
+  A missing key yields `undefined`, so the standard fallback idiom works:
+  `env("PORT") ?? "3000"`.
+- The `.env` file is loaded from the project root (the directory where `marisjs` is
+  invoked), falling back to the source directory. A key already present in the real
+  process environment takes precedence over the `.env` file (standard dotenv
+  non-override convention) — this is what lets CI set real secrets without editing
+  `.env`.
+- `env()` is only callable from `@runsOn server` or `@runsOn api` files. Calling it
+  from a `@runsOn client` file is a **hard validator error** (`CLIENT_ENV_ACCESS`),
+  the same enforcement tier as `CLIENT_DATA_CALL` — environment values are
+  build-time server secrets, and a client bundle is publicly downloadable.
+- **Best-effort lint `ENV_LEAK_TO_CLIENT_PROP`:** AST-based detection — any
+  `env()` call appearing anywhere within a `client:hydrate` component's prop
+  expression is flagged: the direct pattern (`<Widget apiKey={env("STRIPE_KEY")}
+  client:hydrate />`), chained method calls (`apiKey={env("K").trim()}`), and
+  template-literal interpolation (`auth={`Bearer ${env("API_KEY")}`}`). The
+  parser records the flag from the syntax tree itself, not from textual
+  matching of the expression. It is a warning, never a build failure. The
+  caveat is stated explicitly: this is a best-effort check, not a complete
+  guarantee — an `env()` result first stored in an intermediate object or
+  variable (e.g. `const cfg = { key: env("K") }` then `<Widget cfg={cfg}
+  client:hydrate />`) is not caught, because the passed expression no longer
+  contains the call. The hard `CLIENT_ENV_ACCESS` rejection is the actual
+  guarantee; this lint is a bonus signal.
+- `marisjs init` generates a `.gitignore` excluding `.env` (appending to an existing
+  `.gitignore` if present) and a `.env.example` with no real values, as the
+  convention for what keys a project expects. The `.gitignore` is the **primary
+  defense** against accidental secret commits; the validator rules are a **secondary
+  layer** for a different failure mode — leakage of secret values into client code —
+  not for git history.
+
+### 7b. API Routes
+
+**File-based routing.** Alongside `pages/` and `components/`, a top-level `api/`
+directory holds API route files. `api/checkout.ts` maps to the route `/api/checkout`;
+directory nesting maps the same way as pages (`api/billing/charge.ts` →
+`/api/billing/charge`; `api/Index.ts` → `/api`).
+
+**Rules (validator-enforced):**
+
+- Every file under `api/` must begin with `// @runsOn api` — the same mandatory
+  directive rule as pages/components, with `api` as the third valid value.
+- **Handler export convention:** one exported function per HTTP method. The router
+  determines which methods a route supports by which functions are exported:
+  `export function GET(req)`, `export function POST(req)`, and so on for `PUT`,
+  `PATCH`, `DELETE`. There is no internal method-branching pattern — the
+  supported-methods list IS the export list. A default export or a non-method export
+  name is a validation error.
+- Handlers receive the **standard Web `Request` object** and return a standard Web
+  `Response` (or a `Promise<Response>` — async handlers are the norm, since a real
+  API route calling an `env()`-configured external service is almost always async).
+  No custom request/response shape exists; the same types already used by `fetch()`.
+- `env()` is callable from `@runsOn api` files — same tier as `@runsOn server`.
+- `data()` is **not** available in `@runsOn api` files. `data()`'s contract is
+  page-render-time fetching; an API route handler is not rendering a page. A `data()`
+  call in an api file is a hard validation error (`API_DATA_CALL`).
+- API files are not components: the component rules (props parameter, statement
+  ordering, signal/computed declarations, JSX render tree, hydrate markers) do NOT
+  apply to them. An api file's handler bodies are ordinary TypeScript.
+- `marisjs dev` serves API routes; `@marisjs/adapter-node` serves them in production.
+  `@marisjs/adapter-static` refuses a build containing API routes (fail-loud: it
+  cannot execute server code, exactly as it already refuses server-mode pages).
+
+---
+
+## 8. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)
 
 | Pattern | Why forbidden |
 |---|---|
@@ -503,10 +595,12 @@ const products = await data(async () => {
 | Missing or duplicate `@runsOn` directive | Undefined/ambiguous execution target |
 | `any`-typed or untyped props | Silent runtime type errors |
 | `data()` call inside a `@runsOn client` file | Server-only capability leaking to client bundle |
+| `env()` call inside a `@runsOn client` file | Build-time secret leaking to a publicly downloadable bundle |
+| `data()` call inside a `@runsOn api` file | `data()` is page-render-time fetching; an api handler renders no page |
 
 ---
 
-## 8. Open Items for Layer 2 (compiler) to resolve
+## 9. Open Items for Layer 2 (compiler) to resolve
 
 These are flagged, not decided, because they're implementation questions rather than language
 rules — but each needs an answer before the compiler is built:
@@ -753,11 +847,59 @@ rejected with `SERVER_EVENT_HANDLER`). No known divergence remains: `style` obje
 previously rendered `[object Object]` on both paths — now serialized to CSS strings on both
 (resolved as #6, 2026-08-13).
 
+**#12 (resolved 2026-08-14) — Phase E1+E2: `env()` primitive & API routes**
+
+Two genuinely new capabilities, specified in Section 7 above and implemented with the
+full three-role process (workhorse → independent debugging-agent verification pass →
+commit):
+
+**E1 — `env()`.** Parser detects `env()` calls at call sites (same mechanism as
+`data()`); validator enforces the §7a boundary: `CLIENT_ENV_ACCESS` (hard error,
+`@runsOn client` file) and `ENV_LEAK_TO_CLIENT_PROP` (best-effort warning lint —
+AST-based detection, so any `env()` call anywhere in a hydrate prop expression is
+flagged: direct, chained-method, and template-literal shapes; an intermediate
+variable/object wrap remains the documented limitation). The CLI loads `.env`
+(project root, then source dir; real process env takes precedence — standard dotenv
+semantics) at build/dev time and codegen bakes
+a module-scope `env` helper carrying the value snapshot into every server/api module
+that calls it. `marisjs init` now writes `.gitignore` (appending `.env` if it exists)
+and a no-real-values `.env.example`. Regression coverage: server page reads a real
+`.env` value end-to-end through the prerendered html; api handler reads one through a
+live request; client file with `env()` hard-rejected; direct/chained/template-leak
+shapes linted; indirect wrap NOT flagged — the test documents the accepted
+limitation explicitly. (Follow-up hardening, 2026-08-14: the lint was upgraded from a
+text-shape heuristic to AST-based detection per the independent debugging agent's
+finding; `marisjs validate` and the MCP tool dispatch to `validate_api` for api/
+files — previously they applied component rules to API files and emitted misleading
+errors.)
+
+**E2 — API routes.** New `@runsOn api` directive (third valid value), `api/` directory
+routed file-based to `/api/*` (nested like pages), one exported function per HTTP
+method (GET/POST/PUT/PATCH/DELETE) with standard Web `Request`/`Response` — async
+handlers are the norm and are proven live. API files get their own, smaller validator
+rule set rather than the component rules (props/ordering/signals/JSX do not apply —
+handlers are ordinary TS; approach: `validate_api` runs runs-on, handler-name,
+default-export, `API_DATA_CALL`, forbidden-import, CSS-import, and unsupported-
+construct checks only). Codegen emits handlers verbatim (TS stripped) with relative
+imports rewritten to `.mjs`; the same build-time `env` snapshot as server pages. CLI
+build registers `apiRoutes` in routes.json; `marisjs dev` dispatches api requests
+through Node (Request/Response constructed from the raw HTTP line); adapter-node
+serves them live; adapter-static fails loud listing every api route. Regression
+coverage: GET JSON e2e through `marisjs dev`; POST reading a JSON body with a computed
+response; async handler with mocked `fetch()` + `env()` config (the webhook/payment
+pattern) proven at module level; adapter-node live serve; adapter-static refusal;
+`API_DATA_CALL` hard rejection; combined pages+api build proving pages routing is
+undisturbed.
+
+Parity: `env()` — server ✓ tested, api ✓ tested, client ✗ rejected (CLIENT_ENV_ACCESS),
+exactly the `data()`-boundary shape. `data()` — server ✓, api ✗ rejected
+(API_DATA_CALL), client ✗ rejected (CLIENT_DATA_CALL).
+
 ---
 
-## 9. How this doc gets used
+## 10. How this doc gets used
 
-- The **compiler's validator** (Layer 2) implements every rule in Sections 2–7 as a discrete,
+- The **compiler's validator** (Layer 2) implements every rule in Sections 2–8 as a discrete,
   independently-testable check, each returning the exact error message format shown or implied
   here.
 - The **agent-facing validator tool** (Layer 3a) is the same checks, exposed with structured

@@ -16,6 +16,9 @@ pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
     pub fix_hint: &'static str,
+    /// Warnings never fail the build/validation; errors do. Lints
+    /// (ENV_LEAK_TO_CLIENT_PROP) are warnings; every other check is an error.
+    pub is_warning: bool,
 }
 
 impl Diagnostic {
@@ -32,7 +35,21 @@ impl Diagnostic {
             code,
             message: message.into(),
             fix_hint,
+            is_warning: false,
         }
+    }
+
+    /// A warning diagnostic: reported and visible, but never a build failure.
+    pub fn warning(
+        code: &'static str,
+        message: impl Into<String>,
+        fix_hint: &'static str,
+        line: Option<usize>,
+        column: Option<usize>,
+    ) -> Self {
+        let mut d = Self::new(code, message, fix_hint, line, column);
+        d.is_warning = true;
+        d
     }
 }
 
@@ -333,6 +350,78 @@ pub fn check_data_call_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diag
     }
 }
 
+/// §7a: Reject `env()` calls in files marked `@runsOn client` — the same
+/// enforcement tier as CLIENT_DATA_CALL. Environment values are build-time
+/// server secrets; a client bundle is publicly downloadable, so a value
+/// reaching one is a leak by construction.
+pub fn check_env_access_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.has_env_call {
+        if let Some(RunsOn::Client) = file.runs_on {
+            diagnostics.push(Diagnostic::new(
+                "CLIENT_ENV_ACCESS",
+                "env() call in @runsOn client file — env() is only allowed in @runsOn server or @runsOn api files. Environment values are build-time secrets; a client bundle is publicly downloadable.",
+                "Move the env() read to a @runsOn server or @runsOn api file and pass the value via props (or read it in an API route).",
+                Some(file.env_call_line),
+                Some(file.env_call_column),
+            ));
+        }
+    }
+}
+
+/// §7a best-effort lint (WARNING, never a build failure): an env() call
+/// appearing anywhere within a `client:hydrate` component's prop expression
+/// — `<Widget apiKey={env("STRIPE_KEY")} client:hydrate />`,
+/// `apiKey={env('K').trim()}`, `auth={`Bearer ${env('API_KEY')}`}`. Detection
+/// is AST-based: the parser flags the attribute when its expression subtree
+/// contains an env() call, so every shape (direct, chained, template
+/// interpolation, nested) is caught uniformly. Known limitation, stated in
+/// the SPEC: an env() result stored in an intermediate variable/object first
+/// is NOT caught — the hard CLIENT_ENV_ACCESS rejection is the actual
+/// guarantee, this lint is a bonus signal.
+pub fn check_env_leak_to_client_prop(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    let tree = match &file.render_tree {
+        Some(t) => t,
+        None => return,
+    };
+    check_env_leak_in_node(tree, diagnostics);
+}
+
+fn check_env_leak_in_node(node: &JsxNode, diagnostics: &mut Vec<Diagnostic>) {
+    match node {
+        JsxNode::Element { is_hydrate_root, attrs, children, .. } => {
+            if *is_hydrate_root {
+                for attr in attrs {
+                    if attr.contains_env_call {
+                        let shown = match &attr.value {
+                            JsxAttrValue::Expr(expr) => format!("{}=\"{}\"", attr.name, expr),
+                            JsxAttrValue::String(_) => attr.name.clone(),
+                        };
+                        diagnostics.push(Diagnostic::warning(
+                            "ENV_LEAK_TO_CLIENT_PROP",
+                            format!(
+                                "attribute {} passes an env() result into a client:hydrate component prop — the value is baked into the public client bundle. This is a best-effort lint: any env() call anywhere in the prop expression (direct calls, chained methods, template literals) is caught; an env() result stored in an intermediate variable or object first is not detected.",
+                                shown
+                            ),
+                            "Resolve the env() value in a @runsOn server or @runsOn api file and pass the result via props, or read it in an API route.",
+                            None,
+                            None,
+                        ));
+                    }
+                }
+            }
+            for child in children {
+                check_env_leak_in_node(child, diagnostics);
+            }
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            check_env_leak_in_node(cons, diagnostics);
+            check_env_leak_in_node(alt, diagnostics);
+        }
+        JsxNode::ForEach { body, .. } => check_env_leak_in_node(body, diagnostics),
+        _ => {}
+    }
+}
+
 /// §6: Reject reactivity and event wiring in `@runsOn server` files. The server
 /// codegen emits a static HTML string with no signal/computed wiring and no
 /// event listeners, so both would silently break or do nothing:
@@ -562,6 +651,19 @@ pub fn check_css_imports(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>
                 Some(import.column),
             ));
         }
+
+        if file.runs_on == Some(RunsOn::Api) {
+            diagnostics.push(Diagnostic::new(
+                "INVALID_CSS_IMPORT",
+                format!(
+                    "CSS import '{}' in @runsOn api file — API route handlers return Responses, they never render stylesheets.",
+                    import.source
+                ),
+                "Remove the CSS import from this API route file.",
+                Some(import.line),
+                Some(import.column),
+            ));
+        }
     }
 }
 
@@ -657,6 +759,105 @@ pub fn check_handler_jsx(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>
     }
 }
 
+/// §7b: The API-file rule set. Deliberately SMALLER than the component rule
+/// set — an API handler is not a component. The component checks (props
+/// parameter, statement ordering, signals/computed, JSX render tree, hydrate
+/// markers, filename-matches-component) do NOT apply and are NOT run; a
+/// handler body is ordinary TypeScript, emitted verbatim. Only the checks
+/// below apply:
+///  - `@runsOn api` directive presence/uniqueness/correctness
+///  - exports: at least one, each a sanctioned HTTP method name, no defaults
+///  - no `data()` (page-render-time fetching; an api handler renders no page)
+///  - no forbidden/hook imports, no CSS imports (reused component checks)
+///  - no parser-level unsupported constructs
+/// `env()` is allowed and needs no check (same tier as @runsOn server).
+pub const API_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+pub fn validate_api(file: &ComponentFile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    check_api_runs_on(file, &mut diagnostics);
+
+    if file.exports.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            "API_NO_HANDLER",
+            "No exported HTTP method handler found — an API route file must export at least one of GET, POST, PUT, PATCH, DELETE.",
+            "Add e.g. `export function GET(req) { return new Response(...); }`.",
+            None,
+            None,
+        ));
+    }
+    for export in &file.exports {
+        if export.kind == ExportKind::DefaultExport {
+            diagnostics.push(Diagnostic::new(
+                "DEFAULT_EXPORT",
+                "Default export in API route file — API routes export one function per HTTP method, by name.",
+                "Replace the default export with named `export function GET(req)` / `POST(req)` / etc.",
+                Some(export.line),
+                Some(export.column),
+            ));
+        } else if !API_METHODS.contains(&export.name.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "API_INVALID_HANDLER",
+                format!(
+                    "Export '{}' is not a sanctioned API handler name — the router determines supported methods by which of GET, POST, PUT, PATCH, DELETE are exported.",
+                    export.name
+                ),
+                "Rename the export to one of GET, POST, PUT, PATCH, DELETE.",
+                Some(export.line),
+                Some(export.column),
+            ));
+        }
+    }
+
+    if file.has_data_call {
+        diagnostics.push(Diagnostic::new(
+            "API_DATA_CALL",
+            "data() call in @runsOn api file — data() is page-render-time fetching; an API route handler is not rendering a page.",
+            "Remove the data() call and fetch directly in the handler with fetch() or a client library.",
+            Some(file.data_call_line),
+            Some(file.data_call_column),
+        ));
+    }
+
+    check_forbidden_imports(file, &mut diagnostics);
+    check_css_imports(file, &mut diagnostics);
+    check_unsupported_constructs(file, &mut diagnostics);
+
+    diagnostics
+}
+
+fn check_api_runs_on(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.runs_on_count == 0 {
+        diagnostics.push(Diagnostic::new(
+            "MISSING_RUNSON",
+            "Missing @runsOn directive — every file under api/ must declare exactly one // @runsOn api.",
+            "Add `// @runsOn api` as the first line of the file.",
+            None,
+            None,
+        ));
+    } else if file.runs_on_count > 1 {
+        diagnostics.push(Diagnostic::new(
+            "DUPLICATE_RUNSON",
+            format!(
+                "Multiple @runsOn directives found ({}) — an API route file must declare exactly one.",
+                file.runs_on_count
+            ),
+            "Remove all but one @runsOn directive.",
+            Some(file.runs_on_line),
+            Some(file.runs_on_column),
+        ));
+    } else if file.runs_on != Some(RunsOn::Api) {
+        diagnostics.push(Diagnostic::new(
+            "API_RUNSON_REQUIRED",
+            "File under api/ must declare // @runsOn api — @runsOn client/server files belong under pages/ or components/.",
+            "Change the directive to `// @runsOn api`.",
+            Some(file.runs_on_line),
+            Some(file.runs_on_column),
+        ));
+    }
+}
+
 pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     check_runs_on_directive(file, &mut diagnostics);
@@ -668,6 +869,8 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_conditional_rendering_form(file, &mut diagnostics);
     check_list_rendering_form(file, &mut diagnostics);
     check_data_call_boundary(file, &mut diagnostics);
+    check_env_access_boundary(file, &mut diagnostics);
+    check_env_leak_to_client_prop(file, &mut diagnostics);
     check_server_boundaries(file, &mut diagnostics);
     check_statement_ordering(file, &mut diagnostics);
     check_unwrapped_signal_prop(file, &mut diagnostics);
@@ -675,6 +878,27 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_css_imports(file, &mut diagnostics);
     check_handler_jsx(file, &mut diagnostics);
     diagnostics
+}
+
+/// §7b single source of truth for `marisjs validate` and the MCP server's
+/// validate_component: dispatch to the API rule set when the file lives
+/// under an `api/` directory (any ancestor directory named `api` — the
+/// faithful mirror of the CLI build's root-relative `api/` prefix match)
+/// or carries the `@runsOn api` directive; everything else gets the full
+/// component rule set. One dispatch rule, shared by every validator entry
+/// point, so a path can never validate with the wrong rule set.
+pub fn validate_for_path(file: &ComponentFile, path: &Path) -> Vec<Diagnostic> {
+    if file.runs_on == Some(RunsOn::Api) || path_is_under_api_dir(path) {
+        validate_api(file)
+    } else {
+        validate(file)
+    }
+}
+
+fn path_is_under_api_dir(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1) // the file itself
+        .any(|anc| anc.file_name().map_or(false, |f| f == "api"))
 }
 
 /// §2: Every import must resolve to an existing file in the source tree.
@@ -698,11 +922,13 @@ pub fn validate_imports(file: &ComponentFile, file_rel: &Path, source_dir: &Path
             continue;
         }
         // Resolve the import relative to this file's directory, normalizing
-        // ./ and ../ segments, then look for the compiled sibling (.tsx).
+        // ./ and ../ segments, then look for the compiled sibling (.tsx or
+        // .ts — API route files compile from .ts sources).
         let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
         let resolved = normalize_path(&file_parent.join(trimmed));
-        let candidate = source_dir.join(&resolved).with_extension("tsx");
-        if !candidate.exists() {
+        let candidate_tsx = source_dir.join(&resolved).with_extension("tsx");
+        let candidate_ts = source_dir.join(&resolved).with_extension("ts");
+        if !candidate_tsx.exists() && !candidate_ts.exists() {
             diagnostics.push(Diagnostic::new(
                 "IMPORT_NOT_FOUND",
                 format!(
@@ -710,7 +936,7 @@ pub fn validate_imports(file: &ComponentFile, file_rel: &Path, source_dir: &Path
                     imp.source,
                     resolved.display()
                 ),
-                "Fix the import path so it points to a real .tsx file in the project.",
+                "Fix the import path so it points to a real .tsx or .ts file in the project.",
                 Some(imp.line),
                 Some(imp.column),
             ));
@@ -1339,6 +1565,7 @@ mod tests {
                     parser::JsxAttr {
                         name: "onClick".to_string(),
                         value: parser::JsxAttrValue::Expr("() => {}".to_string()),
+                        contains_env_call: false,
                     },
                 ],
                 children: vec![],
@@ -1364,6 +1591,7 @@ mod tests {
                     parser::JsxAttr {
                         name: "href".to_string(),
                         value: parser::JsxAttrValue::String("/x".to_string()),
+                        contains_env_call: false,
                     },
                 ],
                 children: vec![],
@@ -1753,6 +1981,7 @@ mod tests {
                 attrs: vec![JsxAttr {
                     name: "label".into(),
                     value: JsxAttrValue::Expr("label.value".into()),
+                    contains_env_call: false,
                 }],
                 children: vec![],
                 is_hydrate_root: false,
@@ -1783,6 +2012,7 @@ mod tests {
                 attrs: vec![JsxAttr {
                     name: "label".into(),
                     value: JsxAttrValue::Expr("label".into()), // passed by reference
+                    contains_env_call: false,
                 }],
                 children: vec![],
                 is_hydrate_root: false,

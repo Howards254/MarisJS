@@ -43,6 +43,17 @@ fn parse_validate_generate(
     name: &str,
     fixture: &str,
 ) -> String {
+    parse_validate_generate_with_env(dir, name, fixture, &codegen::EnvMap::new())
+}
+
+/// Same as parse_validate_generate, but the caller supplies the build-time
+/// env snapshot (the CLI's load_env result) — server/api modules bake it in.
+fn parse_validate_generate_with_env(
+    dir: &tempfile::TempDir,
+    name: &str,
+    fixture: &str,
+    env: &codegen::EnvMap,
+) -> String {
     let fixture_path = dir.path().join(format!("{}.tsx", name));
     std::fs::write(&fixture_path, fixture).unwrap();
 
@@ -55,7 +66,7 @@ fn parse_validate_generate(
         diags
     );
 
-    let js = codegen::generate(&component).unwrap();
+    let js = codegen::generate(&component, env).unwrap();
     eprintln!("--- Generated JS for {} ---\n{}", name, js);
 
     let js_path = dir.path().join(format!("{}.mjs", name));
@@ -125,7 +136,7 @@ fn static_jsx_with_props() {
     );
 
     // Generate JS
-    let js = codegen::generate(&component).unwrap();
+    let js = codegen::generate(&component, &codegen::EnvMap::new()).unwrap();
     eprintln!("--- Generated JS ---\n{}", js);
 
     // Write generated module
@@ -212,7 +223,7 @@ fn self_closing_element() {
     let diags = validator::validate(&component);
     assert!(diags.is_empty());
 
-    let js = codegen::generate(&component).unwrap();
+    let js = codegen::generate(&component, &codegen::EnvMap::new()).unwrap();
     eprintln!("--- Generated JS ---\n{}", js);
 
     let js_path = dir.path().join("Icon.mjs");
@@ -290,7 +301,7 @@ fn nested_elements_with_text() {
     let diags = validator::validate(&component);
     assert!(diags.is_empty(), "Validation errors: {:?}", diags);
 
-    let js = codegen::generate(&component).unwrap();
+    let js = codegen::generate(&component, &codegen::EnvMap::new()).unwrap();
     eprintln!("--- Generated JS ---\n{}", js);
 
     let js_path = dir.path().join("Layout.mjs");
@@ -2203,7 +2214,7 @@ fn server_data_emits_derived_const_in_generated_js() {
     let diags = validator::validate(&component);
     assert!(diags.is_empty(), "Validation errors: {:?}", diags);
 
-    let js = codegen::generate(&component).unwrap();
+    let js = codegen::generate(&component, &codegen::EnvMap::new()).unwrap();
     eprintln!("--- Generated JS (server with data()) ---\n{}", js);
 
     assert!(js.contains("import { data } from '@marisjs/runtime'"), "missing data import");
@@ -2284,7 +2295,7 @@ fn server_component_with_data_prerenders_correct_html() {
         eprintln!("data_call: {} at {}:{}, has_component_body: {}", component.has_data_call, component.data_call_line, component.data_call_column, component.has_component_body);
         let diags = validator::validate(&component);
         eprintln!("diags: {:?}", diags.iter().map(|d| d.code).collect::<Vec<_>>());
-        if let Ok(js) = codegen::generate(&component) {
+        if let Ok(js) = codegen::generate(&component, &codegen::EnvMap::new()) {
             eprintln!("generated:\n{}", js);
         } else {
             eprintln!("codegen failed");
@@ -4442,5 +4453,976 @@ fn duplicate_island_mounts_both_instances_in_browser() {
         status.success(),
         "playwright duplicate-island spec failed (exit {:?})",
         status.code()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase E1: env() primitive
+// ═══════════════════════════════════════════════════════════════════════
+
+/// §7a: a `@runsOn client` file calling env() is a HARD error (same tier as
+/// CLIENT_DATA_CALL) — environment values are build-time secrets and a
+/// client bundle is publicly downloadable.
+#[test]
+fn env_call_in_client_component_is_rejected() {
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "type BadProps = {};\n",
+        "export function Bad(props: BadProps) {\n",
+        "  const k = env('SECRET_KEY');\n",
+        "  return (<div>{k}</div>);\n",
+        "}\n",
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("Bad.tsx");
+    std::fs::write(&fixture_path, fixture).unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate(&component);
+    assert!(
+        diags.iter().any(|d| d.code == "CLIENT_ENV_ACCESS"),
+        "Expected CLIENT_ENV_ACCESS error, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7a: a server page reading env() must bake the .env value into the
+/// prerendered HTML, end-to-end through the real CLI build (the .env file
+/// lives at the project root, i.e. the source dir passed to the build).
+#[test]
+fn server_page_prerenders_env_value_from_real_dotenv() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    std::fs::write(
+        dir.path().join(".env"),
+        "GREETING=hello-from-dotenv\nSECRET=super-secret\n",
+    )
+    .unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let fixture = concat!(
+        "// @runsOn server\n",
+        "type Props = {};\n",
+        "export function Index(props: Props) {\n",
+        "  return <div>{env('GREETING')} / {env('MISSING_KEY') ?? 'fallback'}</div>;\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let html = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert!(
+        html.contains("hello-from-dotenv"),
+        "env() value must be baked into prerendered html, got: {}",
+        html
+    );
+    // Missing key → undefined → ?? 'fallback' must resolve the fallback.
+    assert!(
+        html.contains("fallback"),
+        "missing env key must fall back, got: {}",
+        html
+    );
+}
+
+/// §7a: a key present in the real process environment wins over .env
+/// (standard dotenv non-override — how CI injects real secrets).
+#[test]
+fn real_process_env_takes_precedence_over_dotenv() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    std::fs::write(dir.path().join(".env"), "GREETING=from-dotenv\n").unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let fixture = concat!(
+        "// @runsOn server\n",
+        "type Props = {};\n",
+        "export function Index(props: Props) {\n",
+        "  return <div>{env('GREETING')}</div>;\n",
+        "}\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .env("GREETING", "from-process-env")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let html = std::fs::read_to_string(out_dir.join("index.html")).unwrap();
+    assert!(
+        html.contains("from-process-env"),
+        "process env must override .env, got: {}",
+        html
+    );
+}
+
+/// §7a: the .env file is NEVER copied into dist — dist is deployable output
+/// and must not carry build-time secrets.
+#[test]
+fn dotenv_is_never_copied_into_dist() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    std::fs::write(dir.path().join(".env"), "SECRET=super-secret\n").unwrap();
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir(&pages_dir).unwrap();
+    let fixture = concat!(
+        "// @runsOn server\n",
+        "type Props = {};\n",
+        "export function Index(props: Props) { return <div>ok</div>; }\n",
+    );
+    std::fs::write(pages_dir.join("Index.tsx"), fixture).unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    assert!(
+        !out_dir.join(".env").exists(),
+        ".env must never be copied into dist"
+    );
+}
+
+/// §7a: an env() call anywhere in a client:hydrate prop expression — direct
+/// call, template-literal interpolation, chained method — is linted as a
+/// WARNING (never a build failure), via AST-based detection. The indirect
+/// pattern (value wrapped in a variable first) is a documented known
+/// limitation and must NOT be falsely flagged.
+#[test]
+fn env_leak_to_client_prop_is_warning_not_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("Leaky.tsx");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from './components/Widget';\n",
+            "type Props = {};\n",
+            "export function Leaky(props: Props) {\n",
+            "  return <Widget apiKey={env('STRIPE_KEY')} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate(&component);
+
+    let leak = diags
+        .iter()
+        .find(|d| d.code == "ENV_LEAK_TO_CLIENT_PROP")
+        .expect("direct env()-into-hydrate-prop must be flagged");
+    assert!(
+        leak.is_warning,
+        "ENV_LEAK_TO_CLIENT_PROP must be a warning, not an error"
+    );
+    assert!(
+        !diags.iter().any(|d| !d.is_warning),
+        "no hard errors expected, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    // AST-based detection: a template literal embedding an env() call must
+    // be flagged (the old text-shape heuristic missed this shape).
+    let tpl_path = dir.path().join("TplLeak.tsx");
+    std::fs::write(
+        &tpl_path,
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from './components/Widget';\n",
+            "type Props = {};\n",
+            "export function TplLeak(props: Props) {\n",
+            "  return <Widget auth={`Bearer ${env('API_KEY')}`} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let tpl = parser::parse_component_file(tpl_path.to_str().unwrap()).unwrap();
+    let tpl_diags = validator::validate(&tpl);
+    assert!(
+        tpl_diags
+            .iter()
+            .any(|d| d.code == "ENV_LEAK_TO_CLIENT_PROP" && d.is_warning),
+        "template-literal env() interpolation into a hydrate prop must be flagged: {:?}",
+        tpl_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    // AST-based detection: a chained method call on the env() result must
+    // also be flagged.
+    let chain_path = dir.path().join("ChainLeak.tsx");
+    std::fs::write(
+        &chain_path,
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from './components/Widget';\n",
+            "type Props = {};\n",
+            "export function ChainLeak(props: Props) {\n",
+            "  return <Widget apiKey={env('KEY').trim()} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let chain = parser::parse_component_file(chain_path.to_str().unwrap()).unwrap();
+    let chain_diags = validator::validate(&chain);
+    assert!(
+        chain_diags
+            .iter()
+            .any(|d| d.code == "ENV_LEAK_TO_CLIENT_PROP" && d.is_warning),
+        "chained method on env() result into a hydrate prop must be flagged: {:?}",
+        chain_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    // The indirect pattern: env() wrapped in a variable first. Known
+    // limitation — this lint only catches the direct shape. Must NOT be
+    // flagged (the test pins the documented behavior).
+    let indirect_path = dir.path().join("Indirect.tsx");
+    std::fs::write(
+        &indirect_path,
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from './components/Widget';\n",
+            "type Props = {};\n",
+            "export function Indirect(props: Props) {\n",
+            "  const cfg = { apiKey: env('STRIPE_KEY') };\n",
+            "  return <Widget cfg={cfg} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let indirect = parser::parse_component_file(indirect_path.to_str().unwrap()).unwrap();
+    let indirect_diags = validator::validate(&indirect);
+    assert!(
+        !indirect_diags
+            .iter()
+            .any(|d| d.code == "ENV_LEAK_TO_CLIENT_PROP"),
+        "indirect env leak is a documented limitation and must NOT be flagged: {:?}",
+        indirect_diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7a: a build containing only the warning must SUCCEED (warnings never
+/// fail the build; only hard errors do).
+#[test]
+fn build_succeeds_when_only_env_leak_warning_present() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    std::fs::write(
+        pages_dir.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Widget } from '../components/Widget';\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) {\n",
+            "  return <Widget apiKey={env('STRIPE_KEY')} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::write(
+        dir.path().join("components/Widget.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type WidgetProps = { apiKey: string };\n",
+            "export function Widget(props: WidgetProps) {\n",
+            "  return <span>{props.apiKey}</span>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".env"), "STRIPE_KEY=sk_test_warn\n").unwrap();
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        status.status.success(),
+        "build must succeed with only warnings, got exit {:?}: {}",
+        status.status.code(),
+        stderr
+    );
+    assert!(
+        stderr.contains("ENV_LEAK_TO_CLIENT_PROP"),
+        "warning must be printed to stderr, got: {}",
+        stderr
+    );
+    assert!(
+        out_dir.join("index.html").exists(),
+        "page must still prerender despite the warning"
+    );
+}
+
+/// §7a: server components passing env() results into NON-hydrate (plain
+/// server-rendered) elements/props is fine — no lint, no error.
+#[test]
+fn env_into_plain_server_jsx_is_unrestricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("Plain.tsx");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Plain(props: Props) {\n",
+            "  return <meta content={env('APP_URL')} />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate(&component);
+    assert!(
+        diags.is_empty(),
+        "no diagnostics expected, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Phase E2: API routes
+// ═══════════════════════════════════════════════════════════════════════
+
+/// §7b: an api file must declare @runsOn api (and only that).
+#[test]
+fn api_file_without_runs_on_api_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("checkout.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn server\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('nope', { status: 200 });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.iter().any(|d| d.code == "API_RUNSON_REQUIRED"),
+        "Expected API_RUNSON_REQUIRED, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7b: data() is forbidden in api files — page-render-time fetching has no
+/// place in a handler that renders no page.
+#[test]
+fn data_call_in_api_file_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("checkout.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  const rows = data(async () => [1, 2]);\n",
+            "  return new Response(JSON.stringify(rows), { status: 200 });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.iter().any(|d| d.code == "API_DATA_CALL"),
+        "Expected API_DATA_CALL, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7b: handler exports are restricted to the sanctioned HTTP methods;
+/// a default export or any other export name is rejected. Supported methods
+/// ARE the export list.
+#[test]
+fn api_handler_names_are_restricted() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("checkout.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export default function handler(req: Request) {\n",
+            "  return new Response('x');\n",
+            "}\n",
+            "export function helper(req: Request) {\n",
+            "  return new Response('y');\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.iter().any(|d| d.code == "DEFAULT_EXPORT"),
+        "Expected DEFAULT_EXPORT, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+    assert!(
+        diags.iter().any(|d| d.code == "API_INVALID_HANDLER"),
+        "Expected API_INVALID_HANDLER, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7b: the api rule set is SMALLER than the component rule set — a handler
+/// body is ordinary TypeScript. Component rules (props parameter, JSX tree,
+/// statement ordering) must NOT fire on api files.
+#[test]
+fn api_files_skip_component_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("checkout.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export function POST(req: Request) {\n",
+            "  const body = req.json();\n",
+            "  const x = 1;\n",
+            "  return new Response(JSON.stringify({ ok: true, x }), { status: 201 });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.is_empty(),
+        "api files skip component rules entirely, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+}
+
+fn write_api_fixture(dir: &tempfile::TempDir, api_source: &str, name: &str) {
+    let api_dir = dir.path().join("api");
+    std::fs::create_dir_all(&api_dir).unwrap();
+    std::fs::write(api_dir.join(name), api_source).unwrap();
+}
+
+/// POSTs to a dev-server port and returns the raw HTTP response.
+fn http_request(port: u16, method: &str, path: &str, body: &str, content_type: &str) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let body_bytes = body.as_bytes();
+    let req = format!(
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        method, path, port, content_type, body_bytes.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(body_bytes).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn spawn_dev_server(dir: &tempfile::TempDir) -> (std::process::Child, u16) {
+    use std::process::{Command as ProcCommand, Stdio};
+    let port = free_port();
+    let out = dir.path().join("dist");
+    let child = ProcCommand::new(cli_binary())
+        .arg("dev")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn marisjs dev");
+    wait_for_port(port);
+    (child, port)
+}
+
+/// §7b e2e #1: a GET API route returns a JSON Response through `marisjs dev`.
+#[test]
+fn dev_server_serves_get_api_route_json() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "APP_NAME=marisjs-ping\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response(JSON.stringify({ app: env('APP_NAME'), ok: true }), {\n",
+            "    status: 200,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+        ),
+        "ping.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/api/ping");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "GET /api/ping should 200, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("application/json"),
+        "should have json content-type, got: {}",
+        response
+    );
+    assert!(
+        response.contains("marisjs-ping") && response.contains("\"ok\":true"),
+        "env() value must flow into the api response, got: {}",
+        response
+    );
+}
+
+/// §7b e2e #2: a POST route reads a JSON body and returns a computed
+/// response (the echo/sum pattern).
+#[test]
+fn dev_server_serves_post_api_route_with_json_body() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export async function POST(req: Request) {\n",
+            "  const body = await req.json();\n",
+            "  return new Response(JSON.stringify({ received: body, sum: body.a + body.b }), {\n",
+            "    status: 200,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+        ),
+        "sum.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_request(port, "POST", "/api/sum", r#"{"a":2,"b":40}"#, "application/json");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "POST /api/sum should 200, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("\"sum\":42"),
+        "computed response body expected, got: {}",
+        response
+    );
+}
+
+/// §7b e2e #3: an async handler calling fetch() (mocked at module level in
+/// the fixture — the test stand-in for a payment provider) using env() for
+/// its config, end-to-end through the dev server.
+#[test]
+fn dev_server_serves_async_handler_with_env_config_and_fetch() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "STRIPE_SECRET_KEY=sk_test_12345\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "// Test stand-in for a real payment provider: the handler below\n",
+            "// calls fetch() the same way a Stripe-ish integration would, with\n",
+            "// the secret read via env() at request time.\n",
+            "globalThis.fetch = async (url, opts) => {\n",
+            "  const auth = opts.headers.get ? opts.headers.get('Authorization') : opts.headers.Authorization;\n",
+            "  return new Response(JSON.stringify({\n",
+            "    url,\n",
+            "    auth,\n",
+            "  }), { status: 200 });\n",
+            "};\n",
+            "export async function POST(req: Request) {\n",
+            "  const body = await req.json();\n",
+            "  const charge = await fetch('https://api.stripe.com/v1/charges', {\n",
+            "    method: 'POST',\n",
+            "    headers: { Authorization: 'Bearer ' + env('STRIPE_SECRET_KEY') },\n",
+            "    body: JSON.stringify(body),\n",
+            "  });\n",
+            "  const upstream = await charge.json();\n",
+            "  return new Response(JSON.stringify({ chargeId: 'ch_1', upstream }), {\n",
+            "    status: 201,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+        ),
+        "checkout.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_request(port, "POST", "/api/checkout", r#"{"amount":2500}"#, "application/json");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        response.starts_with("HTTP/1.1 201"),
+        "POST /api/checkout should 201, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    // The env() value reached the mocked provider through the handler's
+    // fetch call — the full async + env() + fetch chain.
+    assert!(
+        response.contains("sk_test_12345") && response.contains("ch_1"),
+        "env()-configured async fetch chain expected, got: {}",
+        response
+    );
+}
+
+/// §7b: the router decides supported methods from the export list — a method
+/// the file does not export gets 405 with the Allow header.
+#[test]
+fn api_route_405s_for_unexported_method() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function POST(req: Request) {\n",
+            "  return new Response('ok', { status: 200 });\n",
+            "}\n",
+        ),
+        "only_post.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/api/only_post");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        response.starts_with("HTTP/1.1 405"),
+        "GET on a POST-only route must 405, got: {}",
+        response.lines().next().unwrap_or("")
+    );
+    assert!(
+        response.contains("Allow: POST"),
+        "405 must carry the Allow header, got: {}",
+        response
+    );
+}
+
+/// §7b e2e #4: adapter-node serves API routes live — GET and POST through
+/// the production server.
+#[test]
+fn adapter_node_serves_api_route() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "APP_NAME=prod-ping\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response(JSON.stringify({ app: env('APP_NAME'), ok: true }), {\n",
+            "    status: 200,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+            "export async function POST(req: Request) {\n",
+            "  const body = await req.json();\n",
+            "  return new Response(JSON.stringify({ echo: body }), { status: 201 });\n",
+            "}\n",
+        ),
+        "ping.ts",
+    );
+    let out = build_fixture(&dir);
+
+    let port = free_port();
+    let adapter = workspace_root().join("packages/adapter-node/server.mjs");
+    let mut child = ProcCommand::new("node")
+        .arg(&adapter)
+        .arg(&out)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn adapter-node");
+    wait_for_port(port);
+
+    let get_resp = http_get(port, "/api/ping");
+    let post_resp = http_request(port, "POST", "/api/ping", r#"{"x":1}"#, "application/json");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    assert!(
+        get_resp.starts_with("HTTP/1.1 200") && get_resp.contains("prod-ping"),
+        "adapter-node GET should serve the api route with env baked, got: {}",
+        get_resp.lines().next().unwrap_or("")
+    );
+    assert!(
+        post_resp.starts_with("HTTP/1.1 201") && post_resp.contains("\"x\":1"),
+        "adapter-node POST should read the request body, got: {}",
+        post_resp.lines().next().unwrap_or("")
+    );
+}
+
+/// §7b e2e #5: adapter-static fails loud when the build contains API routes
+/// — it cannot execute server code, exactly as it refuses server-mode pages.
+#[test]
+fn adapter_static_refuses_api_routes() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('ok', { status: 200 });\n",
+            "}\n",
+        ),
+        "ping.ts",
+    );
+    let out = build_fixture(&dir);
+
+    let static_out = dir.path().join("static-out");
+    let status = ProcCommand::new("node")
+        .arg(workspace_root().join("packages/adapter-static/cli.mjs"))
+        .arg(&out)
+        .arg(&static_out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !status.status.success(),
+        "adapter-static must refuse api routes"
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("/api/ping") && stderr.contains("adapter-node"),
+        "refusal must list the route and point at adapter-node, got: {}",
+        stderr
+    );
+}
+
+/// §7b regression: a combined pages + api project builds one manifest where
+/// pages routing is untouched and api routes are registered separately —
+/// /api/* is NEVER a page route and the page route is never an api route.
+#[test]
+fn combined_pages_and_api_build_regression() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let pages_dir = dir.path().join("pages");
+    std::fs::create_dir_all(&pages_dir).unwrap();
+    std::fs::write(
+        pages_dir.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) { return <div>home</div>; }\n",
+        ),
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('ok', { status: 200 });\n",
+            "}\n",
+        ),
+        "ping.ts",
+    );
+
+    let bin = cli_binary();
+    let out_dir = dir.path().join("dist");
+    let status = Command::new(bin)
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "combined build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out_dir.join("routes.json")).unwrap(),
+    )
+    .unwrap();
+
+    let routes = manifest["routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0]["path"], "/");
+    assert_eq!(routes[0]["mode"], "static");
+
+    let api_routes = manifest["apiRoutes"].as_array().unwrap();
+    assert_eq!(api_routes.len(), 1);
+    assert_eq!(api_routes[0]["path"], "/api/ping");
+    assert_eq!(api_routes[0]["file"], "api/ping.mjs");
+    assert_eq!(api_routes[0]["methods"][0], "GET");
+
+    // The compiled api module exists in dist with the env helper machinery
+    // available (baked only when env() is called — ping does not call it).
+    assert!(
+        out_dir.join("api/ping.mjs").exists(),
+        "compiled api module must exist in dist"
+    );
+}
+
+/// §7b: env() in an api file bakes the snapshot into the compiled module —
+/// proven at the source level here (module-scope helper + module-level const
+/// in a POST handler use case).
+#[test]
+fn api_module_bakes_env_helper() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("billing.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response(env('STRIPE_SECRET_KEY') ?? 'none', { status: 200 });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.is_empty(),
+        "api file must validate clean, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let mut env = codegen::EnvMap::new();
+    env.insert("STRIPE_SECRET_KEY".to_string(), "sk_live_abc".to_string());
+    let js = codegen::generate_api(&component, &env).unwrap();
+
+    assert!(
+        js.contains("const env = (key) => ({ \"STRIPE_SECRET_KEY\": \"sk_live_abc\" })[key];"),
+        "env helper with baked snapshot expected in module scope, got:\n{}",
+        js
+    );
+    assert!(
+        js.contains("export function GET"),
+        "handler emitted verbatim, got:\n{}",
+        js
+    );
+}
+
+/// §7b: .ts api files compile and their handlers run in Node (TS annotations
+/// stripped) — covered end-to-end by the dev-server tests, plus this unit
+/// check that the emitted handler is plain JS.
+#[test]
+fn api_handler_is_plain_js_after_codegen() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("headers.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request): Response {\n",
+            "  const token = req.headers.get('x-token');\n",
+            "  return new Response(String(token ?? ''), { status: 200 });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    let js = codegen::generate_api(&component, &codegen::EnvMap::new()).unwrap();
+    assert!(
+        !js.contains(": Response"),
+        "TS annotations must be stripped, got:\n{}",
+        js
     );
 }

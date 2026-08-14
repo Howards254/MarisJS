@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper — calls the exact same `parser::parse_component_{file,source}` +
 //! `validator::validate` code path the CLI uses. Output shape is identical to
-//! `marisjs validate`: `{ valid, errors: [{ line, column, code, message, fix_hint }] }`.
+//! `marisjs validate`: `{ valid, errors: [...], warnings: [...] }`.
 
 use rmcp::{
     handler::server::wrapper::Parameters,
@@ -95,6 +95,7 @@ fn validate_input_schema(gen: &mut schemars::SchemaGenerator) -> schemars::Schem
 struct ValidateResult {
     valid: bool,
     errors: Vec<ErrorInfo>,
+    warnings: Vec<ErrorInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,14 +114,14 @@ struct Marisjs;
 
 #[tool_router(server_handler)]
 impl Marisjs {
-    #[tool(description = "Validate a marisjs .tsx component. Provide EXACTLY ONE of: 'path' (absolute path to an existing .tsx file) or 'source' (raw TSX source code, validated in-memory). Returns { valid, errors: [{ line, column, code, message, fix_hint }] } — the same structured JSON that `marisjs validate` produces.")]
+    #[tool(description = "Validate a marisjs .tsx component or .ts API route file. Provide EXACTLY ONE of: 'path' (absolute path to an existing file) or 'source' (raw source code, validated in-memory). Returns { valid, errors, warnings } — the same structured JSON that `marisjs validate` produces.")]
     fn validate_component(&self, Parameters(params): Parameters<ValidateInput>) -> String {
         let result = match params {
             ValidateInput::Path { path } => validate_file(&path),
             ValidateInput::Source { source } => validate_source(&source),
         };
         serde_json::to_string_pretty(&result).unwrap_or_else(|e| {
-            format!(r#"{{"valid":false,"errors":[{{"code":"INTERNAL","message":"{}","fix_hint":"","line":null,"column":null}}]}}"#, e)
+            format!(r#"{{"valid":false,"errors":[{{"code":"INTERNAL","message":"{}","fix_hint":"","line":null,"column":null}}],"warnings":[]}}"#, e)
         })
     }
 }
@@ -135,9 +136,16 @@ fn dispatch(input: ValidateInput) -> ValidateResult {
     }
 }
 
-pub(crate) fn validate_file(path: &str) -> ValidateResult {
+/// §7b: an api/ file validates with the API rule set, not the component
+/// rule set (handlers are not components). Everything else uses the full
+/// component rules. Single dispatch rule, shared with the CLI: the
+/// validator's validate_for_path (ancestor-api-dir or @runsOn api
+/// directive) — no second, possibly-divergent classification here.
+fn validate_path_dispatch(path: &str) -> ValidateResult {
     match parser::parse_component_file(path) {
-        Ok(component) => diagnostics_to_result(validator::validate(&component)),
+        Ok(component) => {
+            diagnostics_to_result(validator::validate_for_path(&component, std::path::Path::new(path)))
+        }
         Err(e) => ValidateResult {
             valid: false,
             errors: vec![ErrorInfo {
@@ -146,8 +154,13 @@ pub(crate) fn validate_file(path: &str) -> ValidateResult {
                 message: e.message,
                 fix_hint: "Check that the file exists and contains valid TypeScript/TSX.".into(),
             }],
+            warnings: Vec::new(),
         },
     }
+}
+
+pub(crate) fn validate_file(path: &str) -> ValidateResult {
+    validate_path_dispatch(path)
 }
 
 pub(crate) fn validate_source(source: &str) -> ValidateResult {
@@ -161,14 +174,25 @@ pub(crate) fn validate_source(source: &str) -> ValidateResult {
                 message: e.message,
                 fix_hint: "Check the source code for syntax errors.".into(),
             }],
+            warnings: Vec::new(),
         },
     }
 }
 
 fn diagnostics_to_result(diagnostics: Vec<validator::Diagnostic>) -> ValidateResult {
+    let (errors, warnings): (Vec<_>, Vec<_>) = diagnostics
+        .into_iter()
+        .partition(|d| !d.is_warning);
     ValidateResult {
-        valid: diagnostics.is_empty(),
-        errors: diagnostics.into_iter().map(|d| ErrorInfo {
+        valid: errors.is_empty(),
+        errors: errors.into_iter().map(|d| ErrorInfo {
+            line: d.line,
+            column: d.column,
+            code: d.code.to_string(),
+            message: d.message,
+            fix_hint: d.fix_hint.to_string(),
+        }).collect(),
+        warnings: warnings.into_iter().map(|d| ErrorInfo {
             line: d.line,
             column: d.column,
             code: d.code.to_string(),

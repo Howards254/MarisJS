@@ -15,6 +15,7 @@ use swc_ecma_visit::{Visit, VisitWith};
 pub enum RunsOn {
     Client,
     Server,
+    Api,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +127,11 @@ pub enum JsxAttrValue {
 pub struct JsxAttr {
     pub name: String,
     pub value: JsxAttrValue,
+    /// AST-based: true when the attribute's expression contains an env()
+    /// call anywhere within it (direct call, chained method, template
+    /// literal interpolation, nested expression). Set by the parser from the
+    /// raw syntax tree — never a text-shape heuristic.
+    pub contains_env_call: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,6 +177,14 @@ pub struct ComponentFile {
     pub has_data_call: bool,
     pub data_call_line: usize,
     pub data_call_column: usize,
+    pub has_env_call: bool,
+    pub env_call_line: usize,
+    pub env_call_column: usize,
+    /// The string-literal keys referenced by env('KEY') call sites. Codegen
+    /// bakes ONLY these keys into the module-scope env helper — never the
+    /// whole process environment (a full snapshot would leak unrelated
+    /// shell secrets into dist output).
+    pub env_call_keys: Vec<String>,
     pub body_stmts: Vec<BodyStmt>,
     pub has_component_body: bool,
     pub render_tree: Option<JsxNode>,
@@ -179,6 +193,19 @@ pub struct ComponentFile {
     pub handler_has_jsx: Vec<bool>,
     pub derived_consts: Vec<String>,
     pub module_consts: Vec<String>,
+    /// Ordered top-level statements (source text, TS annotations stripped) —
+    /// EVERYTHING at module scope except imports, exported function
+    /// declarations (see exported_fn_sources), and the directive comment.
+    /// Component codegen emits module_consts (const-only view); the API
+    /// codegen path emits this full ordered list (module-level consts,
+    /// non-exported helper functions, and other module-level statements like
+    /// setup code), because api files are ordinary TypeScript modules.
+    pub module_statements: Vec<String>,
+    /// Stripped source text of every named function export (name, source) —
+    /// used by the API codegen path, which emits handler functions verbatim.
+    /// TS annotations are stripped via the same splice mechanism as
+    /// handler_decls.
+    pub exported_fn_sources: Vec<(String, String)>,
     pub unsupported_errors: Vec<ParserError>,
 }
 
@@ -198,6 +225,10 @@ impl ComponentFile {
             has_data_call: false,
             data_call_line: 0,
             data_call_column: 0,
+            has_env_call: false,
+            env_call_line: 0,
+            env_call_column: 0,
+            env_call_keys: Vec::new(),
             body_stmts: Vec::new(),
             has_component_body: false,
             render_tree: None,
@@ -206,6 +237,8 @@ impl ComponentFile {
             handler_has_jsx: Vec::new(),
             derived_consts: Vec::new(),
             module_consts: Vec::new(),
+            module_statements: Vec::new(),
+            exported_fn_sources: Vec::new(),
             unsupported_errors: Vec::new(),
         }
     }
@@ -362,6 +395,8 @@ fn parse_runs_on_comment(text: &str) -> Option<RunsOn> {
             return Some(RunsOn::Client);
         } else if rest.starts_with("server") {
             return Some(RunsOn::Server);
+        } else if rest.starts_with("api") {
+            return Some(RunsOn::Api);
         }
     }
     None
@@ -523,6 +558,12 @@ impl Visit for Extractor<'_> {
                     line,
                     column: col,
                 });
+                if let Ok(src) = self.cm.span_to_snippet(n.span) {
+                    let stripped = strip_ts_annotations(&src, n.span, fn_decl);
+                    self.file
+                        .exported_fn_sources
+                        .push((fn_decl.ident.sym.to_string(), stripped));
+                }
                 self.extract_fn_props(
                     &fn_decl.function,
                     fn_decl.ident.sym.to_string(),
@@ -599,39 +640,97 @@ impl Visit for Extractor<'_> {
         self.depth -= 1;
     }
 
-    fn visit_import_decl(&mut self, n: &ImportDecl) {
-        let (line, col) = pos(self.cm, n.span);
-        let source = n.src.value.to_string();
-        let is_css = source.ends_with(".css") || source.ends_with(".CSS");
+    /// Ordered module-scope capture for API files: every top-level statement
+/// except imports, exported function declarations, and the directive
+/// comment, in source order, with TS annotations stripped. This is what the
+/// api codegen emits verbatim — api files are ordinary TypeScript modules,
+/// and dropping module-level statements (setup code, helper functions,
+/// consts) would silently break handlers that reference them.
+fn visit_module(&mut self, n: &Module) {
+    for item in &n.body {
+        match item {
+            ModuleItem::ModuleDecl(ModuleDecl::Import(_)) => continue,
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export)) => {
+                // Exported functions are captured separately (they become the
+                // route handlers); exported consts/lets/vars are captured by
+                // visit_var_decl into module_consts/top_level_bindings and are
+                // ALSO part of the ordered statement list here — the api
+                // codegen emits module_statements and skips module_consts, so
+                // there is no double emission.
+                if matches!(export.decl, Decl::Fn(_)) {
+                    continue;
+                }
+                if let Decl::Var(var) = &export.decl {
+                    // Keep the `export` keyword so the emitted module still
+                    // exports the binding (export const X = 1 must stay
+                    // importable by sibling modules).
+                    if let Ok(src) = self.cm.span_to_snippet(export.span) {
+                        let stripped = strip_var_ts(&src, export.span, var);
+                        self.file.module_statements.push(stripped);
+                    }
+                    continue;
+                }
+                continue;
+            }
+            ModuleItem::ModuleDecl(_) => continue,
+            ModuleItem::Stmt(stmt) => match stmt {
+                Stmt::Decl(Decl::Var(var)) => {
+                    if let Ok(src) = self.cm.span_to_snippet(var.span) {
+                        let stripped = strip_var_ts(&src, var.span, var);
+                        self.file.module_statements.push(stripped);
+                    }
+                }
+                Stmt::Decl(Decl::Fn(fn_decl)) => {
+                    if let Ok(src) = self.cm.span_to_snippet(fn_decl.span()) {
+                        let stripped = strip_ts_annotations(&src, fn_decl.span(), fn_decl);
+                        self.file.module_statements.push(stripped);
+                    }
+                }
+                _ => {
+                    if let Ok(src) = self.cm.span_to_snippet(stmt.span()) {
+                        self.file.module_statements.push(src);
+                    }
+                }
+            },
+        }
+    }
 
-        let mut names = Vec::new();
+    n.visit_children_with(self);
+}
 
-        for spec in &n.specifiers {
-            match spec {
-                ImportSpecifier::Named(named) => {
-                    names.push(named.local.sym.to_string());
-                }
-                ImportSpecifier::Default(default) => {
-                    names.push(default.local.sym.to_string());
-                }
-                ImportSpecifier::Namespace(ns) => {
-                    names.push(ns.local.sym.to_string());
-                }
+fn visit_import_decl(&mut self, n: &ImportDecl) {
+    let (line, col) = pos(self.cm, n.span);
+    let source = n.src.value.to_string();
+    let is_css = source.ends_with(".css") || source.ends_with(".CSS");
+
+    let mut names = Vec::new();
+
+    for spec in &n.specifiers {
+        match spec {
+            ImportSpecifier::Named(named) => {
+                names.push(named.local.sym.to_string());
+            }
+            ImportSpecifier::Default(default) => {
+                names.push(default.local.sym.to_string());
+            }
+            ImportSpecifier::Namespace(ns) => {
+                names.push(ns.local.sym.to_string());
             }
         }
-
-        if is_css || !names.is_empty() {
-            self.file.imports.push(ImportInfo {
-                source,
-                imported_names: names,
-                line,
-                column: col,
-                is_css,
-            });
-        }
-
-        n.visit_children_with(self);
     }
+
+    if is_css || !names.is_empty() {
+        self.file.imports.push(ImportInfo {
+            source,
+            imported_names: names,
+            line,
+            column: col,
+            is_css,
+        });
+    }
+
+    n.visit_children_with(self);
+}
 
     fn visit_var_decl(&mut self, n: &VarDecl) {
         if self.depth == 0 {
@@ -692,11 +791,29 @@ impl Visit for Extractor<'_> {
         match &n.callee {
             Callee::Expr(expr) => match &**expr {
                 Expr::Ident(ident) => {
-                    if ident.sym.as_ref() == "data" {
-                        let (line, col) = pos(self.cm, n.span);
+                    let name = ident.sym.as_ref();
+                    let (line, col) = pos(self.cm, n.span);
+                    if name == "data" {
                         self.file.has_data_call = true;
                         self.file.data_call_line = line;
                         self.file.data_call_column = col;
+                    }
+                    if name == "env" {
+                        self.file.has_env_call = true;
+                        self.file.env_call_line = line;
+                        self.file.env_call_column = col;
+                        // Record the referenced key when it is a string
+                        // literal — this is the bake-allowlist (see
+                        // env_call_keys). Dynamic keys (env(name)) are
+                        // allowed to compile but can never be baked; they
+                        // yield undefined.
+                        if let Some(arg) = n.args.first() {
+                            if let Some(lit) = arg.expr.as_lit() {
+                                if let swc_ecma_ast::Lit::Str(s) = lit {
+                                    self.file.env_call_keys.push(s.value.to_string());
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -998,6 +1115,7 @@ fn convert_jsx_attr_or_spread(attr: &JSXAttrOrSpread, errors: &mut Vec<ParserErr
     match attr {
         JSXAttrOrSpread::JSXAttr(attr) => Some(JsxAttr {
             name: jsx_attr_name_to_string(&attr.name),
+            contains_env_call: jsx_attr_value_contains_env_call(&attr.value),
             value: attr
                 .value
                 .as_ref()
@@ -1024,6 +1142,46 @@ fn is_client_hydrate_attr(attr: &JSXAttrOrSpread) -> bool {
         ),
         JSXAttrOrSpread::SpreadElement(_) => false,
     }
+}
+
+/// AST-based env() detection scoped to a single expression subtree — the
+/// same callee-shape check Extractor::visit_call_expr applies, so the
+/// validator can flag env leaks without text heuristics. Fires for an env()
+/// call anywhere inside the expression: direct calls, chained methods
+/// (`env('K').trim()`), template interpolation (`Bearer ${env('K')}`).
+struct EnvCallFinder {
+    found: bool,
+}
+
+impl Visit for EnvCallFinder {
+    fn visit_call_expr(&mut self, n: &CallExpr) {
+        if matches!(
+            &n.callee,
+            Callee::Expr(expr) if matches!(&**expr, Expr::Ident(ident) if ident.sym == "env")
+        ) {
+            self.found = true;
+        }
+        n.visit_children_with(self);
+    }
+}
+
+fn expr_contains_env_call(expr: &Expr) -> bool {
+    let mut finder = EnvCallFinder { found: false };
+    expr.visit_with(&mut finder);
+    finder.found
+}
+
+fn jsx_attr_value_contains_env_call(value: &Option<JSXAttrValue>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let JSXAttrValue::JSXExprContainer(container) = value else {
+        return false;
+    };
+    let JSXExpr::Expr(expr) = &container.expr else {
+        return false;
+    };
+    expr_contains_env_call(expr)
 }
 
 fn convert_jsx_attr_value(value: &JSXAttrValue, errors: &mut Vec<ParserError>) -> JsxAttrValue {

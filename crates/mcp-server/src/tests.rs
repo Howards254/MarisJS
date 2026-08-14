@@ -271,3 +271,183 @@ fn fixtures_dir() -> String {
         assert!(!error.message.is_empty());
     assert!(!error.fix_hint.is_empty());
 }
+
+#[test]
+fn test_api_file_uses_api_rule_set() {
+    use super::validate_file;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let api_dir = dir.path().join("api");
+    std::fs::create_dir_all(&api_dir).unwrap();
+    let path = api_dir.join("checkout.ts");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(
+        b"// @runsOn api\nexport function GET(req: Request) {\n  return new Response('ok');\n}\n",
+    )
+    .unwrap();
+
+    // Component rules must NOT fire on an api file (no JSX tree, no props).
+    let result = validate_file(path.to_str().unwrap());
+    assert!(result.valid, "api file must validate clean, got: {:?}", result.errors);
+
+    // The full component rule set WOULD reject this file (no JSX) — proving
+    // the api dispatch uses the smaller rule set.
+    let component = parser::parse_component_file(path.to_str().unwrap()).unwrap();
+    let full = validator::validate(&component);
+    assert!(
+        !full.is_empty(),
+        "sanity: full component rules must reject a handler file"
+    );
+}
+
+#[test]
+fn test_api_file_with_data_call_is_rejected() {
+    use super::validate_file;
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().unwrap();
+    let api_dir = dir.path().join("api");
+    std::fs::create_dir_all(&api_dir).unwrap();
+    let path = api_dir.join("checkout.ts");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(
+        b"// @runsOn api\nexport function GET(req: Request) {\n  const x = data(async () => 1);\n  return new Response('ok');\n}\n",
+    )
+    .unwrap();
+
+    let result = validate_file(path.to_str().unwrap());
+    assert!(!result.valid);
+    assert!(
+        result.errors.iter().any(|e| e.code == "API_DATA_CALL"),
+        "expected API_DATA_CALL, got: {:?}",
+        result.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_env_leak_shows_in_warnings_not_errors() {
+    use super::validate_source;
+
+    let result = validate_source(
+        "// @runsOn server\nimport { Widget } from './Widget';\ntype Props = {};\nexport function inline(props: Props) {\n  return <Widget apiKey={env('K')} client:hydrate />;\n}\n",
+    );
+    assert!(
+        result.valid,
+        "warnings must not make validation fail: {:?}",
+        result.errors
+    );
+    assert!(
+        result.warnings.iter().any(|w| w.code == "ENV_LEAK_TO_CLIENT_PROP"),
+        "expected ENV_LEAK_TO_CLIENT_PROP in warnings, got: {:?}",
+        result.warnings.iter().map(|w| &w.code).collect::<Vec<_>>()
+    );
+}
+
+/// §7b: the `@runsOn api` directive alone (file NOT under an api/ dir) must
+/// dispatch to the API rule set — component-only codes must not fire. This
+/// pins the shared dispatch rule (validator::validate_for_path) that build,
+/// CLI validate, and the MCP tool all use.
+#[test]
+fn test_api_directive_outside_api_dir_uses_api_rule_set() {
+    let output = run_validate_file("runs_on_api_outside_api_dir.ts");
+    assert_eq!(
+        output["valid"], true,
+        "api file outside api/ with the directive must validate clean: {}",
+        output
+    );
+    assert_no_code(&output, "FILENAME_MISMATCH");
+    assert_no_code(&output, "PROPS_WRONG_NAME");
+}
+
+/// The tool over the REAL stdio transport: an in-process rmcp client performs
+/// the full MCP handshake and a tools/call round-trip against Marisjs, then
+/// parses the returned JSON. Proves the corrected api/ dispatch reaches the
+/// MCP client unchanged — not just the internal validate_file function.
+#[tokio::test]
+async fn test_validate_component_over_real_transport_uses_api_dispatch() {
+    use rmcp::model::{CallToolRequestParams, ClientInfo};
+    use rmcp::{ClientHandler, ServiceExt};
+    use serde_json::json;
+
+    #[derive(Debug, Clone, Default)]
+    struct StubClient;
+
+    impl ClientHandler for StubClient {
+        fn get_info(&self) -> ClientInfo {
+            ClientInfo::default()
+        }
+    }
+
+    async fn call_validate(path: &str, client: &rmcp::service::RunningService<rmcp::RoleClient, StubClient>) -> Value {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("validate_component")
+                    .with_arguments(json!({ "path": path }).as_object().unwrap().clone()),
+            )
+            .await
+            .expect("tools/call must succeed");
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str())
+            .expect("tool must return text content");
+        serde_json::from_str(text).expect("tool output must be JSON")
+    }
+
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let server_handle = tokio::spawn(async move {
+        let _ = Marisjs
+            .serve(server_transport)
+            .await
+            .expect("server should start")
+            .waiting()
+            .await;
+    });
+
+    let client = StubClient::default()
+        .serve(client_transport)
+        .await
+        .expect("client should connect");
+
+    let fixtures = fixtures_dir();
+
+    let valid = call_validate(&format!("{}api/checkout.ts", fixtures), &client).await;
+    assert_eq!(
+        valid["valid"], true,
+        "valid api file over real transport must be clean: {}",
+        valid
+    );
+    assert!(
+        valid["errors"].as_array().unwrap().is_empty(),
+        "no component-rule errors may leak: {}",
+        valid
+    );
+
+    let broken = call_validate(&format!("{}api/broken_runs_on.ts", fixtures), &client).await;
+    assert_eq!(
+        broken["valid"], false,
+        "api file without @runsOn api must fail: {}",
+        broken
+    );
+    assert!(
+        broken["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "MISSING_RUNSON"),
+        "expected MISSING_RUNSON over real transport, got: {}",
+        broken
+    );
+
+    let directive_only = call_validate(&format!("{}runs_on_api_outside_api_dir.ts", fixtures), &client).await;
+    assert_eq!(
+        directive_only["valid"], true,
+        "@runsOn api outside api/ must validate clean over real transport: {}",
+        directive_only
+    );
+
+    client.cancel().await.expect("client should cancel");
+    server_handle.abort();
+}

@@ -458,3 +458,120 @@ fn dev_server_serves_image_correct_mime() {
     child.kill().unwrap();
     let _ = child.wait();
 }
+
+// ── §7a: marisjs init writes .gitignore (excluding .env) + .env.example ──
+
+/// The .gitignore excluding .env is the PRIMARY defense against accidental
+/// secret commits; .env.example documents expected keys with no real values.
+/// Both are written by `marisjs init`, appended safely when a .gitignore
+/// already exists.
+#[test]
+fn init_writes_gitignore_and_env_example() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    assert!(
+        gitignore.lines().any(|l| l.trim() == ".env"),
+        ".gitignore must exclude .env, got: {}",
+        gitignore
+    );
+
+    let example = std::fs::read_to_string(dir.path().join(".env.example")).unwrap();
+    assert!(
+        example.contains(".env is gitignored"),
+        ".env.example should document the convention, got: {}",
+        example
+    );
+
+    // Idempotent: a second init must not duplicate the .env line.
+    let output2 = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output2.status.success(), "second init must refuse (package.json exists)");
+}
+
+#[test]
+fn init_appends_env_to_existing_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "node_modules\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+    let lines: Vec<&str> = gitignore.lines().collect();
+    assert!(lines.contains(&"node_modules"));
+    assert!(lines.contains(&".env"));
+    assert_eq!(
+        lines.iter().filter(|l| **l == ".env").count(),
+        1,
+        ".env must not be duplicated"
+    );
+}
+
+// ── §7b: validate dispatches to the API rule set for api/ files ─────
+
+#[test]
+fn test_api_file_validates_with_api_rules() {
+    let output = run_validate("api/checkout.ts");
+    assert_eq!(
+        output["valid"], true,
+        "valid api file must validate clean, got: {}",
+        output
+    );
+    assert!(
+        output["errors"].as_array().unwrap().is_empty(),
+        "component-rule errors must not fire on api files: {}",
+        output
+    );
+}
+
+#[test]
+fn test_api_file_without_runs_on_reports_api_errors() {
+    let output = run_validate("api/broken_runs_on.ts");
+    assert_eq!(output["valid"], false);
+    let error = get_error_by_code(&output, "MISSING_RUNSON");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("@runsOn api"),
+        "the api rule set's runs-on error must be reported, got: {}",
+        error
+    );
+    // Component-only codes must NOT appear on an api file.
+    assert_no_code(&output, "FILENAME_MISMATCH");
+    assert_no_code(&output, "PROPS_WRONG_NAME");
+}
+
+#[test]
+fn test_api_directive_outside_api_dir_uses_api_rules() {
+    let output = run_validate("runs_on_api_outside_api_dir.ts");
+    assert_eq!(
+        output["valid"], true,
+        "@runsOn api file outside api/ must validate with api rules, got: {}",
+        output
+    );
+    assert_no_code(&output, "FILENAME_MISMATCH");
+}

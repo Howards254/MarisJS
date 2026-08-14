@@ -17,3 +17,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
 anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+# client feature is test-only: enables an in-process rmcp client so tests
+# exercise the tool over the real stdio transport protocol, not just the
+# internal dispatch functions.
+rmcp = { version = "3.0.0-beta.2", features = ["client"] }

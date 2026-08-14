@@ -1,11 +1,108 @@
 use parser::{ComponentFile, JsxAttrValue, JsxNode, RunsOn, SignalKind};
+use std::collections::HashMap;
 
-pub fn generate(component: &ComponentFile) -> Result<String, String> {
+/// Build-time snapshot of the project's environment (loaded from `.env` +
+/// real process env by the CLI). Baked into server/api modules as a
+/// module-scope `env` helper; never touches `process.env` at runtime.
+pub type EnvMap = HashMap<String, String>;
+
+pub fn generate(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
     if component.runs_on == Some(RunsOn::Server) {
-        generate_server(component)
+        generate_server(component, env)
     } else {
         generate_client(component)
     }
+}
+
+/// §7b: API route codegen. Emits a plain ESM module: non-CSS imports,
+/// (the build-time env snapshot when the file calls env()), module-level
+/// consts, then every exported method handler VERBATIM (TS annotations
+/// stripped by the parser). There is no signal/JSX machinery — handlers are
+/// ordinary TypeScript compiled to ordinary JavaScript.
+pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
+    let mut output = String::new();
+
+    for imp in &component.imports {
+        if imp.is_css {
+            continue; // rejected by the validator anyway — never emitted
+        }
+        // Rewrite RELATIVE imports to the compiled .mjs sibling (same rule as
+        // component imports); bare/node_modules specifiers pass through.
+        let source = if imp.source.starts_with("./") || imp.source.starts_with("../") {
+            format!("{}.mjs", imp.source.trim_end_matches(".tsx").trim_end_matches(".ts"))
+        } else {
+            imp.source.clone()
+        };
+        let names = imp
+            .imported_names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!("import {{ {} }} from '{}';\n", names, source));
+    }
+    if !component.imports.is_empty() {
+        output.push('\n');
+    }
+
+    if component.has_env_call {
+        output.push_str(&emit_env_helper(env, &component.env_call_keys));
+        output.push('\n');
+    }
+
+    // ALL top-level statements in source order — api files are ordinary
+    // TypeScript modules, so setup code, helper functions, and consts are
+    // all emitted verbatim (TS stripped). Handlers reference these bindings
+    // at call time; the env helper above is defined first so module-level
+    // env() uses (e.g. a const built from env at eval time) resolve too.
+    for stmt in &component.module_statements {
+        output.push_str(stmt);
+        output.push('\n');
+    }
+
+    for (_, source) in &component.exported_fn_sources {
+        // The captured snippet spans the full `export function GET(...) {...}`
+        // declaration (TS annotations already stripped by the parser), so it
+        // is emitted verbatim. Every captured source is a named function
+        // export — validated to be a sanctioned method name.
+        output.push_str(&source);
+        if !source.trim_end().ends_with('}') {
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+
+    if output.trim().is_empty() {
+        return Err("no handlers emitted".to_string());
+    }
+    Ok(output)
+}
+
+/// Emits the module-scope env helper carrying the build-time snapshot:
+/// `const env = (key) => ({...values})[key];`. Keys/values are JSON-escaped,
+/// so any value (quotes, newlines, non-ASCII) survives the round trip.
+///
+/// Only the keys the file actually references (parser's env_call_keys) are
+/// baked — never the whole process environment. An unreferenced key cannot
+/// leak into the compiled output; a referenced-but-absent key is simply not
+/// in the map and yields undefined at runtime (so `?? fallback` works).
+fn emit_env_helper(env: &EnvMap, referenced_keys: &[String]) -> String {
+    let entries: Vec<String> = referenced_keys
+        .iter()
+        .filter_map(|k| {
+            env.get(k).map(|v| {
+                format!(
+                    "{}: {}",
+                    serde_json::to_string(k).unwrap(),
+                    serde_json::to_string(v).unwrap()
+                )
+            })
+        })
+        .collect();
+    format!(
+        "const env = (key) => ({{ {} }})[key];\n",
+        entries.join(", ")
+    )
 }
 
 fn generate_client(component: &ComponentFile) -> Result<String, String> {
@@ -126,7 +223,7 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
 // server codegen
 // ---------------------------------------------------------------------------
 
-fn generate_server(component: &ComponentFile) -> Result<String, String> {
+fn generate_server(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
     let component_name = component
         .exports
         .first()
@@ -162,6 +259,11 @@ fn generate_server(component: &ComponentFile) -> Result<String, String> {
 
     if has_data {
         output.push_str("import { data } from '@marisjs/runtime';\n\n");
+    }
+
+    if component.has_env_call {
+        output.push_str(&emit_env_helper(env, &component.env_call_keys));
+        output.push('\n');
     }
 
     if tree_has_style_expr(render_tree) {
@@ -265,7 +367,12 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
             output.push_str(&format!("'{}'", html_escape(text)));
         }
         JsxNode::Expr(expr) => {
-            output.push_str(expr);
+            // Parens are REQUIRED: the expression lands in the middle of a
+            // string-concat chain, and a binary expression (env('K') ??
+            // 'fallback', a || b, …) would otherwise bind looser than + and
+            // silently change meaning (`'x' + a ?? b + 'y'` ≠ `'x' + (a ??
+            // b) + 'y'`). Genuinely additive exprs are unaffected by the wrap.
+            output.push_str(&format!("({})", expr));
         }
         JsxNode::Element { tag, attrs, children, is_hydrate_root, is_component } => {
             if *is_hydrate_root {
