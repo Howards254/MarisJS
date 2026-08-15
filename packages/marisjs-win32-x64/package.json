@@ -1,6 +1,6 @@
 {
   "name": "marisjs-win32-x64",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "marisjs CLI binary for Windows x64",
   "os": [
     "win32"

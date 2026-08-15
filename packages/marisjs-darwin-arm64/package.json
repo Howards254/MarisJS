@@ -1,6 +1,6 @@
 {
   "name": "marisjs-darwin-arm64",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "marisjs CLI binary for macOS arm64 (Apple Silicon)",
   "os": [
     "darwin"

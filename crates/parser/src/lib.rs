@@ -71,6 +71,12 @@ pub enum TopLevelBinding {
         line: usize,
         column: usize,
     },
+    Const {
+        name: String,
+        exported: bool,
+        line: usize,
+        column: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +191,12 @@ pub struct ComponentFile {
     /// whole process environment (a full snapshot would leak unrelated
     /// shell secrets into dist output).
     pub env_call_keys: Vec<String>,
+    /// session()/setSession() call-site detection — the same mechanism as
+    /// env()/data(), so the validator's CLIENT_SESSION_ACCESS rejection and
+    /// codegen's session-block emission share one AST-based source of truth.
+    pub has_session_call: bool,
+    pub session_call_line: usize,
+    pub session_call_column: usize,
     pub body_stmts: Vec<BodyStmt>,
     pub has_component_body: bool,
     pub render_tree: Option<JsxNode>,
@@ -229,6 +241,9 @@ impl ComponentFile {
             env_call_line: 0,
             env_call_column: 0,
             env_call_keys: Vec::new(),
+            has_session_call: false,
+            session_call_line: 0,
+            session_call_column: 0,
             body_stmts: Vec::new(),
             has_component_body: false,
             render_tree: None,
@@ -391,11 +406,15 @@ fn parse_runs_on_comment(text: &str) -> Option<RunsOn> {
     let trimmed = text.trim();
     if let Some(rest) = trimmed.strip_prefix("@runsOn") {
         let rest = rest.trim();
-        if rest.starts_with("client") {
+        // Exact match only (E4-11): a misspelled or prefix value like
+        // "@runsOn apiserver" must NOT silently compile as "api" — an
+        // unknown value is a directive error, surfaced by the validator
+        // (RUNS_ON_DIRECTIVE), never a silent reclassification.
+        if rest == "client" {
             return Some(RunsOn::Client);
-        } else if rest.starts_with("server") {
+        } else if rest == "server" {
             return Some(RunsOn::Server);
-        } else if rest.starts_with("api") {
+        } else if rest == "api" {
             return Some(RunsOn::Api);
         }
     }
@@ -759,10 +778,19 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
                             // capture the source text (TS annotations stripped) the
                             // same way in-component derived consts are captured, so
                             // codegen can emit it at module scope of the output.
+                            // The NAME is recorded too (TopLevelBinding::Const) so
+                            // the validator can detect collisions with the emitted
+                            // session/env runtime declarations.
                             if let Ok(src) = self.cm.span_to_snippet(n.span) {
                                 let stripped = strip_var_ts(&src, n.span, n);
                                 self.file.module_consts.push(stripped);
                             }
+                            self.file.top_level_bindings.push(TopLevelBinding::Const {
+                                name: ident.id.sym.to_string(),
+                                exported: false,
+                                line,
+                                column: col,
+                            });
                         }
                     }
                 }
@@ -788,39 +816,74 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
     }
 
     fn visit_call_expr(&mut self, n: &CallExpr) {
-        match &n.callee {
-            Callee::Expr(expr) => match &**expr {
-                Expr::Ident(ident) => {
-                    let name = ident.sym.as_ref();
-                    let (line, col) = pos(self.cm, n.span);
-                    if name == "data" {
-                        self.file.has_data_call = true;
-                        self.file.data_call_line = line;
-                        self.file.data_call_column = col;
-                    }
-                    if name == "env" {
-                        self.file.has_env_call = true;
-                        self.file.env_call_line = line;
-                        self.file.env_call_column = col;
-                        // Record the referenced key when it is a string
-                        // literal — this is the bake-allowlist (see
-                        // env_call_keys). Dynamic keys (env(name)) are
-                        // allowed to compile but can never be baked; they
-                        // yield undefined.
-                        if let Some(arg) = n.args.first() {
-                            if let Some(lit) = arg.expr.as_lit() {
-                                if let swc_ecma_ast::Lit::Str(s) = lit {
-                                    self.file.env_call_keys.push(s.value.to_string());
-                                }
-                            }
+        // The callee may hide behind cheap AST shapes that resolve to the
+        // same target: a comma-sequence `(0, session)()` (the LAST element is
+        // the actual call target) and, via visit_opt_chain_expr, `session?.()`.
+        // Parenthesized callees (`(session)()`) unwrap first — swc keeps
+        // ParenExpr nodes in the tree.
+        let mut callee_expr: &Expr = match &n.callee {
+            Callee::Expr(expr) => &**expr,
+            _ => return,
+        };
+        while let Expr::Paren(paren) = callee_expr {
+            callee_expr = &paren.expr;
+        }
+        let target: Option<&Ident> = match callee_expr {
+            Expr::Ident(ident) => Some(ident),
+            Expr::Seq(seq) => seq.exprs.last().and_then(|e| match &**e {
+                Expr::Ident(ident) => Some(ident),
+                _ => None,
+            }),
+            _ => None,
+        };
+
+        if let Some(ident) = target {
+            let name = ident.sym.as_ref();
+            let (line, col) = pos(self.cm, n.span);
+            if name == "data" {
+                self.file.has_data_call = true;
+                self.file.data_call_line = line;
+                self.file.data_call_column = col;
+            }
+            if name == "env" {
+                self.file.has_env_call = true;
+                self.file.env_call_line = line;
+                self.file.env_call_column = col;
+                // Record the referenced key when it is a string
+                // literal — this is the bake-allowlist (see
+                // env_call_keys). Dynamic keys (env(name)) are
+                // allowed to compile but can never be baked; they
+                // yield undefined.
+                if let Some(arg) = n.args.first() {
+                    if let Some(lit) = arg.expr.as_lit() {
+                        if let swc_ecma_ast::Lit::Str(s) = lit {
+                            self.file.env_call_keys.push(s.value.to_string());
                         }
                     }
                 }
-                _ => {}
-            },
-            _ => {}
+            }
+            if name == "session" || name == "setSession" {
+                self.file.has_session_call = true;
+                self.file.session_call_line = line;
+                self.file.session_call_column = col;
+            }
         }
 
+        n.visit_children_with(self);
+    }
+
+    /// `session?.()` parses as an optional chain whose base is the call
+    /// expression — surface the base call to the normal detection so the
+    /// boundary checks cannot be dodged by optional-call syntax.
+    fn visit_opt_chain_expr(&mut self, n: &OptChainExpr) {
+        if let OptChainBase::Call(call) = &*n.base {
+            self.visit_call_expr(&CallExpr {
+                span: call.span,
+                callee: Callee::Expr(call.callee.clone()),
+                args: call.args.clone(),
+                type_args: call.type_args.clone(),
+            });
+        }
         n.visit_children_with(self);
     }
 }

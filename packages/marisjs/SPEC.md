@@ -176,6 +176,12 @@ output — there is nothing else to configure.
   rendered as a sibling to page content in the server page's JSX. Shared page chrome
   (nav, footer) lives inside the Layout component's own JSX. A page that needs to pass
   content through a Layout should do so via typed props — e.g., `Layout({ content: ... })`.
+- The dependency direction is one-way: server files may import client files (islands),
+  but a `@runsOn client` file importing a `@runsOn server` component or an api module
+  is a **hard build error** (`CLIENT_IMPORTS_SERVER`) — server modules are emitted
+  under `dist/_server/` with no public URL, so the client bundle would reference an
+  undefined import at runtime. Server data must flow into islands via props, not
+  imports.
 - This is a **convention**, not a framework feature. There is no `<Layout>` built-in
   component, no special `<slot>` syntax, and no automatic global-stylesheet injection.
   The pattern works because the CSS collection walk is transitive and name-based — any
@@ -497,7 +503,7 @@ const products = await data(async () => {
 
 ---
 
-## 7. Environment Variables & API Routes
+## 7. Environment Variables, API Routes & Sessions
 
 ### 7a. Environment Variables and Secrets
 
@@ -577,6 +583,133 @@ directory nesting maps the same way as pages (`api/billing/charge.ts` →
   `@marisjs/adapter-static` refuses a build containing API routes (fail-loud: it
   cannot execute server code, exactly as it already refuses server-mode pages).
 
+### 7c. Sessions
+
+Deliberately minimal session primitives for `@runsOn api` and `@runsOn server` files:
+an HMAC-signed session cookie whose contents the server can read and write. No
+server-side session store, no user accounts, no auth framework — just two functions.
+
+```tsx
+// @runsOn api
+export function POST(req) {
+  const s = session();
+  return setSession(
+    { visits: (s ? s.visits : 0) + 1 },
+    new Response('ok'),
+  );
+}
+export function GET(req) {
+  const s = session();
+  return new Response(JSON.stringify({ visits: s ? s.visits : null }));
+}
+```
+
+**Rules (validator-enforced):**
+
+- `session(): Record<string, any> | null` — reads and HMAC-verifies the incoming
+  session cookie. Returns the decoded data, or `null` when the cookie is absent,
+  malformed, or fails verification (tampered, truncated, wrong signature). Signature
+  verification runs on every read, and all three failure modes fail safe to `null` —
+  never a throw, never partial or unverified data. The incoming request is the one
+  the framework dispatched to the handler; no argument is passed because the handler
+  does not choose which request to read.
+- `setSession(data: Record<string, any>, response: Response): Response` — signs
+  `data` with HMAC and attaches it to `response` as a `Set-Cookie` header, returning
+  the modified `Response`. Callers chain it on the response they return from the
+  handler.
+- The signing secret comes from `env('SESSION_SECRET')` — the E1 primitive, reusing
+  its infrastructure; there is no second secrets mechanism. A module that calls
+  `session()`/`setSession()` **must** build with a strong `SESSION_SECRET` present (in
+  `.env` or the real environment) — `marisjs build`/`marisjs dev` fail loudly at build
+  time with a clear error if it is missing, empty, whitespace-only, or shorter than
+  16 characters. It never fails silently with a weak, default, or empty secret.
+  Production guidance: a long random value (e.g. `openssl rand -base64 32`). The
+  strength gate is a floor, not a substitute for good secret hygiene.
+- Cookie defaults: `HttpOnly` (never readable from client JS), `SameSite=Lax` (the v1
+  CSRF baseline, see below), and `Secure` in production. Whether `Secure` is set is
+  determined at build time from the environment (`NODE_ENV=production`, per the
+  standard convention; an adapter-provided context may override in future versions).
+  Consequence: a site built without `NODE_ENV=production` serves non-`Secure` cookies
+  even on an HTTPS deployment — set it at build time.
+- `session()` and `setSession()` are callable only from `@runsOn api` or `@runsOn
+  server` files. Calling either from a `@runsOn client` file is a **hard validator
+  error** (`CLIENT_SESSION_ACCESS`), the same enforcement tier and mechanism as
+  `CLIENT_DATA_CALL`/`CLIENT_ENV_ACCESS` — a session cookie is a credential-bearing
+  server secret, and a client bundle is publicly downloadable. Detection is
+  AST-based and covers the direct call, optional-call (`session?.()`),
+  parenthesized (`(session)()`), and comma-sequence (`(0, session)()`) shapes;
+  indirect wrappers (e.g. `const f = session; f()`) are a documented detection gap
+  — the same limitation the `env()` leak-warning has for intermediate variables.
+- The cookie value is `base64url(payload) + "." + hex(hmac-sha256(payload))` — the
+  signature covers the encoded payload, so any structural change (added/removed
+  fields, re-encoding) breaks verification. Verification is constant-time
+  (`timingSafeEqual` over the full-length digest), and every failure mode — absent,
+  truncated, length-mismatched, garbage-signature, or non-object payload — fails
+  safe to `null`. The payload is `JSON.parse`d object data only; if application code
+  merges session data with `Object.assign`, treat session data as untrusted input
+  (a `__proto__` key can pollute prototypes at the merge site).
+- The emitted runtime reserves module-scope names in files that use sessions:
+  `session`, `setSession`, and `env`. A user top-level binding or import with one of
+  those names is a **hard validator error** (`RUNTIME_NAME_COLLISION`) — the
+  generated module would otherwise be a SyntaxError at deploy time. Duplicate
+  handler exports (`export function GET` twice) are likewise rejected
+  (`API_DUPLICATE_HANDLER`).
+
+**Documented v1 limitation (deliberate, honest tradeoff):** sessions are **stateless**
+— a signed cookie with no server-side store. The server cannot forcibly revoke a
+session before it expires; the only revocation mechanism is rotating `SESSION_SECRET`,
+which invalidates every session for all users at once. This is a design decision
+stated plainly, in the same spirit as the `data()` no-caching decision: the primitive
+is deliberately simple, and applications that need per-session revocation, expiry, or
+server-side blacklisting must build it themselves (or treat sessions as short-lived).
+The framework will not quietly grow a store in a later version — if this changes, it
+is a new section, not a silent amendment.
+
+**Documented non-goals:** marisjs does not provide password hashing or any
+authentication-provider/OAuth system. Password hashing is ordinary JavaScript:
+install `bcrypt` or `argon2` from npm and call it from a `@runsOn api` handler — no
+special integration is needed, it is just code in a handler. Session primitives are
+deliberately minimal; anything beyond signed-cookie sessions (server-side stores,
+revocation, expiry, OAuth, and so on) is application code.
+
+**CSRF baseline:** `SameSite=Lax` is the v1 baseline defense. It stops cross-site
+requests from carrying the cookie in the common case, but it is not a complete CSRF
+posture — by design, Lax still sends the cookie on top-level navigation GETs (a
+cross-site top-level GET that triggers state changes is the residual exposure), on
+same-site subdomain relationships, and during the short "Lax allow-unsafe" grace
+window after a cookie is set. State-changing API routes (POST/PUT/PATCH/DELETE)
+should verify the request origin explicitly (e.g. compare the `Origin` header
+against the site's own origin). The full CSRF posture is subject to the mandatory
+security review (E4); this section is revisited if that review finds gaps.
+
+**Secret storage:** server-side modules (api handlers, `@runsOn server` pages and
+components) are compiled under the private `dist/_server/` tree; the dev server and
+the node adapter never serve `_server/` or `api/` paths statically, so the baked env
+snapshot (`SESSION_SECRET`, API keys) cannot be downloaded. Client modules carry no
+secrets by construction — the validator blocks `env()`/`session()` in `@runsOn
+client` files — and remain publicly served for hydration.
+
+**Two documented limits of the static-serving guarantee:**
+
+- A `@runsOn server` page **without `data()`** is prerendered at build time into a
+  static `dist/*.html` served to everyone. If its module code reads `env()`, the
+  value is evaluated during that prerender and can end up inside the public HTML.
+  The validator emits a `SERVER_PAGE_ENV_PRERENDER` warning for such pages — never
+  read secrets from a static page; use an api route or a `data()` (dynamic) page.
+  `session()` cannot leak this way — it degrades to `null` during prerender.
+- The dev server and adapter-node send `Access-Control-Allow-Origin: *` on
+  dispatched responses. Cookies are still `HttpOnly` (never readable by script),
+  but an arbitrary website can *cause* a credentialed request to a deployed
+  marisjs api route from the visitor's browser (a CSRF-style origin); this is why
+  the CSRF baseline above requires explicit origin verification on
+  state-changing routes, and it is an additional reason never to put secrets in
+  cookies beyond the session payload.
+
+**Directive strictness (E4-11):** `@runsOn` values must match exactly —
+`client`, `server`, or `api`. A misspelled value (`@runsOn apiserver`) is treated
+as a missing directive (`MISSING_RUNSON`) and fails the build; it is never
+silently reclassified.
+
 ---
 
 ## 8. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)
@@ -596,6 +729,7 @@ directory nesting maps the same way as pages (`api/billing/charge.ts` →
 | `any`-typed or untyped props | Silent runtime type errors |
 | `data()` call inside a `@runsOn client` file | Server-only capability leaking to client bundle |
 | `env()` call inside a `@runsOn client` file | Build-time secret leaking to a publicly downloadable bundle |
+| `session()`/`setSession()` call inside a `@runsOn client` file | Credential-bearing session cookie handling leaking to a publicly downloadable bundle |
 | `data()` call inside a `@runsOn api` file | `data()` is page-render-time fetching; an api handler renders no page |
 
 ---
@@ -894,6 +1028,38 @@ undisturbed.
 Parity: `env()` — server ✓ tested, api ✓ tested, client ✗ rejected (CLIENT_ENV_ACCESS),
 exactly the `data()`-boundary shape. `data()` — server ✓, api ✗ rejected
 (API_DATA_CALL), client ✗ rejected (CLIENT_DATA_CALL).
+
+**#13 (resolved 2026-08-15) — Phase E3+E4: signed-cookie sessions**
+
+Specified in §7c. `session()`/`setSession()` on `@runsOn api`/`@runsOn server` only
+(hard `CLIENT_SESSION_ACCESS` boundary for `@runsOn client`), HMAC-SHA256-signed
+`marisjs_session` cookie (`HttpOnly`, `SameSite=Lax`, `Secure` when built with
+`NODE_ENV=production`), `timingSafeEqual` constant-time verification, every failure
+mode fails safe to `null`. Key material comes from `env('SESSION_SECRET')`; a module
+using sessions must build with a strong secret (missing/empty/whitespace-only/sub-16
+characters = loud build failure). Detection is AST-based incl. `session?.()`,
+`(session)()`, and `(0, session)()` shapes; wrapper emission covers sync and async
+handlers; emitted module-scope names (`session`/`setSession`/`env`) are collision-
+checked (`RUNTIME_NAME_COLLISION`) and duplicate handlers rejected
+(`API_DUPLICATE_HANDLER`). E2 parity: server ✓, api ✓, client ✗ rejected.
+
+**E4 — independent adversarial security review (mandatory gate, APPROVED).** An
+independent review agent attacked the feature before release; every finding was
+fixed and regression-tested, then re-verified by the same reviewer (252 tests,
+0 failures). Fixes shipped: (E4-01 CRITICAL) server modules emitted under private
+`dist/_server/`; dev server and adapter-node 404 `_server/`/`api/` paths statically;
+island imports rewritten across the boundary. (E4-02) dev server path-traversal
+(`/../.env`) → 404. (E4-04) 16+ char secret strength gate. (E4-05) optional-call and
+comma-sequence detection shapes. (E4-06) multiple `Set-Cookie` headers forwarded as
+pairs. (E4-07) 10 MiB body cap → 413. (E4-11) `@runsOn` values exact-match only.
+(E4-13) static server pages reading `env()` warn `SERVER_PAGE_ENV_PRERENDER` — the
+value can leak into prerendered public HTML (honesty, not prevention; documented).
+(E4-14) client→server imports hard-rejected (`CLIENT_IMPORTS_SERVER`). Informational
+findings (ACAO `*` CSRF-style origin caveat, `__proto__` merge note, Lax grace
+window) documented in §7c. Residual non-blocking follow-ups tracked: JSX-tag-only
+client references to server components (undefined import, no secret exposure) and
+cosmetic `MISSING_RUNSON` wording for api files. Crypto core (HMAC construction,
+constant-time compare) verified safe by review.
 
 ---
 

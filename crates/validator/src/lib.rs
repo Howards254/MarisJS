@@ -298,6 +298,7 @@ pub fn check_no_global_mutable_state(file: &ComponentFile, diagnostics: &mut Vec
                     Some(*column),
                 ));
             }
+            TopLevelBinding::Const { .. } => {}
         }
     }
 }
@@ -350,6 +351,89 @@ pub fn check_data_call_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diag
     }
 }
 
+/// §7c: the compiler emits module-scope declarations for the runtime that a
+/// file uses — `session`/`setSession` (when sessions are used) and `env`
+/// (when env() or session() is used). A user top-level binding or import with
+/// the same name turns the generated module into a SyntaxError at deploy
+/// time; fail at validation time instead (spec §1 rule 4).
+pub fn check_runtime_collisions(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    let mut emitted: Vec<&str> = Vec::new();
+    if file.has_session_call {
+        emitted.push("session");
+        emitted.push("setSession");
+    }
+    if file.has_env_call || file.has_session_call {
+        emitted.push("env");
+    }
+    if emitted.is_empty() {
+        return;
+    }
+
+    for binding in &file.top_level_bindings {
+        let (name, line, column) = match binding {
+            TopLevelBinding::Let { name, line, column, .. }
+            | TopLevelBinding::Var { name, line, column, .. }
+            | TopLevelBinding::Const { name, line, column, .. } => (name, *line, *column),
+        };
+        if emitted.contains(&name.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "RUNTIME_NAME_COLLISION",
+                format!(
+                    "Top-level binding '{}' collides with a name the compiler emits ({}). The generated module would be a SyntaxError — rename your binding.",
+                    name,
+                    emitted.join(", ")
+                ),
+                "Rename the binding.",
+                Some(line),
+                Some(column),
+            ));
+        }
+    }
+
+    for import in &file.imports {
+        for name in &import.imported_names {
+            if emitted.contains(&name.as_str()) {
+                diagnostics.push(Diagnostic::new(
+                    "RUNTIME_NAME_COLLISION",
+                    format!(
+                        "Imported name '{}' collides with a name the compiler emits ({}). The generated module would be a SyntaxError — rename the import.",
+                        name,
+                        emitted.join(", ")
+                    ),
+                    "Rename the imported name.",
+                    Some(import.line),
+                    Some(import.column),
+                ));
+            }
+        }
+    }
+}
+
+/// §7b: duplicate handler exports make the route ambiguous (the router picks
+/// one by method name) and the generated module ill-formed — fail at
+/// validation time.
+pub fn check_duplicate_handlers(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen: Vec<&str> = Vec::new();
+    for export in &file.exports {
+        if export.kind != ExportKind::NamedFunction {
+            continue;
+        }
+        if seen.contains(&export.name.as_str()) {
+            diagnostics.push(Diagnostic::new(
+                "API_DUPLICATE_HANDLER",
+                format!(
+                    "Handler '{}' is exported more than once — the route would be ambiguous and the generated module ill-formed.",
+                    export.name
+                ),
+                "Remove all but one definition.",
+                Some(export.line),
+                Some(export.column),
+            ));
+        }
+        seen.push(&export.name);
+    }
+}
+
 /// §7a: Reject `env()` calls in files marked `@runsOn client` — the same
 /// enforcement tier as CLIENT_DATA_CALL. Environment values are build-time
 /// server secrets; a client bundle is publicly downloadable, so a value
@@ -363,6 +447,25 @@ pub fn check_env_access_boundary(file: &ComponentFile, diagnostics: &mut Vec<Dia
                 "Move the env() read to a @runsOn server or @runsOn api file and pass the value via props (or read it in an API route).",
                 Some(file.env_call_line),
                 Some(file.env_call_column),
+            ));
+        }
+    }
+}
+
+/// §7c: Reject `session()`/`setSession()` calls in files marked
+/// `@runsOn client` — the same enforcement tier and mechanism as
+/// CLIENT_DATA_CALL/CLIENT_ENV_ACCESS. A session cookie is a
+/// credential-bearing server secret; a client bundle is publicly
+/// downloadable, so session handling must never reach one.
+pub fn check_session_access_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.has_session_call {
+        if let Some(RunsOn::Client) = file.runs_on {
+            diagnostics.push(Diagnostic::new(
+                "CLIENT_SESSION_ACCESS",
+                "session()/setSession() call in @runsOn client file — sessions are only allowed in @runsOn server or @runsOn api files. A session cookie is a credential-bearing server secret; a client bundle is publicly downloadable.",
+                "Move the session read/write to a @runsOn server or @runsOn api file and pass the result via props (or read/write it in an API route).",
+                Some(file.session_call_line),
+                Some(file.session_call_column),
             ));
         }
     }
@@ -823,6 +926,8 @@ pub fn validate_api(file: &ComponentFile) -> Vec<Diagnostic> {
     check_forbidden_imports(file, &mut diagnostics);
     check_css_imports(file, &mut diagnostics);
     check_unsupported_constructs(file, &mut diagnostics);
+    check_duplicate_handlers(file, &mut diagnostics);
+    check_runtime_collisions(file, &mut diagnostics);
 
     diagnostics
 }
@@ -871,27 +976,57 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_data_call_boundary(file, &mut diagnostics);
     check_env_access_boundary(file, &mut diagnostics);
     check_env_leak_to_client_prop(file, &mut diagnostics);
+    check_session_access_boundary(file, &mut diagnostics);
     check_server_boundaries(file, &mut diagnostics);
     check_statement_ordering(file, &mut diagnostics);
     check_unwrapped_signal_prop(file, &mut diagnostics);
     check_unsupported_constructs(file, &mut diagnostics);
     check_css_imports(file, &mut diagnostics);
     check_handler_jsx(file, &mut diagnostics);
+    check_runtime_collisions(file, &mut diagnostics);
     diagnostics
 }
 
-/// §7b single source of truth for `marisjs validate` and the MCP server's
-/// validate_component: dispatch to the API rule set when the file lives
+/// §7c: dispatches to the API rule set when the file lives
 /// under an `api/` directory (any ancestor directory named `api` — the
 /// faithful mirror of the CLI build's root-relative `api/` prefix match)
 /// or carries the `@runsOn api` directive; everything else gets the full
 /// component rule set. One dispatch rule, shared by every validator entry
 /// point, so a path can never validate with the wrong rule set.
 pub fn validate_for_path(file: &ComponentFile, path: &Path) -> Vec<Diagnostic> {
-    if file.runs_on == Some(RunsOn::Api) || path_is_under_api_dir(path) {
+    let mut diagnostics = if file.runs_on == Some(RunsOn::Api) || path_is_under_api_dir(path) {
         validate_api(file)
     } else {
         validate(file)
+    };
+    check_server_page_env_prerender(file, path, &mut diagnostics);
+    diagnostics
+}
+
+/// E4-13: a @runsOn server PAGE without `data()` is prerendered at build
+/// time into a static dist/*.html served to everyone. If its module code
+/// reads env(), the baked value can end up inside that public HTML (the
+/// value is evaluated during prerender). Warning (not error): env() of
+/// non-secret configuration on a static page is legitimate. Secret values
+/// must move to an api route or a data() (dynamic) page.
+fn check_server_page_env_prerender(file: &ComponentFile, path: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let is_page = path
+        .strip_prefix("pages")
+        .map_or(false, |rest| rest.as_os_str().is_empty() || rest.starts_with("/"));
+    if file.runs_on == Some(RunsOn::Server)
+        && is_page
+        && !file.has_data_call
+        && file.has_env_call
+    {
+        diagnostics.push(Diagnostic::warning(
+            "SERVER_PAGE_ENV_PRERENDER",
+            format!(
+                "this page is prerendered into static HTML at build time (no data()), but its module code reads env() — the value is evaluated during prerender and may end up in the public .html file served to everyone. Never read secrets (SESSION_SECRET, API keys) here."
+            ),
+            "Read secrets only from api routes or data(); for non-secret configuration, this warning is informational.",
+            Some(file.env_call_line.max(1)),
+            Some(file.env_call_column.max(1)),
+        ));
     }
 }
 
@@ -1515,6 +1650,156 @@ mod tests {
         check_data_call_boundary(&file, &mut diags);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "CLIENT_DATA_CALL");
+    }
+
+    // ── check_session_access_boundary ──────────────────────────────────
+
+    #[test]
+    fn session_call_on_client_is_rejected() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Client),
+            runs_on_count: 1,
+            runs_on_line: 1,
+            runs_on_column: 1,
+            has_session_call: true,
+            session_call_line: 5,
+            session_call_column: 12,
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_session_access_boundary(&file, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "CLIENT_SESSION_ACCESS");
+        assert!(!diags[0].is_warning, "CLIENT_SESSION_ACCESS must be a hard error");
+        assert_eq!((diags[0].line, diags[0].column), (Some(5), Some(12)));
+    }
+
+    #[test]
+    fn session_call_on_server_and_api_is_allowed() {
+        for runs_on in [Some(RunsOn::Server), Some(RunsOn::Api)] {
+            let mut file = ComponentFile {
+                runs_on,
+                runs_on_count: 1,
+                runs_on_line: 1,
+                runs_on_column: 1,
+                has_session_call: true,
+                session_call_line: 3,
+                session_call_column: 7,
+                ..make_file()
+            };
+            let mut diags = Vec::new();
+            check_session_access_boundary(&file, &mut diags);
+            assert!(diags.is_empty(), "sessions allowed on {:?}, got: {:?}", file.runs_on, diags);
+        }
+    }
+
+    #[test]
+    fn session_call_without_runs_on_is_allowed() {
+        let file = ComponentFile {
+            has_session_call: true,
+            session_call_line: 3,
+            session_call_column: 7,
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_session_access_boundary(&file, &mut diags);
+        assert!(diags.is_empty());
+    }
+
+    // ── check_runtime_collisions ────────────────────────────────────────
+
+    #[test]
+    fn session_binding_collision_is_rejected() {
+        let file = ComponentFile {
+            has_session_call: true,
+            session_call_line: 2,
+            session_call_column: 5,
+            top_level_bindings: vec![TopLevelBinding::Const {
+                name: "session".to_string(),
+                exported: false,
+                line: 1,
+                column: 1,
+            }],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_runtime_collisions(&file, &mut diags);
+        assert_code(&diags, "RUNTIME_NAME_COLLISION");
+        assert!(!diags[0].is_warning, "collisions are hard errors");
+    }
+
+    #[test]
+    fn no_collision_without_runtime_names() {
+        let file = ComponentFile {
+            has_env_call: true,
+            env_call_line: 2,
+            env_call_column: 5,
+            top_level_bindings: vec![TopLevelBinding::Const {
+                name: "SESSION".to_string(),
+                exported: false,
+                line: 1,
+                column: 1,
+            }],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_runtime_collisions(&file, &mut diags);
+        assert!(diags.is_empty(), "SESSION (uppercase) is not the emitted 'env'");
+    }
+
+    // ── check_duplicate_handlers ────────────────────────────────────────
+
+    #[test]
+    fn duplicate_handler_is_rejected() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Api),
+            runs_on_count: 1,
+            exports: vec![
+                ExportInfo {
+                    name: "GET".to_string(),
+                    kind: ExportKind::NamedFunction,
+                    line: 1,
+                    column: 1,
+                },
+                ExportInfo {
+                    name: "GET".to_string(),
+                    kind: ExportKind::NamedFunction,
+                    line: 5,
+                    column: 1,
+                },
+            ],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_duplicate_handlers(&file, &mut diags);
+        assert_code(&diags, "API_DUPLICATE_HANDLER");
+        assert!(!diags[0].is_warning);
+    }
+
+    #[test]
+    fn distinct_handlers_are_allowed() {
+        let file = ComponentFile {
+            runs_on: Some(RunsOn::Api),
+            runs_on_count: 1,
+            exports: vec![
+                ExportInfo {
+                    name: "GET".to_string(),
+                    kind: ExportKind::NamedFunction,
+                    line: 1,
+                    column: 1,
+                },
+                ExportInfo {
+                    name: "POST".to_string(),
+                    kind: ExportKind::NamedFunction,
+                    line: 5,
+                    column: 1,
+                },
+            ],
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_duplicate_handlers(&file, &mut diags);
+        assert!(diags.is_empty());
     }
 
     // ── check_server_boundaries ─────────────────────────────────────────

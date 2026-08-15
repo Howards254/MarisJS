@@ -330,7 +330,12 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     let mut api_routes: Vec<ApiRoute> = Vec::new();
     let mut component_meta: HashMap<PathBuf, ComponentMeta> = HashMap::new();
 
-    walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut api_routes, &mut component_meta, &env)?;
+    // E4-01: pre-classify every compilable source file as server-side or not
+    // BEFORE emitting anything, so server modules can rewrite imports of
+    // client modules (hydrate islands) correctly.
+    let (server_files, runs_on_by_rel) = preclassify_files(source_dir)?;
+
+    walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut api_routes, &mut component_meta, &env, &server_files, &runs_on_by_rel)?;
 
     // Write runtime (embedded at compile time)
     let runtime_dest = out_dir.join("runtime.mjs");
@@ -365,12 +370,63 @@ fn write_reload_timestamp(out_dir: &Path) {
     let _ = std::fs::write(out_dir.join("__build_timestamp.txt"), ts.to_string());
 }
 
+/// E4-01: walk the source tree once, parsing every compilable file to decide
+/// whether it will be emitted under `_server/` (api files and @runsOn server
+/// files). Keys are root-relative source paths (extension included), matching
+/// how walk_and_build computes rel. The second map carries every parsed
+/// file's runs_on — the E4-14 client→server import check needs the global
+/// picture (a single file cannot know what its neighbors are).
+fn preclassify_files(
+    source_dir: &Path,
+) -> Result<(HashSet<PathBuf>, HashMap<PathBuf, parser::RunsOn>), String> {
+    let mut server_files = HashSet::new();
+    let mut runs_on_by_rel: HashMap<PathBuf, parser::RunsOn> = HashMap::new();
+    let mut stack: Vec<PathBuf> = vec![source_dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).map_err(|e| format!("read_dir: {}", e))? {
+            let entry = entry.map_err(|e| format!("entry: {}", e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name == "node_modules" || name == ".git" || name == ".marisjs" {
+                        continue;
+                    }
+                }
+                stack.push(path);
+            } else if path.extension().map_or(false, |ext| ext == "tsx")
+                || (path.extension().map_or(false, |ext| ext == "ts")
+                    && path.strip_prefix(source_dir).map_or(false, |rel| {
+                        rel == Path::new("api") || rel.starts_with("api/")
+                    }))
+            {
+                let Ok(rel) = path.strip_prefix(source_dir) else { continue };
+                let is_api = rel == Path::new("api") || rel.starts_with("api/");
+                let Some(file_path) = path.to_str() else { continue };
+                if let Ok(component) = parser::parse_component_file(file_path) {
+                    let runs_on = if is_api {
+                        parser::RunsOn::Api
+                    } else {
+                        component.runs_on.clone().unwrap_or(parser::RunsOn::Client)
+                    };
+                    runs_on_by_rel.insert(rel.to_path_buf(), runs_on);
+                    if is_api || component.runs_on == Some(parser::RunsOn::Server) {
+                        server_files.insert(rel.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    Ok((server_files, runs_on_by_rel))
+}
+
 fn walk_and_build(
     base: &Path, current: &Path, out_base: &Path, count: &mut usize,
     page_routes: &mut Vec<PageRoute>,
     api_routes: &mut Vec<ApiRoute>,
     component_meta: &mut HashMap<PathBuf, ComponentMeta>,
     env: &codegen::EnvMap,
+    server_files: &HashSet<PathBuf>,
+    runs_on_by_rel: &HashMap<PathBuf, parser::RunsOn>,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(current).map_err(|e| format!("read_dir: {}", e))? {
         let entry = entry.map_err(|e| format!("entry: {}", e))?;
@@ -384,7 +440,7 @@ fn walk_and_build(
                     continue;
                 }
             }
-walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_meta, env)?;
+walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_meta, env, server_files, runs_on_by_rel)?;
         } else if path.extension().map_or(false, |ext| ext == "tsx")
             // §7b: api/ files compile from .ts OR .tsx (a route handler has no
             // JSX — it is ordinary TypeScript). Everywhere else .ts is an
@@ -396,15 +452,65 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
         {
             let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
             let is_api = rel == Path::new("api") || rel.starts_with("api/");
-            let out_path = out_base.join(rel).with_extension("mjs");
+
+            let file_path = path.to_str().ok_or("invalid path")?;
+            let component = parser::parse_component_file(file_path)
+                .map_err(|e| format!("parse error in {}: {}", rel.display(), e))?;
+            // E4-14: a @runsOn client file importing a server-side module
+            // (api handler or @runsOn server component) is a hard error — the
+            // target is emitted under _server/ with no public URL, so the
+            // client bundle would reference an undefined import at runtime.
+            // The check needs the global runs_on map; a single file cannot
+            // know what its neighbors are.
+            let client_side = !is_api && component.runs_on != Some(parser::RunsOn::Server);
+            if client_side {
+                let file_parent = rel.parent().unwrap_or(Path::new(""));
+                for imp in &component.imports {
+                    if imp.is_css
+                        || !(imp.source.starts_with("./") || imp.source.starts_with("../"))
+                    {
+                        continue;
+                    }
+                    let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+                    let resolved = normalize_path(&file_parent.join(trimmed));
+                    for ext in ["tsx", "ts"] {
+                        let target = PathBuf::from(format!("{}.{}", resolved, ext));
+                        if let Some(target_runs_on) = runs_on_by_rel.get(&target) {
+                            if *target_runs_on != parser::RunsOn::Client {
+                                return Err(format!(
+                                    "{}:{} — CLIENT_IMPORTS_SERVER: client file imports '{}' which runs on {} (server-side modules have no public URL); move the import into a @runsOn server component and pass data down via props",
+                                    rel.display(),
+                                    imp.line,
+                                    imp.source,
+                                    match target_runs_on {
+                                        parser::RunsOn::Server => "server",
+                                        parser::RunsOn::Api => "api",
+                                        parser::RunsOn::Client => "client",
+                                    }
+                                ));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // E4-01: server-side modules (api handlers, @runsOn server pages
+            // and components) are emitted under `_server/` — the dev server
+            // and adapter-node NEVER serve that prefix statically. They are
+            // only reachable through the dispatchers, so the baked env
+            // snapshot (SESSION_SECRET, API keys) can never be downloaded.
+            // Client modules stay at their public path (hydration imports).
+            let server_side = is_api || component.runs_on == Some(parser::RunsOn::Server);
+            let out_path = if server_side {
+                out_base.join("_server").join(rel).with_extension("mjs")
+            } else {
+                out_base.join(rel).with_extension("mjs")
+            };
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
             }
             eprintln!("  building {}", rel.display());
 
-            let file_path = path.to_str().ok_or("invalid path")?;
-            let component = parser::parse_component_file(file_path)
-                .map_err(|e| format!("parse error in {}: {}", rel.display(), e))?;
             // §7b: api files get their own, smaller rule set — an API route
             // handler is not a component (no props/ordering/signals/JSX
             // checks). Everything else — pages and components — gets the full
@@ -414,6 +520,27 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
             } else {
                 validator::validate(&component)
             };
+            // E4-13: a @runsOn server PAGE without data() is prerendered at
+            // build time into static HTML served to everyone; env() values
+            // evaluated during that prerender can leak into the public .html.
+            let is_page = rel.starts_with("pages") || rel.starts_with("pages/");
+            let mut diagnostics = diagnostics;
+            if !is_api
+                && is_page
+                && component.runs_on == Some(parser::RunsOn::Server)
+                && !component.has_data_call
+                && component.has_env_call
+            {
+                diagnostics.push(validator::Diagnostic::warning(
+                    "SERVER_PAGE_ENV_PRERENDER",
+                    format!(
+                        "this page is prerendered into static HTML at build time (no data()), but its module code reads env() — the value is evaluated during prerender and may end up in the public .html file served to everyone. Never read secrets (SESSION_SECRET, API keys) here."
+                    ),
+                    "Read secrets only from api routes or data(); for non-secret configuration, this warning is informational.",
+                    Some(component.env_call_line.max(1)),
+                    Some(component.env_call_column.max(1)),
+                ));
+            }
             let errors: Vec<&validator::Diagnostic> = diagnostics.iter().filter(|d| !d.is_warning).collect();
             for d in diagnostics.iter().filter(|d| d.is_warning) {
                 eprintln!("    warning[{}]: {} (fix: {})", d.code, d.message, d.fix_hint);
@@ -435,6 +562,22 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                 return Err(format!("import validation failed in {}: {} error(s)", rel.display(), import_diags.len()));
             }
 
+            // §7c: a module that calls session()/setSession() MUST build with a
+            // strong SESSION_SECRET present (in .env or the real environment).
+            // Fails loudly here — never silently with a weak/default/empty
+            // secret: empty, whitespace-only, or sub-16-byte values are
+            // rejected (16+ bytes keeps the HMAC key at ≥128 bits).
+            if component.has_session_call {
+                let secret = env.get("SESSION_SECRET").map(|v| v.as_str()).unwrap_or("");
+                let trimmed = secret.trim();
+                if trimmed.is_empty() || trimmed.len() < 16 {
+                    return Err(format!(
+                        "SESSION_SECRET is missing or too weak, but {} uses session()/setSession() — session signing cannot work without it. Add a strong SESSION_SECRET (16+ characters) to .env or the environment (e.g. `openssl rand -base64 32`).",
+                        rel.display()
+                    ));
+                }
+            }
+
             if is_api {
                 let js = codegen::generate_api(&component, env)
                     .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
@@ -449,12 +592,12 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                     .collect();
                 api_routes.push(ApiRoute {
                     path: route,
-                    file: normalize_path(&rel.with_extension("mjs")),
+                    file: format!("_server/{}", normalize_path(&rel.with_extension("mjs"))),
                     methods,
                 });
                 *count += 1;
             } else {
-                let js = codegen::generate(&component, env)
+                let js = codegen::generate_with_server_files(&component, env, rel, server_files)
                     .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;
 
                 // Store component metadata for transitive CSS collection
@@ -474,8 +617,10 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                     let route = page_file_to_route(rel);
                     let html_file = route_to_html_file(&route);
                     // REAL output path (source-preserved casing), NOT reconstructed
-                    // from the route string — this is the canonical mapping.
-                    let mjs_rel = normalize_path(&rel.with_extension("mjs"));
+                    // from the route string — this is the canonical mapping. Server
+                    // pages live under _server/ (E4-01) — the field is only read by
+                    // adapter-node's SSR dispatcher, never served statically.
+                    let mjs_rel = format!("_server/{}", normalize_path(&rel.with_extension("mjs")));
 
                     // Collect hydrate roots for THIS page specifically
                     let mut page_roots: Vec<(String, String)> = Vec::new();
@@ -538,8 +683,15 @@ fn resolve_page_css(
     for (idx, mut page) in page_routes.into_iter().enumerate() {
         // Use the page's real source path (recorded at build time) — the
         // component_meta keys are the actual on-disk rel paths, so the
-        // case must match the source tree exactly.
-        let page_rel = page.mjs_rel.trim_end_matches(".mjs").to_string() + ".tsx";
+        // case must match the source tree exactly. The manifest mjs path
+        // carries the internal `_server/` prefix; the source rel never does.
+        let page_rel = page
+            .mjs_rel
+            .strip_prefix("_server/")
+            .unwrap_or(&page.mjs_rel)
+            .trim_end_matches(".mjs")
+            .to_string()
+            + ".tsx";
         let page_path = PathBuf::from(&page_rel);
 
         let mut closure = PageCssClosure::default();
@@ -1138,6 +1290,27 @@ fn mime_for_ext(ext: &str) -> &'static str {
 }
 
 
+/// E4-02: lexically normalize a request path (resolve `.` and `..` without
+/// following symlinks) and return None if it would escape the dist root.
+fn safe_static_path(out_dir: &Path, path: &str) -> Option<PathBuf> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() {
+                    return None;
+                }
+            }
+            p => parts.push(p),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(out_dir.join(parts.join("/")))
+}
+
 fn handle_http(
     out_dir: &Path,
     routes: &HashMap<String, String>,
@@ -1165,6 +1338,15 @@ fn handle_http(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
+    // E4-07: cap request bodies — a huge Content-Length must not force
+    // unbounded memory growth (the dev server binds 0.0.0.0, so this is
+    // reachable from the network).
+    const MAX_BODY: usize = 10 * 1024 * 1024;
+    if content_length > MAX_BODY {
+        let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
     let mut have = buf.len().saturating_sub(header_len);
     while have < content_length {
         let n = stream.read(&mut tmp).unwrap_or(0);
@@ -1201,8 +1383,31 @@ fn handle_http(
             } else if path == "/" {
                 out_dir.join("index.html") // fallback
             } else {
-                out_dir.join(path.trim_start_matches('/'))
+                // E4-02: never join attacker-controlled path segments —
+                // normalize lexically (resolve . and .. without following
+                // symlinks) and 404 if any .. escapes the dist root.
+                match safe_static_path(out_dir, path) {
+                    Some(p) => p,
+                    None => {
+                        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                        let _ = stream.write_all(resp.as_bytes());
+                        return;
+                    }
+                }
             };
+
+            // E4-01: server-side modules (_server/…) and api/ files are NEVER
+            // served statically — they are only reachable through the API
+            // dispatcher, so the baked env snapshot (SESSION_SECRET, API
+            // keys) can never be downloaded.
+            if let Ok(rel) = file_path.strip_prefix(out_dir) {
+                let first = rel.components().next().and_then(|c| c.as_os_str().to_str());
+                if matches!(first, Some("_server") | Some("api")) {
+                    let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes());
+                    return;
+                }
+            }
 
             match std::fs::read(&file_path) {
                 Ok(content) => {
@@ -1299,8 +1504,11 @@ const req = new Request('http://localhost' + input.path, { method: input.method,
 try {
   const res = await handler(req);
   const buf = Buffer.from(await res.arrayBuffer());
-  const outHeaders = {};
-  res.headers.forEach((v, k) => { outHeaders[k] = v; });
+  // E4-06: headers as an ARRAY of [k, v] pairs — an object would collapse
+  // multiple Set-Cookie headers into the last one and silently drop
+  // security cookies.
+  const outHeaders = [];
+  res.headers.forEach((v, k) => { outHeaders.push([k, v]); });
   console.log(JSON.stringify({ status: res.status, headers: outHeaders, body: buf.toString('base64') }));
 } catch (e) {
   console.log(JSON.stringify({ status: 500, headers: { 'content-type': 'text/plain;charset=UTF-8' }, body: Buffer.from(String((e && e.stack) || e)).toString('base64') }));
@@ -1342,7 +1550,7 @@ try {
         "status": 500, "headers": {}, "body": ""
     }));
     let status = response.get("status").and_then(|v| v.as_u64()).unwrap_or(500);
-    let headers_obj = response.get("headers").and_then(|v| v.as_object()).cloned().unwrap_or_default();
+    let headers_arr = response.get("headers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let body_b64 = response.get("body").and_then(|v| v.as_str()).unwrap_or("");
 
     let mut head_out = format!(
@@ -1350,14 +1558,18 @@ try {
         status,
         http_status_text(status)
     );
-    for (k, v) in &headers_obj {
-        if let Some(vs) = v.as_str() {
-            // Never allow the handler to smuggle framing headers.
-            let lower = k.to_ascii_lowercase();
-            if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" {
-                continue;
+    for pair in &headers_arr {
+        if let Some(arr) = pair.as_array() {
+            if arr.len() == 2 {
+                if let (Some(k), Some(v)) = (arr[0].as_str(), arr[1].as_str()) {
+                    // Never allow the handler to smuggle framing headers.
+                    let lower = k.to_ascii_lowercase();
+                    if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" {
+                        continue;
+                    }
+                    head_out.push_str(&format!("{}: {}\r\n", k, v));
+                }
             }
-            head_out.push_str(&format!("{}: {}\r\n", k, vs));
         }
     }
     let body_bytes = base64_decode(body_b64);

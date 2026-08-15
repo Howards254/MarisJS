@@ -1,5 +1,6 @@
 use parser::{ComponentFile, JsxAttrValue, JsxNode, RunsOn, SignalKind};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Build-time snapshot of the project's environment (loaded from `.env` +
 /// real process env by the CLI). Baked into server/api modules as a
@@ -7,8 +8,24 @@ use std::collections::HashMap;
 pub type EnvMap = HashMap<String, String>;
 
 pub fn generate(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
+    generate_with_server_files(component, env, Path::new(""), &std::collections::HashSet::new())
+}
+
+/// E4-01: server-side modules are emitted under `_server/<rel>` while client
+/// modules stay at the public `<rel>` — so a server module importing a CLIENT
+/// module (a hydrate island) must rewrite the relative specifier to walk back
+/// up to the public tree. `rel` is the importing file's root-relative source
+/// path; `server_files` is the set of root-relative source paths that are
+/// server-side (emitted under `_server/`). Server→server relative imports are
+/// untouched (both modules move together, so relative resolution still works).
+pub fn generate_with_server_files(
+    component: &ComponentFile,
+    env: &EnvMap,
+    rel: &Path,
+    server_files: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<String, String> {
     if component.runs_on == Some(RunsOn::Server) {
-        generate_server(component, env)
+        generate_server(component, env, rel, server_files)
     } else {
         generate_client(component)
     }
@@ -45,8 +62,24 @@ pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, S
         output.push('\n');
     }
 
-    if component.has_env_call {
-        output.push_str(&emit_env_helper(env, &component.env_call_keys));
+    let mut referenced_keys = component.env_call_keys.clone();
+    if component.has_session_call {
+        // The session block reads env('SESSION_SECRET') and
+        // env('NODE_ENV'); make sure both are baked even when the file
+        // never calls env() directly.
+        for key in ["SESSION_SECRET", "NODE_ENV"] {
+            if !referenced_keys.iter().any(|k| k == key) {
+                referenced_keys.push(key.to_string());
+            }
+        }
+    }
+    if component.has_env_call || component.has_session_call {
+        output.push_str(&emit_env_helper(env, &referenced_keys));
+        output.push('\n');
+    }
+
+    if component.has_session_call {
+        output.push_str(&emit_session_block());
         output.push('\n');
     }
 
@@ -60,13 +93,24 @@ pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, S
         output.push('\n');
     }
 
-    for (_, source) in &component.exported_fn_sources {
+    for (name, source) in &component.exported_fn_sources {
         // The captured snippet spans the full `export function GET(...) {...}`
         // declaration (TS annotations already stripped by the parser), so it
         // is emitted verbatim. Every captured source is a named function
         // export — validated to be a sanctioned method name.
-        output.push_str(&source);
-        if !source.trim_end().ends_with('}') {
+        //
+        // When the module uses sessions, each handler is wrapped so the
+        // request it was dispatched with lands in the AsyncLocalStorage
+        // context (module-scoped mutation would race across concurrent
+        // requests — the wrapper is the request-context seam, so neither
+        // the dev server nor the adapter needs session knowledge).
+        let emitted = if component.has_session_call {
+            wrap_handler_with_session_context(name, source)
+        } else {
+            source.clone()
+        };
+        output.push_str(&emitted);
+        if !emitted.trim_end().ends_with('}') {
             output.push('\n');
         }
         output.push('\n');
@@ -103,6 +147,98 @@ fn emit_env_helper(env: &EnvMap, referenced_keys: &[String]) -> String {
         "const env = (key) => ({{ {} }})[key];\n",
         entries.join(", ")
     )
+}
+
+/// §7c canonical session runtime, emitted inline into every server/api
+/// module that calls session()/setSession() (server modules are
+/// self-contained — same rule as the env helper). HMAC signing/verification
+/// uses Node's built-in crypto only: `createHmac` + `timingSafeEqual`
+/// (constant-time comparison — a naive `===` on strings would leak timing).
+/// The incoming request lives in an AsyncLocalStorage context set by the
+/// generated handler wrapper — never a module-scoped mutable, which would
+/// race across concurrent requests in the adapter.
+///
+/// Failure modes are all fail-safe-to-null: no cookie, unparseable cookie,
+/// wrong-length or mismatched signature, malformed payload — `session()`
+/// returns null, never throws, never returns unverified data.
+fn emit_session_block() -> String {
+    r#"import { createHmac, timingSafeEqual } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+const __sessionAls = new AsyncLocalStorage();
+const __sessionCookie = 'marisjs_session';
+const __sessionSecure = (env('NODE_ENV') || '') === 'production';
+
+const __sessionSign = (payload) => createHmac('sha256', env('SESSION_SECRET')).update(payload).digest('hex');
+
+const __sessionExtract = (header) => {
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    if (part.slice(0, eq).trim() === __sessionCookie) {
+      return part.slice(eq + 1).trim();
+    }
+  }
+  return null;
+};
+
+const session = () => {
+  const secret = env('SESSION_SECRET');
+  if (!secret) return null;
+  const req = __sessionAls.getStore();
+  if (!req) return null;
+  const header = req.headers && req.headers.get('cookie');
+  if (!header) return null;
+  const raw = __sessionExtract(header);
+  if (!raw) return null;
+  const dot = raw.lastIndexOf('.');
+  if (dot <= 0 || dot === raw.length - 1) return null;
+  const payload = raw.slice(0, dot);
+  const expected = __sessionSign(payload);
+  const given = Buffer.from(raw.slice(dot + 1), 'hex');
+  const want = Buffer.from(expected, 'hex');
+  if (given.length !== want.length || !timingSafeEqual(given, want)) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return decoded && typeof decoded === 'object' && !Array.isArray(decoded) ? decoded : null;
+  } catch {
+    return null;
+  }
+};
+
+const setSession = (data, response) => {
+  const secret = env('SESSION_SECRET');
+  if (!secret || !response) return response;
+  const payload = Buffer.from(JSON.stringify(data), 'utf8').toString('base64url');
+  const cookie = __sessionCookie + '=' + payload + '.' + __sessionSign(payload) + '; Path=/; HttpOnly; SameSite=Lax' + (__sessionSecure ? '; Secure' : '');
+  response.headers.append('Set-Cookie', cookie);
+  return response;
+};
+"#
+    .to_string()
+}
+
+/// §7c: `export function GET(req) { ... }` → `function __raw_GET(req) { ... }`
+/// plus an exported wrapper that runs the real body inside the session
+/// request context (args[0] is the dispatched Request). The wrapper is the
+/// single seam that makes the no-argument `session()` work — neither the
+/// dev server nor the adapter-node router needs any session knowledge.
+/// Async handlers are handled too (`export async function GET`): the wrapped
+/// body stays async and AsyncLocalStorage preserves the request context
+/// across `await`, so `session()` keeps working.
+/// The body is emitted verbatim; only the declaration header changes.
+fn wrap_handler_with_session_context(name: &str, source: &str) -> String {
+    for (prefix, raw_decl) in [
+        (format!("export async function {name}("), "async function"),
+        (format!("export function {name}("), "function"),
+    ] {
+        if let Some(rest) = source.strip_prefix(&prefix) {
+            return format!(
+                "{raw_decl} __raw_{name}({rest}\n\nexport function {name}(...args) {{\n  return __sessionAls.run(args[0], () => __raw_{name}(...args));\n}}\n"
+            );
+        }
+    }
+    source.to_string()
 }
 
 fn generate_client(component: &ComponentFile) -> Result<String, String> {
@@ -223,7 +359,12 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
 // server codegen
 // ---------------------------------------------------------------------------
 
-fn generate_server(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
+fn generate_server(
+    component: &ComponentFile,
+    env: &EnvMap,
+    rel: &Path,
+    server_files: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<String, String> {
     let component_name = component
         .exports
         .first()
@@ -251,7 +392,11 @@ fn generate_server(component: &ComponentFile, env: &EnvMap) -> Result<String, St
 
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
-        output.push_str(&format!("import {{ {} }} from '{}';\n", name, source));
+        output.push_str(&format!(
+            "import {{ {} }} from '{}';\n",
+            name,
+            rewrite_server_import(rel, source, server_files)
+        ));
     }
     if !comp_imports.is_empty() {
         output.push('\n');
@@ -261,8 +406,28 @@ fn generate_server(component: &ComponentFile, env: &EnvMap) -> Result<String, St
         output.push_str("import { data } from '@marisjs/runtime';\n\n");
     }
 
-    if component.has_env_call {
-        output.push_str(&emit_env_helper(env, &component.env_call_keys));
+    let mut referenced_keys = component.env_call_keys.clone();
+    if component.has_session_call {
+        // The session block reads env('SESSION_SECRET') and env('NODE_ENV');
+        // make sure both are baked even when the file never calls env()
+        // directly.
+        for key in ["SESSION_SECRET", "NODE_ENV"] {
+            if !referenced_keys.iter().any(|k| k == key) {
+                referenced_keys.push(key.to_string());
+            }
+        }
+    }
+    if component.has_env_call || component.has_session_call {
+        output.push_str(&emit_env_helper(env, &referenced_keys));
+        output.push('\n');
+    }
+
+    if component.has_session_call {
+        // Server pages prerender at build time — there is no request, so
+        // session() degrades to null and setSession() is a no-op unless a
+        // Response is passed in. The block is emitted so the file compiles
+        // and the boundary rule (CLIENT_SESSION_ACCESS) stays symmetric.
+        output.push_str(&emit_session_block());
         output.push('\n');
     }
 
@@ -658,6 +823,65 @@ fn resolve_import_source(name: &str, file_imports: &[parser::ImportInfo]) -> Opt
         }
     }
     None
+}
+
+/// E4-01: server modules live under `_server/<rel>`; client modules stay at
+/// `<rel>`. A server module importing another server module keeps its
+/// relative specifier (both moved, resolution unchanged). A server module
+/// importing a CLIENT module (a hydrate island) must walk back up to the
+/// public tree, because the old relative path from `_server/…` would land
+/// inside `_server/`. Bare specifiers (@marisjs/runtime, packages) are
+/// untouched — they resolve via node_modules from anywhere.
+fn rewrite_server_import(
+    rel: &Path,
+    source: &str,
+    server_files: &std::collections::HashSet<std::path::PathBuf>,
+) -> String {
+    if !source.starts_with("./") && !source.starts_with("../") {
+        return source.to_string();
+    }
+    if rel.as_os_str().is_empty() {
+        return source.to_string();
+    }
+
+    let imported_rel = normalize_join(rel.parent().unwrap_or(Path::new("")), source);
+    let imported_source = imported_rel.with_extension("tsx");
+    if server_files.contains(&imported_source) {
+        return source.to_string();
+    }
+
+    // Client module — resolve a relative path from the server module's
+    // directory (inside _server/) up to the root, then down to the public
+    // module path. The _server/ prefix adds one extra level.
+    let depth = rel
+        .parent()
+        .map(|p| p.components().count() + 1)
+        .unwrap_or(1);
+    let up = "../".repeat(depth);
+    let target = imported_rel.to_string_lossy().trim_end_matches(".mjs").to_string();
+    format!("{}{}.mjs", up, target)
+}
+
+/// Lexically join `dir` and `specifier` (a relative `./`/`../` path), resolving
+/// `.` and `..` without touching the filesystem.
+fn normalize_join(dir: &Path, specifier: &str) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = dir
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(p) => Some(p.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    for part in specifier.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(std::ffi::OsString::from(p)),
+        }
+    }
+    parts.into_iter().collect()
 }
 
 // ---------------------------------------------------------------------------

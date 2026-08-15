@@ -140,7 +140,16 @@ const server = createServer(async (req, res) => {
             duplex: 'half',
           });
           const response = await handler(request);
-          res.writeHead(response.status, Object.fromEntries(response.headers));
+          // E4-06: collect headers as an array per name — multiple Set-Cookie
+          // headers must ALL be forwarded (an object would keep only the last
+          // one and silently drop security cookies). Node emits array values
+          // as repeated header lines.
+          const outHeaders = {};
+          response.headers.forEach((v, k) => {
+            const name = k.toLowerCase() === 'set-cookie' ? 'Set-Cookie' : k;
+            outHeaders[name] = (outHeaders[name] || []).concat(v);
+          });
+          res.writeHead(response.status, outHeaders);
           res.end(Buffer.from(await response.arrayBuffer()));
           return;
         }
@@ -187,7 +196,16 @@ const server = createServer(async (req, res) => {
       }
     }
 
-    // Serve arbitrary files from dist/ for script/CSS imports
+    // Serve arbitrary files from dist/ for script/CSS imports. E4-01: the
+    // server-side module tree (_server/) and api/ files are NEVER served
+    // statically — they carry the baked env snapshot (SESSION_SECRET, API
+    // keys) and are only reachable through the dispatchers above.
+    const firstSeg = url.pathname.split('/').filter(Boolean)[0] || '';
+    if (firstSeg === '_server' || firstSeg === 'api') {
+      res.writeHead(404);
+      res.end('Not found');
+      return;
+    }
     const filePath = join(DIST, url.pathname);
     if (existsSync(filePath) && !filePath.includes('/node_modules/') && !filePath.includes('\\node_modules\\')) {
       const ext = extname(filePath);

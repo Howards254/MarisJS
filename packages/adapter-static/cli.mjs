@@ -119,9 +119,13 @@ function collectStaticFiles(dir, base = '') {
     const full = join(dir, entry);
     const rel = base ? `${base}/${entry}` : entry;
 
-    // Skip server-side and internal directories
+    // Skip server-side and internal directories. E4-01: the entire _server/
+    // tree (api modules, @runsOn server pages and components) carries the
+    // baked env snapshot (SESSION_SECRET, API keys) and must NEVER be
+    // published — a static host cannot be told to 404 it later.
     if (rel.startsWith('pages/')) continue;
     if (rel.startsWith('api/')) continue;
+    if (rel.startsWith('_server/')) continue;
     if (rel.startsWith('node_modules/')) continue;
     if (entry === '__build_timestamp.txt') continue;
     if (rel === 'routes.json') continue;

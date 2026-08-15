@@ -1909,7 +1909,7 @@ fn page_head_meta_works_with_hydrate_islands() {
         head
     );
 
-    let mjs = std::fs::read_to_string(out_dir.join("pages/Index.mjs")).unwrap();
+    let mjs = std::fs::read_to_string(out_dir.join("_server/pages/Index.mjs")).unwrap();
     assert!(
         mjs.contains("head: head"),
         "compiled page should return the head key, got: {}",
@@ -3354,8 +3354,8 @@ fn nested_route_two_levels_resolves_files_css_and_imports() {
     // source-preserved casing, and the prerendered page is NOT the
     // "page not found" placeholder.
     assert!(
-        out.join("pages/Docs/Api/Signals.mjs").exists(),
-        "real mjs output should exist at pages/Docs/Api/Signals.mjs"
+        out.join("_server/pages/Docs/Api/Signals.mjs").exists(),
+        "real mjs output should exist at _server/pages/Docs/Api/Signals.mjs"
     );
     assert!(
         !out.join("pages/Docs/Api/signals.mjs").exists(),
@@ -3413,7 +3413,7 @@ fn nested_route_two_levels_resolves_files_css_and_imports() {
         .iter()
         .find(|r| r["path"] == "/docs/api/signals")
         .expect("manifest should contain /docs/api/signals");
-    assert_eq!(route["mjs"], "pages/Docs/Api/Signals.mjs");
+    assert_eq!(route["mjs"], "_server/pages/Docs/Api/Signals.mjs");
     assert_eq!(route["file"], "docs/api/signals.html");
     assert_eq!(route["css"][0], "pages/components/Widget.css");
     assert_eq!(route["clientModules"][0]["path"], "pages/components/Widget.mjs");
@@ -3804,7 +3804,7 @@ fn server_page_references_module_level_const() {
     // (direct server-path output — fails the instant server emission breaks),
     // (2) the prerendered HTML contains the evaluated values (fails if the
     // consts were emitted but not evaluated).
-    let mjs = std::fs::read_to_string(out.join("pages/Menu.mjs")).unwrap();
+    let mjs = std::fs::read_to_string(out.join("_server/pages/Menu.mjs")).unwrap();
     assert!(
         mjs.contains("const sections = ['Drinks', 'Desserts', 'Savory'];"),
         "server module must emit the sections const at module scope, got:\n{}",
@@ -5346,14 +5346,16 @@ fn combined_pages_and_api_build_regression() {
     let api_routes = manifest["apiRoutes"].as_array().unwrap();
     assert_eq!(api_routes.len(), 1);
     assert_eq!(api_routes[0]["path"], "/api/ping");
-    assert_eq!(api_routes[0]["file"], "api/ping.mjs");
+    assert_eq!(api_routes[0]["file"], "_server/api/ping.mjs");
     assert_eq!(api_routes[0]["methods"][0], "GET");
 
-    // The compiled api module exists in dist with the env helper machinery
-    // available (baked only when env() is called — ping does not call it).
+    // The compiled api module exists in dist under the private _server/ tree
+    // (E4-01: it carries the baked env snapshot and is never served
+    // statically) with the env helper machinery available (baked only when
+    // env() is called — ping does not call it).
     assert!(
-        out_dir.join("api/ping.mjs").exists(),
-        "compiled api module must exist in dist"
+        out_dir.join("_server/api/ping.mjs").exists(),
+        "compiled api module must exist in dist/_server"
     );
 }
 
@@ -5424,5 +5426,1066 @@ fn api_handler_is_plain_js_after_codegen() {
         !js.contains(": Response"),
         "TS annotations must be stripped, got:\n{}",
         js
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §7c Sessions — e2e, tamper, attribute, and boundary tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Like http_request but inserts raw extra header lines (e.g. a Cookie header)
+/// before the blank line that terminates the request head.
+fn http_request_extra(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    content_type: &str,
+    extra_headers: &str,
+) -> String {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let body_bytes = body.as_bytes();
+    let req = format!(
+        "{} {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
+        method, path, port, content_type, body_bytes.len(), extra_headers
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.write_all(body_bytes).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+}
+
+fn split_response(raw: &str) -> (String, String) {
+    let sep = raw.find("\r\n\r\n").unwrap_or(raw.len());
+    (raw[..sep].to_string(), raw[sep + 4..].to_string())
+}
+
+fn header_value(headers: &str, name: &str) -> Option<String> {
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_session_cookie(set_cookie: &str) -> Option<String> {
+    let start = set_cookie.find("marisjs_session=")?;
+    let rest = &set_cookie[start..];
+    let end = rest.find(';').unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+fn cookie_value(cookie: &str) -> &str {
+    cookie.strip_prefix("marisjs_session=").unwrap_or(cookie)
+}
+
+fn tamper_byte(cookie: &str) -> String {
+    let value = cookie_value(cookie);
+    let dot = value.find('.').unwrap();
+    let (payload, sig) = value.split_at(dot);
+    let mut chars: Vec<char> = payload.chars().collect();
+    let idx = chars.iter().position(|c| c.is_ascii_alphanumeric()).unwrap();
+    chars[idx] = if chars[idx] == 'a' { 'b' } else { 'a' };
+    let flipped: String = chars.into_iter().collect();
+    format!("marisjs_session={}{}", flipped, sig)
+}
+
+/// Structural tamper: decode the payload, inject an extra field, re-encode,
+/// keep the ORIGINAL signature. The signature covers the encoded payload, so
+/// any change must fail verification.
+fn tamper_payload_keep_sig(cookie: &str) -> String {
+    let value = cookie_value(cookie);
+    let dot = value.find('.').unwrap();
+    let (payload, sig) = value.split_at(dot);
+    let script = format!(
+        "const d = JSON.parse(Buffer.from('{}', 'base64url').toString()); d.admin = true; process.stdout.write(Buffer.from(JSON.stringify(d)).toString('base64url'));",
+        payload
+    );
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .unwrap();
+    let reencoded = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!reencoded.is_empty(), "node must decode + re-encode the payload");
+    format!("marisjs_session={}{}", reencoded, sig)
+}
+
+fn spawn_dev_server_with_env(
+    dir: &tempfile::TempDir,
+    envs: &[(&str, &str)],
+) -> (std::process::Child, u16) {
+    use std::process::{Command as ProcCommand, Stdio};
+    let port = free_port();
+    let out = dir.path().join("dist");
+    let mut cmd = ProcCommand::new(cli_binary());
+    cmd.arg("dev")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("SESSION_SECRET")
+        .env_remove("NODE_ENV");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let child = cmd.spawn().expect("spawn marisjs dev");
+    wait_for_port(port);
+    (child, port)
+}
+
+fn session_api_fixture(dir: &tempfile::TempDir) {
+    std::fs::write(
+        dir.path().join(".env"),
+        "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function POST(req: Request) {\n",
+            "  const s = session();\n",
+            "  return setSession({ visits: (s ? s.visits : 0) + 1 }, new Response('set', { status: 200 }));\n",
+            "}\n",
+            "export function GET(req: Request) {\n",
+            "  const s = session();\n",
+            "  return new Response(JSON.stringify({ has: !!s, visits: s ? s.visits : null }), {\n",
+            "    status: 200,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+}
+
+/// §7c e2e: full session round trip over the dev server — set, read, increment,
+/// and every tamper shape fails safe to null.
+#[test]
+fn dev_server_session_round_trip_tamper_and_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    session_api_fixture(&dir);
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+
+    let post = http_request_extra(port, "POST", "/api/session", "", "text/plain", "");
+    let (headers, _) = split_response(&post);
+    let set_cookie = header_value(&headers, "set-cookie").expect("POST must Set-Cookie");
+    assert!(set_cookie.contains("marisjs_session="), "cookie name: {}", set_cookie);
+    assert!(set_cookie.contains("HttpOnly"), "HttpOnly must be set: {}", set_cookie);
+    assert!(set_cookie.contains("SameSite=Lax"), "SameSite=Lax must be set: {}", set_cookie);
+    assert!(!set_cookie.contains("Secure"), "no Secure outside production: {}", set_cookie);
+    let cookie = extract_session_cookie(&set_cookie).expect("cookie value");
+
+    let (_, body) = split_response(&http_request_extra(port, "GET", "/api/session", "", "text/plain", ""));
+    assert!(body.contains("\"has\":false"), "no cookie → no session, got: {}", body);
+
+    let with_cookie = http_request_extra(
+        port,
+        "GET",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", cookie),
+    );
+    let (_, body) = split_response(&with_cookie);
+    assert!(
+        body.contains("\"has\":true") && body.contains("\"visits\":1"),
+        "round trip must decode the cookie, got: {}",
+        body
+    );
+
+    let flipped = tamper_byte(&cookie);
+    let tampered = http_request_extra(
+        port,
+        "GET",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", flipped),
+    );
+    let (_, body) = split_response(&tampered);
+    assert!(body.contains("\"has\":false"), "byte-flip tamper must fail safe, got: {}", body);
+
+    let structural = tamper_payload_keep_sig(&cookie);
+    let struct_t = http_request_extra(
+        port,
+        "GET",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", structural),
+    );
+    let (_, body) = split_response(&struct_t);
+    assert!(
+        body.contains("\"has\":false"),
+        "structural tamper (extra field, original sig) must fail safe, got: {}",
+        body
+    );
+
+    let post2 = http_request_extra(
+        port,
+        "POST",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", cookie),
+    );
+    let (headers2, _) = split_response(&post2);
+    let set_cookie2 = header_value(&headers2, "set-cookie").expect("POST #2 must Set-Cookie");
+    let cookie2 = extract_session_cookie(&set_cookie2).expect("cookie #2");
+    let get2 = http_request_extra(
+        port,
+        "GET",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", cookie2),
+    );
+    let (_, body) = split_response(&get2);
+    assert!(body.contains("\"visits\":2"), "setSession must persist increments, got: {}", body);
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// §7c: the Secure attribute is baked when NODE_ENV=production at build time.
+#[test]
+fn session_cookie_is_secure_in_production_build() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    session_api_fixture(&dir);
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[("NODE_ENV", "production")]);
+    let post = http_request_extra(port, "POST", "/api/session", "", "text/plain", "");
+    let (headers, _) = split_response(&post);
+    let set_cookie = header_value(&headers, "set-cookie").expect("POST must Set-Cookie");
+    assert!(set_cookie.contains("Secure"), "Secure must be set in production: {}", set_cookie);
+    assert!(set_cookie.contains("SameSite=Lax"), "SameSite=Lax must be set: {}", set_cookie);
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// §7c: building a module that uses session() without SESSION_SECRET set must
+/// fail loudly at build time — never silently sign with nothing.
+#[test]
+fn missing_session_secret_fails_build_loudly() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return setSession({ ok: true }, new Response('set'));\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .env_remove("SESSION_SECRET")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "build must fail without SESSION_SECRET");
+    assert!(stderr.contains("SESSION_SECRET"), "error must name SESSION_SECRET, got: {}", stderr);
+    assert!(stderr.contains("api/session.ts"), "error must name the file, got: {}", stderr);
+}
+
+/// §7c: session()/setSession() in a @runsOn client file is a hard build error
+/// (CLIENT_SESSION_ACCESS) — same mechanism as env()/data().
+#[test]
+fn session_call_in_client_component_is_rejected() {
+    use std::process::Command;
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) {\n",
+            "  const s = session();\n",
+            "  return <div>{s ? 'logged-in' : 'anon'}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "client session() must fail the build");
+    assert!(stderr.contains("CLIENT_SESSION_ACCESS"), "expected CLIENT_SESSION_ACCESS, got: {}", stderr);
+}
+
+/// §7c: the emitted API module carries the session runtime (HMAC + AsyncLocal-
+/// Storage wrapper) and bakes SESSION_SECRET into the env snapshot.
+#[test]
+fn api_module_emits_session_block_and_wraps_handlers() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture_path = dir.path().join("session.ts");
+    std::fs::write(
+        &fixture_path,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  const s = session();\n",
+            "  return new Response(JSON.stringify({ has: !!s }));\n",
+            "}\n",
+            "export function POST(req: Request) {\n",
+            "  return setSession({ ok: true }, new Response('set'));\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let component = parser::parse_component_file(fixture_path.to_str().unwrap()).unwrap();
+    assert!(component.has_session_call, "parser must detect session() calls");
+    assert!(component.session_call_line > 0, "line must be recorded");
+    assert!(component.session_call_column > 0, "column must be recorded");
+    let diags = validator::validate_api(&component);
+    assert!(
+        diags.is_empty(),
+        "api files may use sessions, got: {:?}",
+        diags.iter().map(|d| d.code).collect::<Vec<_>>()
+    );
+
+    let env: codegen::EnvMap = [
+        ("SESSION_SECRET".to_string(), "s3cret".to_string()),
+        ("NODE_ENV".to_string(), "production".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let js = codegen::generate_api(&component, &env).unwrap();
+
+    assert!(js.contains("__sessionAls"), "AsyncLocalStorage wrapper expected, got:\n{}", js);
+    assert!(js.contains("timingSafeEqual"), "constant-time compare expected, got:\n{}", js);
+    assert!(js.contains("function __raw_GET"), "original handler must be preserved, got:\n{}", js);
+    assert!(js.contains("export function GET(...args)"), "handler must be wrapped, got:\n{}", js);
+    assert!(js.contains("export function POST(...args)"), "setSession handler must be wrapped, got:\n{}", js);
+    assert!(
+        js.contains("\"SESSION_SECRET\": \"s3cret\""),
+        "SESSION_SECRET must be baked into the env snapshot, got:\n{}",
+        js
+    );
+    assert!(js.contains("SameSite=Lax"), "Lax must be baked, got:\n{}", js);
+    assert!(js.contains("Secure"), "Secure must be baked for NODE_ENV=production, got:\n{}", js);
+}
+
+/// §7c: a @runsOn server page calling session() compiles — at prerender there
+/// is no request context, so session() degrades to null without throwing.
+#[test]
+fn server_page_session_call_compiles_and_degrades_to_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let env: codegen::EnvMap = [("SESSION_SECRET".to_string(), "s3cret".to_string())]
+        .into_iter()
+        .collect();
+    let js = parse_validate_generate_with_env(
+        &dir,
+        "SessionPage",
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function SessionPage(props: Props) {\n",
+            "  const s = session();\n",
+            "  return <p>{s ? s.user : 'anon'}</p>;\n",
+            "}\n",
+        ),
+        &env,
+    );
+    assert!(js.contains("__sessionAls"), "session block expected, got:\n{}", js);
+
+    run_node(
+        &dir,
+        concat!(
+            "import { SessionPage } from './SessionPage.mjs';\n",
+            "const html = SessionPage({});\n",
+            "if (!html.includes('anon')) { console.error('expected anon fallback, got: ' + html); process.exit(1); }\n",
+            "if (html.includes('logged-in')) { console.error('session must be null at prerender: ' + html); process.exit(1); }\n",
+            "console.log('PASS');\n",
+        ),
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E4 security review fixes — regression tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// E4-01: server-side modules carry the baked env snapshot (SESSION_SECRET)
+/// and must NEVER be served statically — dev server and adapter-node both 404.
+#[test]
+fn server_modules_are_never_served_statically() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  const s = session();\n",
+            "  return new Response('ok');\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) { return <div>home</div>; }\n",
+        ),
+    )
+    .unwrap();
+
+    // dev server: the static fallback must 404 for /api/*.mjs and /_server/….
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+    let resp = http_get(port, "/api/session.mjs");
+    assert!(resp.starts_with("HTTP/1.1 404"), "dev must 404 api modules, got: {}", resp);
+    let resp = http_get(port, "/_server/api/session.mjs");
+    assert!(resp.starts_with("HTTP/1.1 404"), "dev must 404 _server modules, got: {}", resp);
+    let resp = http_get(port, "/_server/pages/Index.mjs");
+    assert!(resp.starts_with("HTTP/1.1 404"), "dev must 404 _server pages, got: {}", resp);
+    // …but the route still works through the dispatcher, and public assets do too.
+    let resp = http_get(port, "/api/session");
+    assert!(resp.starts_with("HTTP/1.1 200"), "api dispatch must still work, got: {}", resp);
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    // adapter-node: same rule on the arbitrary-file fallback.
+    let out = dir.path().join("dist");
+    let status = ProcCommand::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "build failed: {}", String::from_utf8_lossy(&status.stderr));
+
+    let port2 = free_port();
+    let adapter = workspace_root().join("packages/adapter-node/server.mjs");
+    let mut child = ProcCommand::new("node")
+        .arg(&adapter)
+        .arg(&out)
+        .env("PORT", port2.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn adapter-node");
+    wait_for_port(port2);
+    let resp = http_get(port2, "/api/session.mjs");
+    assert!(resp.starts_with("HTTP/1.1 404"), "adapter must 404 api modules, got: {}", resp);
+    let resp = http_get(port2, "/_server/pages/Index.mjs");
+    assert!(resp.starts_with("HTTP/1.1 404"), "adapter must 404 _server pages, got: {}", resp);
+    let resp = http_get(port2, "/api/session");
+    assert!(resp.starts_with("HTTP/1.1 200"), "adapter api dispatch must work, got: {}", resp);
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// E4-02: the dev server must reject path traversal — /../.env, /..%2f, and
+/// deep escapes all 404; the project .env never leaks.
+#[test]
+fn dev_server_rejects_path_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(dir.path().join(".env"), "TOP_SECRET=abc123\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        "// @runsOn server\ntype Props = {};\nexport function Index(props: Props) { return <div>home</div>; }\n",
+    )
+    .unwrap();
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+    for evil in ["/../.env", "/../../../../etc/passwd", "/a/../../.env"] {
+        let resp = http_get(port, evil);
+        assert!(
+            resp.starts_with("HTTP/1.1 404"),
+            "traversal '{}' must 404, got: {}",
+            evil,
+            resp
+        );
+    }
+    // The real file is still served (the dist copy of .env is NOT made; the
+    // project .env sits outside dist, so the root page still works).
+    let resp = http_get(port, "/");
+    assert!(resp.starts_with("HTTP/1.1 200"), "root must still work, got: {}", resp);
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// E4-03: `export async function GET` handlers must get the session context
+/// wrapper too — sessions round-trip through an async handler.
+#[test]
+fn async_session_handlers_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export async function POST(req: Request) {\n",
+            "  const s = session();\n",
+            "  return setSession({ visits: (s ? s.visits : 0) + 1 }, new Response('set'));\n",
+            "}\n",
+            "export async function GET(req: Request) {\n",
+            "  await Promise.resolve();\n",
+            "  const s = session();\n",
+            "  return new Response(JSON.stringify({ has: !!s, visits: s ? s.visits : null }), {\n",
+            "    status: 200,\n",
+            "    headers: { 'content-type': 'application/json' },\n",
+            "  });\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+    let post = http_request_extra(port, "POST", "/api/session", "", "text/plain", "");
+    let (headers, _) = split_response(&post);
+    let set_cookie = header_value(&headers, "set-cookie").expect("POST must Set-Cookie");
+    let cookie = extract_session_cookie(&set_cookie).unwrap();
+    let get = http_request_extra(
+        port,
+        "GET",
+        "/api/session",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", cookie),
+    );
+    let (_, body) = split_response(&get);
+    assert!(
+        body.contains("\"has\":true") && body.contains("\"visits\":1"),
+        "async handler must decode the session (context survives await), got: {}",
+        body
+    );
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// E4-04: whitespace-only and too-short SESSION_SECRET values fail the build
+/// loudly — never sign with a guessable key.
+#[test]
+fn weak_session_secrets_fail_build() {
+    use std::process::Command;
+    for (secret, label) in [
+        ("  \n", "whitespace-only"),
+        ("x\n", "one char"),
+        ("short\n", "short"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        setup_test_dir(&dir);
+        std::fs::write(dir.path().join(".env"), format!("SESSION_SECRET={}", secret)).unwrap();
+        write_api_fixture(
+            &dir,
+            concat!(
+                "// @runsOn api\n",
+                "export function GET(req: Request) {\n",
+                "  return setSession({ ok: true }, new Response('set'));\n",
+                "}\n",
+            ),
+            "session.ts",
+        );
+        let output = Command::new(cli_binary())
+            .arg("build")
+            .arg(dir.path())
+            .arg("--out")
+            .arg(dir.path().join("dist"))
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{} SESSION_SECRET must fail the build",
+            label
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("SESSION_SECRET"), "{}: {}", label, stderr);
+    }
+}
+
+/// E4-05: optional-call and comma-sequence forms of session() are detected —
+/// client files get CLIENT_SESSION_ACCESS and api files require SESSION_SECRET.
+#[test]
+fn session_call_shape_bypasses_are_detected() {
+    use std::process::Command;
+
+    // client file using session?.() → hard boundary error
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) {\n",
+            "  const s = session?.();\n",
+            "  return <div>{s ? 'in' : 'out'}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("CLIENT_SESSION_ACCESS"),
+        "session?.() in a client file must fail with CLIENT_SESSION_ACCESS, got: {}",
+        stderr
+    );
+
+    // api file using (0, session)() with no SESSION_SECRET → loud failure
+    let dir2 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir2);
+    write_api_fixture(
+        &dir2,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  const s = (0, session)();\n",
+            "  return new Response(JSON.stringify({ has: !!s }));\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir2.path())
+        .arg("--out")
+        .arg(dir2.path().join("dist"))
+        .env_remove("SESSION_SECRET")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("SESSION_SECRET"),
+        "(0, session)() without a secret must fail loudly, got: {}",
+        stderr
+    );
+}
+
+/// E4-06: multiple Set-Cookie headers are ALL forwarded by the dev server —
+/// never silently collapsed to the last one.
+#[test]
+fn dev_server_forwards_multiple_set_cookie_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  const res = new Response('ok');\n",
+            "  res.headers.append('Set-Cookie', 'a=1; Path=/');\n",
+            "  res.headers.append('Set-Cookie', 'b=2; Path=/');\n",
+            "  return res;\n",
+            "}\n",
+        ),
+        "cookies.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+    let resp = http_get(port, "/api/cookies");
+    let (headers, _) = split_response(&resp);
+    let count = headers
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .count();
+    assert_eq!(count, 2, "both Set-Cookie headers must be forwarded, got:\n{}", headers);
+    assert!(headers.contains("a=1"), "cookie a=1 missing:\n{}", headers);
+    assert!(headers.contains("b=2"), "cookie b=2 missing:\n{}", headers);
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// E4-07: oversized request bodies are rejected with 413, not buffered.
+#[test]
+fn dev_server_rejects_oversized_bodies() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function POST(req: Request) {\n",
+            "  return new Response('ok');\n",
+            "}\n",
+        ),
+        "big.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let req = format!(
+        "POST /api/big HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 9999999999\r\nConnection: close\r\n\r\n",
+        port
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 413"),
+        "oversized body must be rejected with 413, got: {}",
+        response
+    );
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// E4-08: duplicate handlers and session-name collisions fail at validation
+/// time, not as a runtime SyntaxError in the emitted module.
+#[test]
+fn duplicate_handlers_and_runtime_name_collisions_are_rejected() {
+    use std::process::Command;
+
+    // duplicate GET
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) { return new Response('one'); }\n",
+            "export function GET(req: Request) { return new Response('two'); }\n",
+        ),
+        "dup.ts",
+    );
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("API_DUPLICATE_HANDLER"),
+        "duplicate GET must fail at validation, got: {}",
+        stderr
+    );
+
+    // user's own `const session` in a session-using api file
+    let dir2 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir2);
+    std::fs::write(dir2.path().join(".env"), "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n").unwrap();
+    write_api_fixture(
+        &dir2,
+        concat!(
+            "// @runsOn api\n",
+            "const session = () => 'mine';\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response(String(session()));\n",
+            "}\n",
+        ),
+        "session.ts",
+    );
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir2.path())
+        .arg("--out")
+        .arg(dir2.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("RUNTIME_NAME_COLLISION"),
+        "user session binding must be rejected, got: {}",
+        stderr
+    );
+}
+
+/// E4-13: a static (no data()) @runsOn server page that reads env() must
+/// build WITH a SERVER_PAGE_ENV_PRERENDER warning — the value is evaluated
+/// during prerender and can leak into the public .html.
+#[test]
+fn prerender_env_leak_is_warned() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(dir.path().join(".env"), "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) {\n",
+            "  const s = env('SESSION_SECRET');\n",
+            "  return <div>{s}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the warning must not fail the build: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SERVER_PAGE_ENV_PRERENDER"),
+        "static server page reading env() must warn, got: {}",
+        stderr
+    );
+
+    // A data() (dynamic) server page reading env() is fine — it renders per
+    // request and never bakes values into static HTML.
+    let dir2 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir2);
+    std::fs::write(dir2.path().join(".env"), "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n").unwrap();
+    std::fs::create_dir_all(dir2.path().join("pages")).unwrap();
+    std::fs::write(
+        dir2.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) {\n",
+            "  const d = await data(async () => ({ ok: true }));\n",
+            "  const s = env('SESSION_SECRET');\n",
+            "  return <div>{d.ok}{s}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir2.path())
+        .arg("--out")
+        .arg(dir2.path().join("dist"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "data() page must still build: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("SERVER_PAGE_ENV_PRERENDER"),
+        "dynamic page must NOT warn, got: {}",
+        stderr
+    );
+}
+
+/// E4-14: a @runsOn client file importing a @runsOn server component is a
+/// hard build error — the server module lives under _server/ with no public
+/// URL, so the client bundle would reference an undefined import.
+#[test]
+fn client_importing_server_component_is_rejected() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type Props = {};\n",
+            "import { ServerWidget } from './ServerWidget';\n",
+            "export function Index(props: Props) {\n",
+            "  return <div><ServerWidget /></div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pages/ServerWidget.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function ServerWidget(props: Props) { return <span>srv</span>; }\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("CLIENT_IMPORTS_SERVER"),
+        "client→server import must fail the build, got: {}",
+        stderr
+    );
+}
+
+/// E4-11: @runsOn values must match exactly — a misspelled value
+/// ("@runsOn apiserver") must NOT silently compile as api; it is a missing
+/// directive and the validator rejects the file.
+#[test]
+fn misspelled_runs_on_value_is_rejected() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn apiserver\n",
+            "type Props = {};\n",
+            "export function Index(props: Props) { return <div>x</div>; }\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(cli_binary())
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(dir.path().join("dist"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("MISSING_RUNSON"),
+        "misspelled @runsOn must fail loudly as a missing directive, got: {}",
+        stderr
+    );
+}
+
+/// E4-01 (adapter-static): a static deploy must never publish the _server/
+/// tree — server components and static server pages carry the baked env
+/// snapshot (SESSION_SECRET, API keys). A static host cannot 404 a path, so
+/// the adapter must exclude _server/ at copy time. The prerendered page HTML
+/// itself may still contain evaluated values (separate SERVER_PAGE_ENV_PRERENDER
+/// concern), but the MODULES with the baked secrets must not ship.
+#[test]
+fn adapter_static_never_publishes_server_modules() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("pages")).unwrap();
+    std::fs::create_dir_all(dir.path().join("components")).unwrap();
+    std::fs::write(
+        dir.path().join("pages/Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "import { Panel } from '../components/Panel';\n",
+            "export function Index(props: Props) {\n",
+            "  return <div><Panel /></div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("components/Panel.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Props = {};\n",
+            "export function Panel(props: Props) {\n",
+            "  const key = env('SESSION_SECRET');\n",
+            "  return <aside>{key}</aside>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    // Sanity: the baked secret module really is under _server/ in dist.
+    assert!(
+        out.join("_server/components/Panel.mjs").exists(),
+        "server component must be emitted under dist/_server"
+    );
+
+    let public = dir.path().join("public");
+    let status = Command::new("node")
+        .arg(workspace_root().join("packages/adapter-static/cli.mjs"))
+        .arg(&out)
+        .arg(&public)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "adapter-static failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    assert!(
+        !public.join("_server").exists(),
+        "adapter-static must NOT publish the _server/ tree (baked secrets)"
+    );
+    let mut server_modules: Vec<String> = Vec::new();
+    fn walk_for_mjs(dir: &std::path::Path, base: &std::path::Path, acc: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                walk_for_mjs(&p, base, acc);
+            } else if p.extension().map_or(false, |e| e == "mjs") {
+                acc.push(p.strip_prefix(base).unwrap().display().to_string());
+            }
+        }
+    }
+    walk_for_mjs(&public, &public, &mut server_modules);
+    // runtime.mjs is the public client runtime and is expected; anything
+    // under _server/ (or any other baked-secret module) must be absent.
+    server_modules.retain(|m| m.starts_with("_server/"));
+    assert!(
+        server_modules.is_empty(),
+        "static output must contain no server modules, got: {:?}",
+        server_modules
     );
 }
