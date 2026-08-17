@@ -1678,12 +1678,14 @@ fn eval_middleware(
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
     ));
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let created = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&envelope_path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let created = opts.open(&envelope_path);
         if created.is_err() {
             // Path collision (nanos makes it practically impossible) — fail
             // closed rather than risk reading a stale/foreign file.
