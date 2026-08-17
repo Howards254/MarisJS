@@ -31,6 +31,28 @@ const mimeTypes = {
 const routeMap = new Map(manifest.routes.map(r => [r.path, r]));
 const apiRouteMap = new Map((manifest.apiRoutes || []).map(r => [r.path, r]));
 
+// §7d: load the compiled middleware module once at startup (production keeps
+// modules warm; dev re-evaluates per request). The module carries the
+// canonical __matchPath, so matching is delegated — no second implementation
+// here. If it fails to import, the server fails to START (fail closed), never
+// serves ungated traffic.
+let middlewareModule = null;
+if (manifest.middleware) {
+  const mwFile = join(DIST, manifest.middleware.file);
+  if (!existsSync(mwFile)) {
+    console.error(`Middleware declared in routes.json but ${manifest.middleware.file} is missing.`);
+    process.exit(1);
+  }
+  middlewareModule = await import(mwFile);
+  // F9: verify the contract at STARTUP, not on first request — a malformed
+  // module missing the matcher or handler would otherwise only 500 at
+  // request time. Fail closed by refusing to serve ungated traffic.
+  if (typeof middlewareModule.__matchPath !== 'function' || typeof middlewareModule.middleware !== 'function') {
+    console.error(`${manifest.middleware.file} does not export the middleware contract (middleware + __matchPath).`);
+    process.exit(1);
+  }
+}
+
 function capitalizeFirst(s) {
   if (!s) return s;
   return s.charAt(0).toUpperCase() + s.slice(1);
@@ -106,6 +128,60 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const route = routeMap.get(url.pathname);
+    const method = req.method.toUpperCase();
+
+    // Build the Web Request once per request, reused by middleware and the
+    // route handler. Middleware must not read the body (SPEC §7d) — passing
+    // the same object to the handler afterwards is safe as long as that rule
+    // holds; a middleware that reads the body would leave the handler a
+    // consumed stream (the author's responsibility, identical to dev).
+    let request = null;
+    const buildRequest = () => {
+      if (request) return request;
+      const forwardedHeaders = { ...req.headers };
+      delete forwardedHeaders['content-length'];
+      delete forwardedHeaders['transfer-encoding'];
+      delete forwardedHeaders.connection;
+      request = new Request(url, {
+        method,
+        headers: forwardedHeaders,
+        body: ['GET', 'HEAD'].includes(method) ? undefined : req,
+        // undici requires duplex for stream/async-iterable bodies.
+        duplex: 'half',
+      });
+      return request;
+    };
+
+    // §7d: middleware gates every matching request BEFORE any dispatch — api
+    // routes, pages, and static files alike. Outcomes:
+    //   next()/nomatch → continue to normal dispatch
+    //   redirect()     → 3xx with Location
+    //   respond()      → the Response, verbatim
+    //   anything else  → fail closed (500), never a silent pass-through.
+    if (middlewareModule && middlewareModule.__matchPath(url.pathname)) {
+      const result = await middlewareModule.middleware(buildRequest());
+      if (result && result.__m === 'next') {
+        // continue to normal dispatch below
+      } else if (result && result.__m === 'redirect') {
+        res.writeHead(Number(result.status) || 302, { Location: String(result.url) });
+        res.end();
+        return;
+      } else if (result && result.__m === 'respond' && result.response instanceof Response) {
+        const response = result.response;
+        const outHeaders = {};
+        response.headers.forEach((v, k) => {
+          const name = k.toLowerCase() === 'set-cookie' ? 'Set-Cookie' : k;
+          outHeaders[name] = (outHeaders[name] || []).concat(v);
+        });
+        res.writeHead(response.status, outHeaders);
+        res.end(Buffer.from(await response.arrayBuffer()));
+        return;
+      } else {
+        res.writeHead(500);
+        res.end('Internal error');
+        return;
+      }
+    }
 
     // §7b: API routes dispatch FIRST — an /api/* path is never a static
     // file. The handler is a plain ESM function receiving the standard Web
@@ -113,7 +189,6 @@ const server = createServer(async (req, res) => {
     // the same contract as marisjs dev.
     const apiRoute = apiRouteMap.get(url.pathname);
     if (apiRoute) {
-      const method = req.method.toUpperCase();
       if (!apiRoute.methods.includes(method)) {
         res.writeHead(405, { Allow: apiRoute.methods.join(', ') });
         res.end();
@@ -124,22 +199,7 @@ const server = createServer(async (req, res) => {
         const module = await import(apiFile);
         const handler = module[method];
         if (typeof handler === 'function') {
-          // Pass the request body as a stream (async-iterable). Content-
-          // length is derived by undici — forwarding the raw header with a
-          // stream body makes the Request constructor throw, so drop framing
-          // and hop-by-hop headers.
-          const forwardedHeaders = { ...req.headers };
-          delete forwardedHeaders['content-length'];
-          delete forwardedHeaders['transfer-encoding'];
-          delete forwardedHeaders.connection;
-          const request = new Request(url, {
-            method,
-            headers: forwardedHeaders,
-            body: ['GET', 'HEAD'].includes(method) ? undefined : req,
-            // undici requires duplex for stream/async-iterable bodies.
-            duplex: 'half',
-          });
-          const response = await handler(request);
+          const response = await handler(buildRequest());
           // E4-06: collect headers as an array per name — multiple Set-Cookie
           // headers must ALL be forwarded (an object would keep only the last
           // one and silently drop security cookies). Node emits array values
@@ -200,7 +260,10 @@ const server = createServer(async (req, res) => {
     // server-side module tree (_server/) and api/ files are NEVER served
     // statically — they carry the baked env snapshot (SESSION_SECRET, API
     // keys) and are only reachable through the dispatchers above.
-    const firstSeg = url.pathname.split('/').filter(Boolean)[0] || '';
+    // F1: compare case-insensitively — macOS APFS and Windows NTFS are
+    // case-insensitive by default, so /_SERVER/middleware.mjs would resolve
+    // to dist/_server/middleware.mjs on those hosts.
+    const firstSeg = (url.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
     if (firstSeg === '_server' || firstSeg === 'api') {
       res.writeHead(404);
       res.end('Not found');
@@ -231,4 +294,5 @@ server.listen(PORT, () => {
   console.log(`Serving from: ${DIST}`);
   console.log(`Routes: ${manifest.routes.length}`);
   console.log(`API routes: ${(manifest.apiRoutes || []).length}`);
+  console.log(`Middleware: ${middlewareModule ? 'enabled' : 'none'}`);
 });

@@ -219,6 +219,40 @@ pub struct ComponentFile {
     /// handler_decls.
     pub exported_fn_sources: Vec<(String, String)>,
     pub unsupported_errors: Vec<ParserError>,
+    /// §7d: this file is the project-root middleware.ts (parsed via
+    /// parse_middleware_file). Distinct classification from api/ files in E2:
+    /// middleware gets its own validator rule set and codegen path.
+    pub is_middleware: bool,
+    /// The file exports a function named `middleware`.
+    pub has_middleware_fn: bool,
+    pub middleware_fn_line: usize,
+    pub middleware_fn_column: usize,
+    /// The statically-extracted `matcher` array (every element a string
+    /// literal). `Some` even when empty `[]` (matches nothing — documented);
+    /// `None` when the export is missing or not a fully-static string array.
+    pub matcher: Option<Vec<String>>,
+    pub matcher_present: bool,
+    pub matcher_line: usize,
+    pub matcher_column: usize,
+    /// Why a present `matcher` export is not a valid static string array
+    /// (`Some` only when matcher_present && matcher is None). The validator
+    /// maps this to MATCHER_NOT_ARRAY / MATCHER_NOT_STRING.
+    pub matcher_invalid_reason: Option<String>,
+    /// Every return statement directly inside the middleware function body,
+    /// classified into the three sanctioned result shapes or Bad. This is the
+    /// validator's source of truth for §7d "return paths are limited to the
+    /// three sanctioned shapes" — the enforcement is AST-based, not a text
+    /// heuristic.
+    pub middleware_returns: Vec<MiddlewareReturn>,
+    /// Every call to next()/redirect()/respond() inside the middleware
+    /// function body, with the call's starting span offset. The validator
+    /// cross-references the sanctioned returns' arg spans: a helper call that
+    /// is not the direct return value is a hard error (a discarded gate
+    /// result is a silent pass-through waiting to happen).
+    pub middleware_helper_calls: Vec<MiddlewareHelperCall>,
+    /// Bindings inside the middleware function body that shadow the emitted
+    /// next/redirect/respond helpers.
+    pub middleware_shadows: Vec<MiddlewareShadow>,
 }
 
 impl ComponentFile {
@@ -255,6 +289,18 @@ impl ComponentFile {
             module_statements: Vec::new(),
             exported_fn_sources: Vec::new(),
             unsupported_errors: Vec::new(),
+            is_middleware: false,
+            has_middleware_fn: false,
+            middleware_fn_line: 0,
+            middleware_fn_column: 0,
+            matcher: None,
+            matcher_present: false,
+            matcher_line: 0,
+            matcher_column: 0,
+            matcher_invalid_reason: None,
+            middleware_returns: Vec::new(),
+            middleware_helper_calls: Vec::new(),
+            middleware_shadows: Vec::new(),
         }
     }
 }
@@ -264,6 +310,46 @@ pub struct ParserError {
     pub code: &'static str,
     pub message: String,
     pub fix_hint: &'static str,
+}
+
+/// §7d: one return statement inside the middleware function body. `arg_span`
+/// is the starting offset of the helper call when the return IS a sanctioned
+/// direct call — the validator matches it against middleware_helper_calls to
+/// find helper calls that were discarded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiddlewareReturn {
+    pub kind: MiddlewareResultKind,
+    pub line: usize,
+    pub column: usize,
+    pub arg_span: Option<BytePos>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MiddlewareResultKind {
+    Next,
+    Redirect,
+    Respond,
+    Bad,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiddlewareHelperCall {
+    pub name: String,
+    pub span: BytePos,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// §7d: a binding inside the middleware function body that shadows one of
+/// the emitted result helpers (next/redirect/respond) — `const next = ...`
+/// makes `return next()` call the shadow, so a "redirect" can silently
+/// become a pass-through. The validator rejects these.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MiddlewareShadow {
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
 }
 
 #[derive(Debug)]
@@ -287,10 +373,43 @@ fn pos(cm: &SourceMap, span: Span) -> (usize, usize) {
     (loc.line, loc.col_display)
 }
 
+/// Resolves the call target identifier, unwrapping the cheap AST shapes that
+/// hide it: parentheses `(session)()`, comma sequences `(0, session)()` (the
+/// LAST element is the target), and, via visit_opt_chain_expr, `session?.()`.
+fn direct_callee_ident(callee: &Callee) -> Option<&Ident> {
+    let mut expr: &Expr = match callee {
+        Callee::Expr(expr) => expr,
+        _ => return None,
+    };
+    while let Expr::Paren(paren) = expr {
+        expr = &paren.expr;
+    }
+    match expr {
+        Expr::Ident(ident) => Some(ident),
+        Expr::Seq(seq) => seq.exprs.last().and_then(|e| match &**e {
+            Expr::Ident(ident) => Some(ident),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
 /// Parses a `.tsx` file using SWC and walks the resulting AST to produce this framework's typed AST.
 /// Every field in `ComponentFile` comes from a real AST node with a real Span, so line/column
 /// positions are populated from actual parser output.
 pub fn parse_component_file(path: &str) -> Result<ComponentFile, ParseError> {
+    parse_with_options(path, false)
+}
+
+/// §7d: parse the project-root middleware.ts. The caller decides a file IS
+/// the middleware (exact root-relative name); this just enables the
+/// middleware-specific parsing (matcher extraction, middleware function body
+/// analysis) so the same visitor serves every file kind.
+pub fn parse_middleware_file(path: &str) -> Result<ComponentFile, ParseError> {
+    parse_with_options(path, true)
+}
+
+fn parse_with_options(path: &str, is_middleware: bool) -> Result<ComponentFile, ParseError> {
     let cm: Arc<SourceMap> = Default::default();
     let fm = cm
         .load_file(Path::new(path))
@@ -327,6 +446,7 @@ pub fn parse_component_file(path: &str) -> Result<ComponentFile, ParseError> {
         .map(|item| item.span().lo);
 
     let mut file = ComponentFile::new(filename);
+    file.is_middleware = is_middleware;
 
     extract_runs_on_from_comments(&cm, &comments, first_code_pos, &mut file);
     walk_module(&cm, &module, &mut file);
@@ -338,6 +458,20 @@ pub fn parse_component_file(path: &str) -> Result<ComponentFile, ParseError> {
 /// from disk. The `filename` is used in diagnostics (line/column references
 /// still come from the real AST spans within the source).
 pub fn parse_component_source(source: &str, filename: &str) -> Result<ComponentFile, ParseError> {
+    parse_source_with_options(source, filename, false)
+}
+
+/// §7d: like `parse_component_source` but with middleware classification
+/// enabled (matcher extraction + middleware function body analysis).
+pub fn parse_middleware_source(source: &str, filename: &str) -> Result<ComponentFile, ParseError> {
+    parse_source_with_options(source, filename, true)
+}
+
+fn parse_source_with_options(
+    source: &str,
+    filename: &str,
+    is_middleware: bool,
+) -> Result<ComponentFile, ParseError> {
     let cm: Arc<SourceMap> = Default::default();
     let fm = cm.new_source_file(FileName::Custom(filename.to_string()).into(), source.to_string());
 
@@ -365,6 +499,7 @@ pub fn parse_component_source(source: &str, filename: &str) -> Result<ComponentF
         .map(|item| item.span().lo);
 
     let mut file = ComponentFile::new(filename.to_string());
+    file.is_middleware = is_middleware;
 
     extract_runs_on_from_comments(&cm, &comments, first_code_pos, &mut file);
     walk_module(&cm, &module, &mut file);
@@ -554,6 +689,15 @@ struct Extractor<'a> {
     cm: &'a SourceMap,
     file: &'a mut ComponentFile,
     depth: usize,
+    /// Stack of function contexts; the TOP entry is the function directly
+    /// enclosing the current node. `true` = that function IS the middleware
+    /// function itself. A nested closure inside middleware pushes `false`
+    /// (its returns are not middleware returns), while the enclosing
+    /// middleware entry remains below it on the stack.
+    fn_stack: Vec<bool>,
+    /// Set when the exported `middleware` function declaration is entered,
+    /// consumed by the next visit_function push.
+    pending_middleware_fn: bool,
 }
 
 fn walk_module(cm: &SourceMap, module: &Module, file: &mut ComponentFile) {
@@ -561,6 +705,8 @@ fn walk_module(cm: &SourceMap, module: &Module, file: &mut ComponentFile) {
         cm,
         file,
         depth: 0,
+        fn_stack: Vec::new(),
+        pending_middleware_fn: false,
     };
     module.visit_with(&mut extractor);
 }
@@ -592,6 +738,63 @@ impl Visit for Extractor<'_> {
                 let (vline, vcol) = pos(self.cm, var_decl.span);
                 for decl in &var_decl.decls {
                     if let Pat::Ident(ident) = &decl.name {
+                        // §7d: middleware.ts's exported `matcher` const is the
+                        // path-pattern allowlist. Extract its static value (an
+                        // array literal of string literals; `as string[]` /
+                        // `satisfies` assertions unwrap first) so the
+                        // validator can enforce "present and an array of
+                        // strings". A non-static or non-string-array value
+                        // leaves matcher = None (validator rejects it).
+                        if self.file.is_middleware && ident.id.sym == "matcher" {
+                            self.file.matcher_present = true;
+                            self.file.matcher_line = vline;
+                            self.file.matcher_column = vcol;
+                            let mut init: Option<&Expr> = decl.init.as_deref();
+                            while let Some(e) = init {
+                                match e {
+                                    Expr::TsAs(as_expr) => init = Some(&as_expr.expr),
+                                    Expr::TsSatisfies(sat) => init = Some(&sat.expr),
+                                    Expr::Paren(p) => init = Some(&p.expr),
+                                    _ => break,
+                                }
+                            }
+                            if let Some(Expr::Array(arr)) = init {
+                                let mut values = Vec::new();
+                                let mut all_strings = true;
+                                for elem in &arr.elems {
+                                    match elem {
+                                        Some(spread) if spread.spread.is_some() => {
+                                            all_strings = false;
+                                            break;
+                                        }
+                                        Some(elem) => match &*elem.expr {
+                                            Expr::Lit(Lit::Str(s)) => {
+                                                values.push(s.value.to_string())
+                                            }
+                                            _ => {
+                                                all_strings = false;
+                                                break;
+                                            }
+                                        },
+                                        None => {
+                                            all_strings = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if all_strings {
+                                    self.file.matcher = Some(values);
+                                } else {
+                                    self.file.matcher_invalid_reason = Some(
+                                        "every element of `matcher` must be a string literal (no spread, no computed values)".to_string(),
+                                    );
+                                }
+                            } else {
+                                self.file.matcher_invalid_reason = Some(
+                                    "`matcher` must be an array literal of string literals (e.g. `const matcher = ['/admin/**']`) — the value is extracted statically at build time".to_string(),
+                                );
+                            }
+                        }
                         match var_decl.kind {
                             VarDeclKind::Let => self.file.top_level_bindings.push(
                                 TopLevelBinding::Let {
@@ -642,21 +845,154 @@ impl Visit for Extractor<'_> {
     }
 
     fn visit_fn_decl(&mut self, n: &FnDecl) {
+        let is_module_level = self.depth == 0;
+        // §7d: a function declared inside the middleware function body that
+        // shadows an emitted result helper is a gate weaking — record it the
+        // same way as a var shadow.
+        if self.file.is_middleware && self.fn_stack.last() == Some(&true) {
+            let name = n.ident.sym.as_ref();
+            if matches!(name, "next" | "redirect" | "respond") {
+                let (line, col) = pos(self.cm, n.span());
+                self.file.middleware_shadows.push(MiddlewareShadow {
+                    name: name.to_string(),
+                    line,
+                    column: col,
+                });
+            }
+        }
+        // The exported `middleware` function — only the module-level decl of
+        // the project-root middleware.ts counts (nested decls are helpers).
+        if self.file.is_middleware
+            && is_module_level
+            && n.ident.sym == "middleware"
+            && !self.file.has_middleware_fn
+        {
+            self.file.has_middleware_fn = true;
+            let (line, col) = pos(self.cm, n.span());
+            self.file.middleware_fn_line = line;
+            self.file.middleware_fn_column = col;
+            self.pending_middleware_fn = true;
+        }
         self.depth += 1;
         n.visit_children_with(self);
         self.depth -= 1;
     }
 
     fn visit_function(&mut self, n: &Function) {
+        let is_middleware_itself = self.pending_middleware_fn;
+        self.pending_middleware_fn = false;
+        // §7d: a parameter named next/redirect/respond (of the middleware
+        // itself, or of any function inside its body) shadows the emitted
+        // helper within that scope.
+        if self.file.is_middleware && (is_middleware_itself || self.fn_stack.last() == Some(&true)) {
+            for param in &n.params {
+                if let Pat::Ident(ident) = &param.pat {
+                    let name = ident.id.sym.as_ref();
+                    if matches!(name, "next" | "redirect" | "respond") {
+                        let (line, col) = pos(self.cm, ident.id.span);
+                        self.file.middleware_shadows.push(MiddlewareShadow {
+                            name: name.to_string(),
+                            line,
+                            column: col,
+                        });
+                    }
+                }
+            }
+        }
+        self.fn_stack.push(is_middleware_itself);
         self.depth += 1;
         n.visit_children_with(self);
         self.depth -= 1;
+        self.fn_stack.pop();
     }
 
     fn visit_arrow_expr(&mut self, n: &ArrowExpr) {
+        // §7d: same shadow check for arrow params inside the middleware body.
+        if self.file.is_middleware && self.fn_stack.last() == Some(&true) {
+            for param in &n.params {
+                if let Pat::Ident(ident) = param {
+                    let name = ident.id.sym.as_ref();
+                    if matches!(name, "next" | "redirect" | "respond") {
+                        let (line, col) = pos(self.cm, ident.id.span);
+                        self.file.middleware_shadows.push(MiddlewareShadow {
+                            name: name.to_string(),
+                            line,
+                            column: col,
+                        });
+                    }
+                }
+            }
+        }
+        self.fn_stack.push(false);
         self.depth += 1;
         n.visit_children_with(self);
         self.depth -= 1;
+        self.fn_stack.pop();
+    }
+
+    /// §7d: analyze every return statement whose directly-enclosing function
+    /// is the middleware function. Each return must be a direct call to one
+    /// of the three sanctioned helpers; anything else is recorded as Bad for
+    /// the validator to reject (never a silent pass-through).
+    fn visit_return_stmt(&mut self, n: &ReturnStmt) {
+        if self.file.is_middleware && self.fn_stack.last() == Some(&true) {
+            let (line, col) = pos(self.cm, n.span);
+            let mut kind = MiddlewareResultKind::Bad;
+            let mut detail = "bare `return;` — middleware must return next(), redirect(), or respond()".to_string();
+            let mut arg_span: Option<BytePos> = None;
+            if let Some(arg) = &n.arg {
+                let mut e: &Expr = &**arg;
+                while let Expr::Paren(paren) = e {
+                    e = &paren.expr;
+                }
+                match e {
+                    Expr::Call(call) => {
+                        if let Some(target) = direct_callee_ident(&call.callee) {
+                            let name = target.sym.as_ref();
+                            match name {
+                                "next" => {
+                                    kind = MiddlewareResultKind::Next;
+                                    detail = "next()".to_string();
+                                    arg_span = Some(call.span.lo);
+                                }
+                                "redirect" => {
+                                    kind = MiddlewareResultKind::Redirect;
+                                    detail = "redirect()".to_string();
+                                    arg_span = Some(call.span.lo);
+                                }
+                                "respond" => {
+                                    kind = MiddlewareResultKind::Respond;
+                                    detail = "respond()".to_string();
+                                    arg_span = Some(call.span.lo);
+                                }
+                                other => {
+                                    detail = format!(
+                                        "`return {}(...)` — middleware must return one of the three sanctioned helpers: next(), redirect(), or respond()",
+                                        other
+                                    );
+                                }
+                            }
+                        } else {
+                            detail = "return of a call expression — middleware must return next(), redirect(), or respond() directly".to_string();
+                        }
+                    }
+                    Expr::Cond(_) => {
+                        detail = "conditional (ternary) return — middleware must return a single next()/redirect()/respond() call; write each branch as its own return statement".to_string();
+                    }
+                    _ => {
+                        detail = "return of a non-result value — middleware must return next(), redirect(), or respond()".to_string();
+                    }
+                }
+            }
+            self.file.middleware_returns.push(MiddlewareReturn {
+                kind,
+                line,
+                column: col,
+                arg_span,
+                detail,
+            });
+        }
+        n.visit_children_with(self);
     }
 
     /// Ordered module-scope capture for API files: every top-level statement
@@ -752,6 +1088,25 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
 }
 
     fn visit_var_decl(&mut self, n: &VarDecl) {
+        // §7d: a var/let/const declared inside the middleware function body
+        // that shadows an emitted result helper (next/redirect/respond)
+        // would make `return next()` call the shadow — a silent pass-through
+        // in the gate. Record it; the validator rejects it.
+        if self.file.is_middleware && self.fn_stack.last() == Some(&true) {
+            for decl in &n.decls {
+                if let Pat::Ident(ident) = &decl.name {
+                    let name = ident.id.sym.as_ref();
+                    if matches!(name, "next" | "redirect" | "respond") {
+                        let (line, col) = pos(self.cm, ident.id.span);
+                        self.file.middleware_shadows.push(MiddlewareShadow {
+                            name: name.to_string(),
+                            line,
+                            column: col,
+                        });
+                    }
+                }
+            }
+        }
         if self.depth == 0 {
             let (line, col) = pos(self.cm, n.span);
             for decl in &n.decls {
@@ -816,28 +1171,30 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
     }
 
     fn visit_call_expr(&mut self, n: &CallExpr) {
+        // §7d: record next()/redirect()/respond() calls inside the middleware
+        // function body — the validator matches these against the sanctioned
+        // returns' arg spans to find discarded gate results.
+        if self.file.is_middleware && self.fn_stack.last() == Some(&true) {
+            if let Some(target) = direct_callee_ident(&n.callee) {
+                let name = target.sym.as_ref();
+                if matches!(name, "next" | "redirect" | "respond") {
+                    let (line, col) = pos(self.cm, n.span);
+                    self.file.middleware_helper_calls.push(MiddlewareHelperCall {
+                        name: name.to_string(),
+                        span: n.span.lo,
+                        line,
+                        column: col,
+                    });
+                }
+            }
+        }
+
         // The callee may hide behind cheap AST shapes that resolve to the
         // same target: a comma-sequence `(0, session)()` (the LAST element is
         // the actual call target) and, via visit_opt_chain_expr, `session?.()`.
         // Parenthesized callees (`(session)()`) unwrap first — swc keeps
         // ParenExpr nodes in the tree.
-        let mut callee_expr: &Expr = match &n.callee {
-            Callee::Expr(expr) => &**expr,
-            _ => return,
-        };
-        while let Expr::Paren(paren) = callee_expr {
-            callee_expr = &paren.expr;
-        }
-        let target: Option<&Ident> = match callee_expr {
-            Expr::Ident(ident) => Some(ident),
-            Expr::Seq(seq) => seq.exprs.last().and_then(|e| match &**e {
-                Expr::Ident(ident) => Some(ident),
-                _ => None,
-            }),
-            _ => None,
-        };
-
-        if let Some(ident) = target {
+        if let Some(ident) = direct_callee_ident(&n.callee) {
             let name = ident.sym.as_ref();
             let (line, col) = pos(self.cm, n.span);
             if name == "data" {

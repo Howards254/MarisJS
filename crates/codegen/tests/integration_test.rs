@@ -6489,3 +6489,647 @@ fn adapter_static_never_publishes_server_modules() {
         server_modules
     );
 }
+
+// ── §7d middleware ──────────────────────────────────────────────────────
+
+/// Writes the project-root middleware.ts fixture.
+fn write_middleware_fixture(dir: &tempfile::TempDir, source: &str) {
+    std::fs::write(dir.path().join("middleware.ts"), source).unwrap();
+}
+
+/// Imports the compiled middleware module and evaluates the canonical
+/// __matchPath against every path, returning the match booleans in order.
+/// Exercises the exact matcher implementation the dev server and adapter
+/// delegate to.
+fn match_paths(out: &std::path::Path, paths: &[&str]) -> Vec<bool> {
+    let list = serde_json::to_string(paths).unwrap();
+    let script = format!(
+        "const m = await import(process.argv[1]); process.stdout.write(JSON.stringify({}.map(p => m.__matchPath(p))));",
+        list
+    );
+    let output = Command::new("node")
+        .arg("--input-type=module")
+        .arg("-e")
+        .arg(&script)
+        .arg(out.join("_server/middleware.mjs").to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "match_paths node failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// §7d matcher semantics battery — the exact documented semantics of SPEC
+/// §7d, asserted against the REAL compiled matcher:
+///   case-sensitive, trailing slashes significant, `*` matches any run of
+///   characters (including `/` and empty), empty `[]` matches nothing,
+///   `'*'` matches everything, OR over the array.
+#[test]
+fn middleware_matcher_semantics_battery() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['/admin/*', '/Admin', '/docs/'];\n",
+        ),
+    );
+    let out = build_fixture(&dir);
+    assert!(
+        out.join("_server/middleware.mjs").exists(),
+        "middleware must compile into dist/_server/middleware.mjs"
+    );
+
+    let paths = [
+        "/admin/",
+        "/admin/anything",
+        "/admin/a/b/c",
+        "/admin",      // no trailing slash — '/admin/*' requires the literal '/'
+        "/adminx",     // wildcard may match empty but not 'x' without the '/'
+        "/Admin",      // exact case match on the literal pattern
+        "/admin",      // case-sensitive: '/Admin' ≠ '/admin' (only unmatched here)
+        "/docs/",
+        "/docs",       // trailing slash significant
+        "/",
+        "/api/anything",
+    ];
+    let got = match_paths(&out, &paths);
+    assert_eq!(
+        got,
+        vec![
+            true,   // "/admin/"
+            true,   // "/admin/anything"
+            true,   // "/admin/a/b/c"
+            false,  // "/admin"
+            false,  // "/adminx"
+            true,   // "/Admin"
+            false,  // "/admin"
+            true,   // "/docs/"
+            false,  // "/docs"
+            false,  // "/"
+            false,  // "/api/anything"
+        ],
+        "matcher ['/admin/*','/Admin','/docs/'] semantics, got {:?}",
+        got
+    );
+
+    // Empty matcher [] — matches nothing, middleware never runs.
+    let dir2 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir2);
+    write_middleware_fixture(
+        &dir2,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = [];\n",
+        ),
+    );
+    let out2 = build_fixture(&dir2);
+    assert_eq!(
+        match_paths(&out2, &["/", "/anything", "/admin/"]),
+        vec![false, false, false],
+        "empty matcher must match nothing"
+    );
+
+    // '*' alone matches every path.
+    let dir3 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir3);
+    write_middleware_fixture(
+        &dir3,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['*'];\n",
+        ),
+    );
+    let out3 = build_fixture(&dir3);
+    assert_eq!(
+        match_paths(&out3, &["/", "/a/b", "/with space", "/%2Fencoded"]),
+        vec![true, true, true, true],
+        "'*' must match every path (including percent-encoded, raw pathname)"
+    );
+}
+
+/// §7d e2e #1: `next()` allows the request through — the API route still
+/// runs. The gate matched, decided "allow", and dispatch continued.
+#[test]
+fn middleware_next_proceeds_to_route() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['/api/*'];\n",
+        ),
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('hello', { status: 200 });\n",
+            "}\n",
+        ),
+        "hello.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/api/hello");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let (headers, body) = split_response(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 200"),
+        "next() must let the api route serve, got: {}",
+        headers.lines().next().unwrap_or("")
+    );
+    assert!(
+        body.contains("hello"),
+        "the handler body must be served after next(), got: {}",
+        body
+    );
+}
+
+/// §7d e2e #2: `redirect(url, status)` sends a real redirect with Location —
+/// the client observes it and the route is never reached.
+#[test]
+fn middleware_redirect_sends_location() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return redirect('/new', 301);\n",
+            "}\n",
+            "export const matcher: string[] = ['/old'];\n",
+        ),
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('new-location', { status: 200 });\n",
+            "}\n",
+        ),
+        "new.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/old");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let (headers, _) = split_response(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 301"),
+        "redirect() must send the given status, got: {}",
+        headers.lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        header_value(&headers, "location").as_deref(),
+        Some("/new"),
+        "redirect() must set Location: /new, got headers: {}",
+        headers
+    );
+}
+
+/// §7d e2e #3: `respond(response)` short-circuits — the matched route's
+/// handler is NEVER invoked. The 403 body proves the handler's secret did
+/// not leak.
+#[test]
+fn middleware_respond_blocks_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return respond(new Response('blocked', { status: 403, headers: { 'x-why': 'gate' } }));\n",
+            "}\n",
+            "export const matcher: string[] = ['/api/secret'];\n",
+        ),
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('LEAKED-SECRET', { status: 200 });\n",
+            "}\n",
+        ),
+        "secret.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/api/secret");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let (headers, body) = split_response(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 403"),
+        "respond() must send its own status, got: {}",
+        headers.lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        header_value(&headers, "x-why").as_deref(),
+        Some("gate"),
+        "respond() response headers must be forwarded, got: {}",
+        headers
+    );
+    assert!(
+        body.contains("blocked") && !body.contains("LEAKED"),
+        "respond() must short-circuit the handler entirely, got body: {}",
+        body
+    );
+}
+
+/// §7d e2e #3b (review F2): a middleware redirect URL containing CR/LF must
+/// NOT become header injection in the dev server — the request fails closed
+/// (500) instead of emitting a crafted header block.
+#[test]
+fn middleware_crlf_in_redirect_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return redirect('/ok\\r\\nX-Injected: gotcha');\n",
+            "}\n",
+            "export const matcher: string[] = ['/old'];\n",
+        ),
+    );
+
+    let (mut child, port) = spawn_dev_server(&dir);
+    let response = http_get(port, "/old");
+    child.kill().unwrap();
+    let _ = child.wait();
+
+    let (headers, _) = split_response(&response);
+    assert!(
+        headers.starts_with("HTTP/1.1 500"),
+        "CRLF in redirect URL must fail closed (500), got: {}",
+        headers.lines().next().unwrap_or("")
+    );
+    assert!(
+        !headers.to_lowercase().contains("x-injected"),
+        "no injected header may be emitted, got: {}",
+        headers
+    );
+}
+
+/// §7d e2e #4: the auth-gate story end to end — middleware reads session(),
+/// redirects unauthenticated requests, and lets authenticated ones through.
+/// Proves session() works inside middleware over the dev server (the ALS
+/// wrapper + baked secret both function through the compiled module).
+#[test]
+fn middleware_session_auth_gate_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    std::fs::write(
+        dir.path().join(".env"),
+        "SESSION_SECRET=test-secret-0123456789abcdef0123456789abcdef\n",
+    )
+    .unwrap();
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  const s = session();\n",
+            "  if (!s || !s.isMember) return redirect('/login');\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['/api/member'];\n",
+        ),
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function POST(req: Request) {\n",
+            "  return setSession({ isMember: true }, new Response('logged-in', { status: 200 }));\n",
+            "}\n",
+        ),
+        "login.ts",
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('member-only-data', { status: 200 });\n",
+            "}\n",
+        ),
+        "member.ts",
+    );
+
+    let (mut child, port) = spawn_dev_server_with_env(&dir, &[]);
+
+    // Unauthenticated: the gate redirects before the handler ever runs.
+    let anon = http_request_extra(port, "GET", "/api/member", "", "text/plain", "");
+    let (anon_headers, _) = split_response(&anon);
+    assert!(
+        anon_headers.starts_with("HTTP/1.1 302"),
+        "unauthenticated /api/member must redirect to /login, got: {}",
+        anon_headers.lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        header_value(&anon_headers, "location").as_deref(),
+        Some("/login"),
+        "redirect target must be /login, got headers: {}",
+        anon_headers
+    );
+
+    // Login (outside the gate) establishes a session cookie.
+    let login = http_request_extra(port, "POST", "/api/login", "", "text/plain", "");
+    let (login_headers, _) = split_response(&login);
+    let set_cookie = header_value(&login_headers, "set-cookie").expect("POST must Set-Cookie");
+    let cookie = extract_session_cookie(&set_cookie).expect("cookie value");
+
+    // Authenticated: middleware returns next(), the handler serves the data.
+    let authed = http_request_extra(
+        port,
+        "GET",
+        "/api/member",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", cookie),
+    );
+    let (authed_headers, authed_body) = split_response(&authed);
+    assert!(
+        authed_headers.starts_with("HTTP/1.1 200"),
+        "authenticated request must pass the gate, got: {}",
+        authed_headers.lines().next().unwrap_or("")
+    );
+    assert!(
+        authed_body.contains("member-only-data"),
+        "authenticated handler must serve, got body: {}",
+        authed_body
+    );
+
+    // A tampered cookie fails the gate the same way as no cookie.
+    let tampered = tamper_byte(&cookie);
+    let attacked = http_request_extra(
+        port,
+        "GET",
+        "/api/member",
+        "",
+        "text/plain",
+        &format!("Cookie: {}\r\n", tampered),
+    );
+    let (attacked_headers, _) = split_response(&attacked);
+    assert!(
+        attacked_headers.starts_with("HTTP/1.1 302"),
+        "tampered session must fail the gate closed (redirect), got: {}",
+        attacked_headers.lines().next().unwrap_or("")
+    );
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// §7d validator: every middleware rule fires with the right code — the gate
+/// cannot be weakened by a bad return, a discarded helper call, a missing or
+/// malformed matcher, data(), or a stray @runsOn directive.
+#[test]
+fn middleware_validation_rejects_bad_shapes() {
+    let codes = |source: &str| -> Vec<String> {
+        let component = parser::parse_middleware_source(source, "middleware.ts").unwrap();
+        let mut diags = validator::validate_for_path(&component, std::path::Path::new("middleware.ts"));
+        diags.retain(|d| !d.is_warning);
+        diags.into_iter().map(|d| d.code.to_string()).collect()
+    };
+
+    // Missing middleware function.
+    let diags = codes("export const matcher: string[] = ['/x'];\n");
+    assert!(diags.iter().any(|c| c == "MISSING_MIDDLEWARE"), "got: {:?}", diags);
+
+    // Missing matcher.
+    let diags = codes("export function middleware(req: Request) { return next(); }\n");
+    assert!(diags.iter().any(|c| c == "MATCHER_REQUIRED"), "got: {:?}", diags);
+
+    // matcher not an array literal at all.
+    let diags = codes(
+        "export function middleware(req: Request) { return next(); }\nexport const matcher: string[] = '/x';\n",
+    );
+    assert!(diags.iter().any(|c| c == "MATCHER_NOT_ARRAY"), "got: {:?}", diags);
+
+    // matcher contains a non-string (or a spread) — an array literal with an
+    // invalid element.
+    let diags = codes(
+        "export function middleware(req: Request) { return next(); }\nexport const matcher: any[] = ['/x', 42];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MATCHER_NOT_STRING"), "got: {:?}", diags);
+
+    // Spread element is likewise a non-static element.
+    let diags = codes(
+        "export function middleware(req: Request) { return next(); }\nexport const matcher: string[] = [...['/x']];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MATCHER_NOT_STRING"), "got: {:?}", diags);
+
+    // Bare return — not a sanctioned result.
+    let diags = codes(
+        "export function middleware(req: Request) { return; }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MIDDLEWARE_RESULT"), "got: {:?}", diags);
+
+    // Return of an arbitrary value.
+    let diags = codes(
+        "export function middleware(req: Request) { return 'pass'; }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MIDDLEWARE_RESULT"), "got: {:?}", diags);
+
+    // Ternary return.
+    let diags = codes(
+        "export function middleware(req: Request) { return session() ? next() : redirect('/login'); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MIDDLEWARE_RESULT"), "got: {:?}", diags);
+
+    // A discarded gate result: the call is not the direct return value.
+    let diags = codes(
+        "export function middleware(req: Request) { next(); return next(); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(
+        diags.iter().any(|c| c == "MIDDLEWARE_HELPER_NOT_RETURNED"),
+        "discarded next() must be rejected, got: {:?}",
+        diags
+    );
+
+    // data() has no meaning in middleware.
+    let diags = codes(
+        "export function middleware(req: Request) { data(); return next(); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MIDDLEWARE_DATA_CALL"), "got: {:?}", diags);
+
+    // A binding shadowing a result helper — `return next()` would call the
+    // shadow, silently changing the gate decision.
+    let diags = codes(
+        "export function middleware(req: Request) { const next = () => ({ __m: 'next' }); return next(); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(
+        diags.iter().any(|c| c == "MIDDLEWARE_HELPER_SHADOW"),
+        "shadowed next() must be rejected, got: {:?}",
+        diags
+    );
+
+    // A parameter named after a result helper shadows it for the whole body.
+    let diags = codes(
+        "export function middleware(next: Request) { return next(); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(
+        diags.iter().any(|c| c == "MIDDLEWARE_HELPER_SHADOW"),
+        "param shadow must be rejected, got: {:?}",
+        diags
+    );
+
+    // @runsOn is not a middleware directive.
+    let diags = codes(
+        "// @runsOn api\nexport function middleware(req: Request) { return next(); }\nexport const matcher: string[] = ['/x'];\n",
+    );
+    assert!(diags.iter().any(|c| c == "MIDDLEWARE_NO_RUNSON"), "got: {:?}", diags);
+
+    // A valid middleware validates clean.
+    let diags = codes(
+        "export function middleware(req: Request) { const s = session(); if (!s) return redirect('/login'); return next(); }\nexport const matcher: string[] = ['/api/*'];\n",
+    );
+    assert!(diags.is_empty(), "valid middleware must be clean, got: {:?}", diags);
+}
+
+/// §7d e2e #5: adapter-node evaluates middleware before dispatch — the same
+/// gate works in production, not just dev. redirect() is honored; next()
+/// reaches the api handler.
+#[test]
+fn adapter_node_runs_middleware_before_dispatch() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  if (req.headers.get('x-env') === 'staging') return redirect('/maintenance');\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['/api/*'];\n",
+        ),
+    );
+    write_api_fixture(
+        &dir,
+        concat!(
+            "// @runsOn api\n",
+            "export function GET(req: Request) {\n",
+            "  return new Response('route-ok', { status: 200 });\n",
+            "}\n",
+        ),
+        "route.ts",
+    );
+    let out = build_fixture(&dir);
+
+    let port = free_port();
+    let adapter = workspace_root().join("packages/adapter-node/server.mjs");
+    let mut child = ProcCommand::new("node")
+        .arg(&adapter)
+        .arg(&out)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn adapter-node");
+    wait_for_port(port);
+
+    // Pass-through: no x-env header → next() → handler serves.
+    let ok = http_request_extra(port, "GET", "/api/route", "", "text/plain", "");
+    let (ok_headers, ok_body) = split_response(&ok);
+    assert!(
+        ok_headers.starts_with("HTTP/1.1 200") && ok_body.contains("route-ok"),
+        "adapter-node next() must reach the handler, got: {}",
+        ok_headers.lines().next().unwrap_or("")
+    );
+
+    // Gated: x-env staging → redirect, handler never runs.
+    let gated = http_request_extra(
+        port,
+        "GET",
+        "/api/route",
+        "",
+        "text/plain",
+        "X-Env: staging\r\n",
+    );
+    let (gated_headers, gated_body) = split_response(&gated);
+    assert!(
+        gated_headers.starts_with("HTTP/1.1 302"),
+        "adapter-node middleware redirect must fire, got: {}",
+        gated_headers.lines().next().unwrap_or("")
+    );
+    assert_eq!(
+        header_value(&gated_headers, "location").as_deref(),
+        Some("/maintenance"),
+        "redirect Location, got headers: {}",
+        gated_headers
+    );
+    assert!(
+        !gated_body.contains("route-ok"),
+        "the handler must not run when middleware redirects, got body: {}",
+        gated_body
+    );
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+/// §7d e2e #6: adapter-static fails loud when the build declares middleware —
+/// middleware is server code and a static host cannot run it.
+#[test]
+fn adapter_static_refuses_middleware() {
+    use std::process::{Command as ProcCommand, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    write_middleware_fixture(
+        &dir,
+        concat!(
+            "export function middleware(req: Request): MiddlewareResult {\n",
+            "  return next();\n",
+            "}\n",
+            "export const matcher: string[] = ['/admin/*'];\n",
+        ),
+    );
+    let out = build_fixture(&dir);
+
+    let static_out = dir.path().join("static-out");
+    let status = ProcCommand::new("node")
+        .arg(workspace_root().join("packages/adapter-static/cli.mjs"))
+        .arg(&out)
+        .arg(&static_out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(
+        !status.status.success(),
+        "adapter-static must refuse builds that declare middleware"
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("middleware") && stderr.contains("adapter-node"),
+        "refusal must name middleware and point at adapter-node, got: {}",
+        stderr
+    );
+}

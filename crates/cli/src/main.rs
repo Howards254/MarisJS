@@ -337,6 +337,12 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
 
     walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut api_routes, &mut component_meta, &env, &server_files, &runs_on_by_rel)?;
 
+    // §7d: build the project-root middleware.ts (if any) into
+    // dist/_server/middleware.mjs. Must run AFTER walk_and_build's
+    // client→server import check, which needs runs_on_by_rel populated with
+    // the middleware classification.
+    let has_middleware = build_middleware(source_dir, out_dir, &env)?;
+
     // Write runtime (embedded at compile time)
     let runtime_dest = out_dir.join("runtime.mjs");
     std::fs::write(&runtime_dest, RUNTIME_JS).map_err(|e| format!("failed to write runtime: {}", e))?;
@@ -358,7 +364,7 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     prerender_pages(out_dir, &page_routes)?;
 
     // Generate routes.json manifest
-    generate_routes_json(out_dir, &page_routes, &api_routes)?;
+    generate_routes_json(out_dir, &page_routes, &api_routes, has_middleware)?;
     eprintln!("  generated routes.json");
 
     write_reload_timestamp(out_dir);
@@ -413,6 +419,18 @@ fn preclassify_files(
                         server_files.insert(rel.to_path_buf());
                     }
                 }
+            } else if path.extension().map_or(false, |ext| ext == "ts")
+                && path.strip_prefix(source_dir).map_or(false, |rel| {
+                    rel == Path::new("middleware.ts")
+                })
+            {
+                // §7d: the project-root middleware.ts is a server-side module
+                // (emitted under _server/) — a client file importing it must
+                // fail the E4-14 client→server check like any other server
+                // module.
+                let Ok(rel) = path.strip_prefix(source_dir) else { continue };
+                runs_on_by_rel.insert(rel.to_path_buf(), parser::RunsOn::Api);
+                server_files.insert(rel.to_path_buf());
             }
         }
     }
@@ -648,8 +666,11 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
             // Static assets (images, fonts, etc.) are copied through so the
             // dev server and adapters can serve them. `.env` is NEVER copied:
             // it holds build-time secrets, and dist/ is deployable output.
+            // middleware.ts is compiled into _server/middleware.mjs and must
+            // NEVER be copied verbatim — it is the request-gate source and is
+            // only reachable through the server dispatchers (E4-01).
             let rel = path.strip_prefix(base).map_err(|e| format!("strip_prefix: {}", e))?;
-            if rel.file_name().map_or(false, |n| n == ".env") {
+            if rel.file_name().map_or(false, |n| n == ".env" || n == "middleware.ts") {
                 continue;
             }
             let dest = out_base.join(rel);
@@ -662,6 +683,61 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
         }
     }
     Ok(())
+}
+
+/// §7d: build the project-root middleware.ts (when present) into
+/// dist/_server/middleware.mjs. Same gates as api files: the middleware rule
+/// set (matcher + sanctioned returns), the SESSION_SECRET gate when
+/// session()/setSession() is used, and import resolution. Returns whether a
+/// middleware.ts exists (so the manifest can record it).
+fn build_middleware(source_dir: &Path, out_dir: &Path, env: &codegen::EnvMap) -> Result<bool, String> {
+    let middleware_path = source_dir.join("middleware.ts");
+    if !middleware_path.is_file() {
+        return Ok(false);
+    }
+
+    let component = parser::parse_middleware_file(middleware_path.to_str().unwrap())
+        .map_err(|e| format!("parse error in middleware.ts: {}", e))?;
+
+    let diagnostics = validator::validate_middleware(&component);
+    let errors: Vec<&validator::Diagnostic> = diagnostics.iter().filter(|d| !d.is_warning).collect();
+    for d in diagnostics.iter().filter(|d| d.is_warning) {
+        eprintln!("    warning[{}]: {} (fix: {})", d.code, d.message, d.fix_hint);
+    }
+    if !errors.is_empty() {
+        for d in &errors {
+            eprintln!("    {}:{} — {}: {} (fix: {})", d.line.unwrap_or(0), d.column.unwrap_or(0), d.code, d.message, d.fix_hint);
+        }
+        return Err(format!("validation failed in middleware.ts: {} error(s)", errors.len()));
+    }
+
+    let import_diags = validator::validate_imports(&component, Path::new("middleware.ts"), source_dir);
+    if !import_diags.is_empty() {
+        for d in &import_diags {
+            eprintln!("    {}:{} — {}: {} (fix: {})", d.line.unwrap_or(0), d.column.unwrap_or(0), d.code, d.message, d.fix_hint);
+        }
+        return Err(format!("import validation failed in middleware.ts: {} error(s)", import_diags.len()));
+    }
+
+    if component.has_session_call {
+        let secret = env.get("SESSION_SECRET").map(|v| v.as_str()).unwrap_or("");
+        let trimmed = secret.trim();
+        if trimmed.is_empty() || trimmed.len() < 16 {
+            return Err(
+                "SESSION_SECRET is missing or too weak, but middleware.ts uses session()/setSession() — session signing cannot work without it. Add a strong SESSION_SECRET (16+ characters) to .env or the environment (e.g. `openssl rand -base64 32`).".to_string(),
+            );
+        }
+    }
+
+    let js = codegen::generate_middleware(&component, env)
+        .map_err(|e| format!("codegen error in middleware.ts: {}", e))?;
+    let out_path = out_dir.join("_server/middleware.mjs");
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
+    }
+    std::fs::write(&out_path, js).map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
+    eprintln!("  building middleware.ts");
+    Ok(true)
 }
 
 // ── CSS collection and copying ────────────────────────────────────────
@@ -1082,6 +1158,16 @@ struct RoutesManifest<'a> {
     routes: Vec<RouteEntry<'a>>,
     #[serde(rename = "apiRoutes", skip_serializing_if = "Vec::is_empty")]
     api_routes: Vec<ApiRouteEntry<'a>>,
+    /// §7d: present only when the project has a middleware.ts. The file is
+    /// the compiled dist/_server/middleware.mjs; dev server and adapter-node
+    /// import it to evaluate request gating BEFORE route/api dispatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    middleware: Option<MiddlewareEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct MiddlewareEntry<'a> {
+    file: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1095,6 +1181,7 @@ fn generate_routes_json(
     out_dir: &Path,
     page_routes: &[PageRoute],
     api_routes: &[ApiRoute],
+    has_middleware: bool,
 ) -> Result<(), String> {
     let entries: Vec<RouteEntry> = page_routes.iter().map(|page| {
         let modules: Vec<ClientModuleEntry> = page.page_roots.iter().map(|(name, path)| {
@@ -1117,11 +1204,18 @@ fn generate_routes_json(
         methods: &api.methods,
     }).collect();
 
+    let middleware_entry = if has_middleware {
+        Some(MiddlewareEntry { file: "_server/middleware.mjs" })
+    } else {
+        None
+    };
+
     let manifest = RoutesManifest {
         version: 1,
         runtime: "./runtime.mjs",
         routes: entries,
         api_routes: api_entries,
+        middleware: middleware_entry,
     };
 
     let json = serde_json::to_string_pretty(&manifest).map_err(|e| format!("json: {}", e))?;
@@ -1194,14 +1288,25 @@ fn load_api_routes(out_dir: &Path) -> Vec<ApiRoute> {
 
 // ── dev server ─────────────────────────────────────────────────────────
 
+/// §7d: read the compiled middleware module path from routes.json
+/// (None when the project has no middleware.ts).
+fn load_middleware_path(out_dir: &Path) -> Option<String> {
+    let path = out_dir.join("routes.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let file = manifest.get("middleware")?.get("file")?.as_str()?;
+    Some(file.to_string())
+}
+
 fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
     eprintln!("=== initial build ===");
     build_all(source, out)?;
 
     let out_dir = Path::new(out).to_path_buf();
     let source_dir = Path::new(source).to_path_buf();
-    let routes = load_routes(&out_dir);
-    let api_routes = load_api_routes(&out_dir);
+    let mut routes = load_routes(&out_dir);
+    let mut api_routes = load_api_routes(&out_dir);
+    let mut middleware = load_middleware_path(&out_dir);
 
     let (tx, rx) = mpsc::channel::<()>();
     start_file_watcher(source_dir.clone(), tx)?;
@@ -1212,8 +1317,6 @@ fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
     eprintln!("  watching {} for changes...\n", source);
 
     let out_dir_clone = out_dir.clone();
-    let routes_clone = routes.clone();
-    let api_routes_clone = api_routes.clone();
     let source_str = source.to_string();
     let out_str = out.to_string();
 
@@ -1227,14 +1330,21 @@ fn run_dev(source: &str, out: &str, port: u16) -> Result<(), String> {
             match build_all(&source_str, &out_str) {
                 Ok(n) => {
                     eprintln!(" rebuilt {} file(s)\n", n);
-                    // Don't update routes — build_all regenerates them
+                    // F4: reload the dispatch tables after every successful
+                    // rebuild. A newly added middleware.ts (or a changed
+                    // route set) must engage immediately — serving the stale
+                    // pre-middlware state would be a silent fail-open until
+                    // restart, on a 0.0.0.0 server.
+                    routes = load_routes(&out_dir);
+                    api_routes = load_api_routes(&out_dir);
+                    middleware = load_middleware_path(&out_dir);
                 }
                 Err(e) => eprintln!(" rebuild error: {}\n", e),
             }
         }
 
         if let Ok((mut stream, _)) = listener.accept() {
-            handle_http(&out_dir_clone, &routes_clone, &api_routes_clone, &mut stream);
+            handle_http(&out_dir_clone, &routes, &api_routes, &middleware, &mut stream);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1315,6 +1425,7 @@ fn handle_http(
     out_dir: &Path,
     routes: &HashMap<String, String>,
     api_routes: &[ApiRoute],
+    middleware: &Option<String>,
     stream: &mut std::net::TcpStream,
 ) {
     // Read the request head plus any body (Content-Length governs how much
@@ -1363,6 +1474,69 @@ fn handle_http(
     let method = if parts.len() >= 1 { parts[0] } else { "GET" };
     let path = if parts.len() >= 2 { parts[1] } else { "/" };
 
+    // §7d: middleware runs FIRST, before any dispatch — API routes AND
+    // static pages are both gated. A matched middleware that returns
+    // redirect()/respond() short-circuits; next()/nomatch continue to the
+    // normal dispatch below. A middleware error is fail-closed (500), never
+    // a silent pass-through.
+    if let Some(mw_file) = middleware {
+        match eval_middleware(out_dir, mw_file, method, path, &head, &body) {
+            MiddlewareOutcome::Redirect { url, status } => {
+                // F2: the middleware-controlled url lands in a raw HTTP
+                // header line. Reject embedded CR/LF outright — a literal
+                // newline here is header injection, never a legitimate
+                // Location. Fail closed (500) rather than emitting a crafted
+                // header block.
+                if url.contains('\r') || url.contains('\n') {
+                    let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes());
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 {} {}\r\nLocation: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\n\r\n",
+                    status,
+                    http_status_text(status),
+                    url
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                return;
+            }
+            MiddlewareOutcome::Respond {
+                status,
+                headers,
+                body_bytes,
+            } => {
+                let mut head_out = format!(
+                    "HTTP/1.1 {} {}\r\nAccess-Control-Allow-Origin: *\r\n",
+                    status,
+                    http_status_text(status)
+                );
+                for (k, v) in &headers {
+                    let lower = k.to_ascii_lowercase();
+                    if lower == "content-length" || lower == "transfer-encoding" || lower == "connection" {
+                        continue;
+                    }
+                    // F2: defensive — a header name or value with CR/LF is
+                    // header injection; never emit it.
+                    if k.contains('\r') || k.contains('\n') || v.contains('\r') || v.contains('\n') {
+                        continue;
+                    }
+                    head_out.push_str(&format!("{}: {}\r\n", k, v));
+                }
+                head_out.push_str(&format!("Content-Length: {}\r\n\r\n", body_bytes.len()));
+                let _ = stream.write_all(head_out.as_bytes());
+                let _ = stream.write_all(&body_bytes);
+                return;
+            }
+            MiddlewareOutcome::Error => {
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n";
+                let _ = stream.write_all(resp.as_bytes());
+                return;
+            }
+            MiddlewareOutcome::Pass => {}
+        }
+    }
+
     // §7b: API routes dispatch FIRST — an /api/* path is never a static file.
     if let Some(api) = api_routes.iter().find(|a| a.path == path) {
         handle_api_route(out_dir, api, method, &head, &body, stream);
@@ -1400,9 +1574,17 @@ fn handle_http(
             // served statically — they are only reachable through the API
             // dispatcher, so the baked env snapshot (SESSION_SECRET, API
             // keys) can never be downloaded.
+            //
+            // F1: compare case-insensitively — macOS APFS and Windows NTFS
+            // are case-insensitive by default, so /_SERVER/middleware.mjs
+            // would resolve to dist/_server/middleware.mjs on those hosts.
             if let Ok(rel) = file_path.strip_prefix(out_dir) {
-                let first = rel.components().next().and_then(|c| c.as_os_str().to_str());
-                if matches!(first, Some("_server") | Some("api")) {
+                let first = rel
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                if matches!(first.as_deref(), Some("_server") | Some("api")) {
                     let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
                     let _ = stream.write_all(resp.as_bytes());
                     return;
@@ -1423,6 +1605,197 @@ fn handle_http(
                 }
             }
         }
+    }
+}
+
+/// §7d dev-server middleware evaluation. Same pattern as handle_api_route: a
+/// fresh node process per request imports the compiled module and runs it
+/// against the exact contract the adapter uses. The module exports
+/// `middleware`, `matcher`, and the canonical `__matchPath`; the script does
+/// the matching HERE in one place (the regexes are baked into the compiled
+/// module — no second matcher implementation in Rust).
+///
+/// Outcomes are fail-closed: an import failure, an exception, or a result
+/// that is not one of the three sanctioned shapes becomes Error (500), never
+/// a silent pass-through. nomatch/next both mean "continue to dispatch" —
+/// the caller can't distinguish and doesn't need to.
+#[derive(Debug)]
+enum MiddlewareOutcome {
+    Pass,
+    Redirect { url: String, status: u64 },
+    Respond { status: u64, headers: Vec<(String, String)>, body_bytes: Vec<u8> },
+    Error,
+}
+
+fn eval_middleware(
+    out_dir: &Path,
+    mw_file: &str,
+    method: &str,
+    request_path: &str,
+    head: &str,
+    body: &[u8],
+) -> MiddlewareOutcome {
+    let mjs_path = out_dir.join(mw_file);
+    let abs = match std::fs::canonicalize(&mjs_path) {
+        Ok(p) => p,
+        Err(_) => return MiddlewareOutcome::Error,
+    };
+
+    let headers: Vec<String> = head
+        .lines()
+        .skip(1)
+        .filter(|l| {
+            let lower = l.to_ascii_lowercase();
+            !lower.starts_with("content-length:") && !l.trim().is_empty()
+        })
+        .map(|l| l.to_string())
+        .collect();
+
+    let payload = serde_json::json!({
+        "method": method,
+        "path": request_path,
+        "headers": headers,
+        "bodyBase64": if body.is_empty() { serde_json::Value::Null } else {
+            serde_json::Value::String(base64_encode(body))
+        },
+    })
+    .to_string();
+
+    // F3: the interpreter communicates its envelope through a temp file
+    // passed on argv, NOT stdout. A middleware that console.log()s debug
+    // output must not corrupt (or, worse, be able to forge) the envelope
+    // channel — with stdout as the channel, a stray `console.log` broke
+    // every matched request and a crafted write could fake a pass.
+    //
+    // F3-hardening: Rust creates the file FIRST with O_EXCL + 0600. The path
+    // is therefore a real empty file owned by this process (the temp dir's
+    // sticky bit stops anyone else deleting/replacing it) before node ever
+    // touches it — no attacker-planted symlink can redirect node's write.
+    // node then overwrites the file; Rust reads and removes it.
+    let envelope_path = std::env::temp_dir().join(format!(
+        "marisjs-mw-{}-{}.json",
+        std::process::id(),
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&envelope_path);
+        if created.is_err() {
+            // Path collision (nanos makes it practically impossible) — fail
+            // closed rather than risk reading a stale/foreign file.
+            return MiddlewareOutcome::Error;
+        }
+    }
+
+    // The contract interpreter: build the Request exactly like the api
+    // dispatcher, then match and run. The three shapes are the ONLY results
+    // the middleware can produce (validator-guaranteed at build); anything
+    // else — including an object with an unknown __m — is fail-closed.
+    let script = r#"
+import { readFileSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const out = process.argv[2];
+const emit = (obj) => { writeFileSync(out, JSON.stringify(obj)); process.exit(0); };
+const input = JSON.parse(readFileSync(0, 'utf8'));
+let mod;
+try {
+  mod = await import(pathToFileURL(process.argv[1]).href);
+} catch (e) {
+  emit({ kind: 'error' });
+}
+if (typeof mod.__matchPath !== 'function' || typeof mod.middleware !== 'function') {
+  emit({ kind: 'error' });
+}
+if (!mod.__matchPath(input.path)) {
+  emit({ kind: 'nomatch' });
+}
+const headers = {};
+for (const line of input.headers) {
+  const i = line.indexOf(':');
+  if (i > 0) headers[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+}
+const body = input.bodyBase64 ? Buffer.from(input.bodyBase64, 'base64') : undefined;
+const req = new Request('http://localhost' + input.path, { method: input.method, headers, body });
+try {
+  const result = await mod.middleware(req);
+  if (result && result.__m === 'next') {
+    emit({ kind: 'next' });
+  } else if (result && result.__m === 'redirect') {
+    emit({ kind: 'redirect', url: String(result.url), status: Number(result.status) || 302 });
+  } else if (result && result.__m === 'respond' && result.response instanceof Response) {
+    const buf = Buffer.from(await result.response.arrayBuffer());
+    const outHeaders = [];
+    result.response.headers.forEach((v, k) => { outHeaders.push([k, v]); });
+    emit({ kind: 'respond', status: result.response.status, headers: outHeaders, body: buf.toString('base64') });
+  } else {
+    // Not one of the three sanctioned shapes — fail closed.
+    emit({ kind: 'error' });
+  }
+} catch (e) {
+  emit({ kind: 'error' });
+}
+"#;
+
+    let child = ProcCommand::new("node")
+        .arg("--input-type=module")
+        .arg("-e")
+        .arg(script)
+        .arg(abs.to_str().unwrap_or(""))
+        .arg(&envelope_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let Ok(mut child) = child else {
+        return MiddlewareOutcome::Error;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output();
+    let Ok(out) = out else {
+        return MiddlewareOutcome::Error;
+    };
+
+    let stderr_text = String::from_utf8_lossy(&out.stderr);
+    if !stderr_text.trim().is_empty() {
+        eprintln!("  [middleware] node stderr: {}", stderr_text.trim());
+    }
+
+    let response: serde_json::Value = std::fs::read_to_string(&envelope_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::json!({ "kind": "error" }));
+    let _ = std::fs::remove_file(&envelope_path);
+    match response.get("kind").and_then(|v| v.as_str()).unwrap_or("error") {
+        "nomatch" | "next" => MiddlewareOutcome::Pass,
+        "redirect" => MiddlewareOutcome::Redirect {
+            url: response.get("url").and_then(|v| v.as_str()).unwrap_or("/").to_string(),
+            status: response.get("status").and_then(|v| v.as_u64()).unwrap_or(302),
+        },
+        "respond" => {
+            let status = response.get("status").and_then(|v| v.as_u64()).unwrap_or(200);
+            let mut headers = Vec::new();
+            if let Some(arr) = response.get("headers").and_then(|v| v.as_array()) {
+                for pair in arr {
+                    if let Some(arr) = pair.as_array() {
+                        if arr.len() == 2 {
+                            if let (Some(k), Some(v)) = (arr[0].as_str(), arr[1].as_str()) {
+                                headers.push((k.to_string(), v.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            let body_bytes = base64_decode(response.get("body").and_then(|v| v.as_str()).unwrap_or(""));
+            MiddlewareOutcome::Respond { status, headers, body_bytes }
+        }
+        _ => MiddlewareOutcome::Error,
     }
 }
 

@@ -368,7 +368,39 @@ pub fn check_runtime_collisions(file: &ComponentFile, diagnostics: &mut Vec<Diag
     if emitted.is_empty() {
         return;
     }
+    check_binding_import_collisions(file, &emitted, diagnostics);
+}
 
+/// §7d: middleware additionally emits the three result helpers and the
+/// canonical matcher into the module scope — top-level bindings or imports
+/// named next/redirect/respond/__matchPath would collide with them.
+fn check_middleware_runtime_collisions(
+    file: &ComponentFile,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut emitted: Vec<&str> = Vec::new();
+    if file.has_session_call {
+        emitted.push("session");
+        emitted.push("setSession");
+    }
+    if file.has_env_call || file.has_session_call {
+        emitted.push("env");
+    }
+    emitted.push("next");
+    emitted.push("redirect");
+    emitted.push("respond");
+    emitted.push("__matchPath");
+    if emitted.is_empty() {
+        return;
+    }
+    check_binding_import_collisions(file, &emitted, diagnostics);
+}
+
+fn check_binding_import_collisions(
+    file: &ComponentFile,
+    emitted: &[&str],
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     for binding in &file.top_level_bindings {
         let (name, line, column) = match binding {
             TopLevelBinding::Let { name, line, column, .. }
@@ -987,14 +1019,157 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     diagnostics
 }
 
-/// §7c: dispatches to the API rule set when the file lives
+/// §7d: the middleware.ts rule set — the single request-gating surface, so
+/// every rule here is mandatory.
+///
+/// - The file must export exactly a `middleware` function (MISSING_MIDDLEWARE)
+///   and a `matcher` const (MATCHER_REQUIRED), whose value is a static array
+///   of string literals (MATCHER_NOT_ARRAY / MATCHER_NOT_STRING).
+/// - Every `return` inside the middleware function body must be a direct call
+///   to next()/redirect()/respond() (MIDDLEWARE_RESULT). Anything else is
+///   rejected — a non-sanctioned return is a gate that can silently pass
+///   traffic through.
+/// - A call to next()/redirect()/respond() that is NOT the direct return
+///   value is rejected (MIDDLEWARE_HELPER_NOT_RETURNED): a discarded gate
+///   result is the same silent pass-through.
+/// - The server-only surfaces that middleware may use are session(),
+///   setSession() and env() (same tier as @runsOn api). data() is
+///   page-render-time fetching and has no meaning before routing
+///   (MIDDLEWARE_DATA_CALL). @runsOn is not a middleware directive
+///   (MIDDLEWARE_NO_RUNSON).
+pub fn validate_middleware(file: &ComponentFile) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+
+    if !file.has_middleware_fn {
+        diagnostics.push(Diagnostic::new(
+            "MISSING_MIDDLEWARE",
+            "middleware.ts must export a function named `middleware` — it is the request-gating entry point run before every route.",
+            "Add `export function middleware(req: Request): MiddlewareResult { ... }` (or `export const middleware = (req) => ...`).",
+            Some(file.middleware_fn_line),
+            Some(file.middleware_fn_column),
+        ));
+    }
+
+    if !file.matcher_present {
+        diagnostics.push(Diagnostic::new(
+            "MATCHER_REQUIRED",
+            "middleware.ts must export a `matcher` const — it declares which request paths the middleware applies to.",
+            "Add `export const matcher: string[] = ['/admin/*'];`",
+            None,
+            None,
+        ));
+    } else if file.matcher.is_none() {
+        let (code, detail) = match file.matcher_invalid_reason.as_deref() {
+            Some(reason) if reason.contains("array literal") => (
+                "MATCHER_NOT_ARRAY",
+                "`matcher` must be an array literal of string literals — the value is extracted statically at build time.",
+            ),
+            _ => (
+                "MATCHER_NOT_STRING",
+                "`matcher` must contain only string literals (no spread, no computed values).",
+            ),
+        };
+        diagnostics.push(Diagnostic::new(
+            code,
+            detail,
+            "Rewrite `matcher` as a plain array literal of string patterns, e.g. `['/admin/*']`.",
+            Some(file.matcher_line),
+            Some(file.matcher_column),
+        ));
+    }
+
+    for ret in &file.middleware_returns {
+        if ret.kind == parser::MiddlewareResultKind::Bad {
+            diagnostics.push(Diagnostic::new(
+                "MIDDLEWARE_RESULT",
+                format!(
+                    "middleware return path is not a sanctioned result: {}",
+                    ret.detail
+                ),
+                "Return a direct call to next(), redirect(), or respond() — no ternaries, no bare returns, no other functions.",
+                Some(ret.line),
+                Some(ret.column),
+            ));
+        }
+    }
+
+    // The cross-check: every helper call inside the middleware body must BE
+    // the direct return value of its return statement. A call whose span does
+    // not match a sanctioned return's arg span was discarded.
+    for call in &file.middleware_helper_calls {
+        let is_returned = file
+            .middleware_returns
+            .iter()
+            .any(|ret| ret.arg_span == Some(call.span));
+        if !is_returned {
+            diagnostics.push(Diagnostic::new(
+                "MIDDLEWARE_HELPER_NOT_RETURNED",
+                format!(
+                    "{}() was called but its result is not the direct return value — a gate result that is discarded silently lets the request pass through.",
+                    call.name
+                ),
+                "Return the call directly: `return next();` / `return redirect(url);` / `return respond(res);`.",
+                Some(call.line),
+                Some(call.column),
+            ));
+        }
+    }
+
+    if file.has_data_call {
+        diagnostics.push(Diagnostic::new(
+            "MIDDLEWARE_DATA_CALL",
+            "data() call in middleware.ts — data() is page-render-time fetching; middleware runs before routing and cannot call it.",
+            "Fetch in the middleware with fetch() directly, or move the fetch to the route handler.",
+            Some(file.data_call_line),
+            Some(file.data_call_column),
+        ));
+    }
+
+    if file.runs_on_count > 0 {
+        diagnostics.push(Diagnostic::new(
+            "MIDDLEWARE_NO_RUNSON",
+            "@runsOn directive in middleware.ts — middleware is not a component and has no runsOn placement; it runs on the server before every matching request.",
+            "Remove the @runsOn directive from middleware.ts.",
+            Some(file.runs_on_line),
+            Some(file.runs_on_column),
+        ));
+    }
+
+    check_forbidden_imports(file, &mut diagnostics);
+    check_unsupported_constructs(file, &mut diagnostics);
+    check_middleware_runtime_collisions(file, &mut diagnostics);
+
+    // §7d: a binding inside the middleware function body named next/redirect/
+    // respond shadows the emitted helper — `const next = ...; return next();`
+    // would make a "redirect" silently become a pass-through. Reject it.
+    for shadow in &file.middleware_shadows {
+        diagnostics.push(Diagnostic::new(
+            "MIDDLEWARE_HELPER_SHADOW",
+            format!(
+                "Binding '{}' shadows the emitted middleware result helper — a `return {}()` in scope would call YOUR binding, not the helper, silently changing the gate decision.",
+                shadow.name,
+                shadow.name
+            ),
+            "Rename the binding (the result helpers next/redirect/respond are reserved inside middleware).",
+            Some(shadow.line),
+            Some(shadow.column),
+        ));
+    }
+
+    diagnostics
+}
 /// under an `api/` directory (any ancestor directory named `api` — the
-/// faithful mirror of the CLI build's root-relative `api/` prefix match)
-/// or carries the `@runsOn api` directive; everything else gets the full
-/// component rule set. One dispatch rule, shared by every validator entry
-/// point, so a path can never validate with the wrong rule set.
+/// §7c: dispatches to the API rule set when the file lives under an `api/`
+/// directory (any ancestor directory named `api` — the faithful mirror of
+/// the CLI build's root-relative `api/` prefix match) or carries the
+/// `@runsOn api` directive; §7d middleware.ts gets the middleware rule set;
+/// everything else gets the full component rule set. One dispatch rule,
+/// shared by every validator entry point, so a path can never validate with
+/// the wrong rule set.
 pub fn validate_for_path(file: &ComponentFile, path: &Path) -> Vec<Diagnostic> {
-    let mut diagnostics = if file.runs_on == Some(RunsOn::Api) || path_is_under_api_dir(path) {
+    let mut diagnostics = if file.is_middleware {
+        validate_middleware(file)
+    } else if file.runs_on == Some(RunsOn::Api) || path_is_under_api_dir(path) {
         validate_api(file)
     } else {
         validate(file)

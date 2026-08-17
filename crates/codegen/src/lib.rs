@@ -122,6 +122,147 @@ pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, S
     Ok(output)
 }
 
+/// §7d: middleware codegen. Emits dist/_server/middleware.mjs — a plain ESM
+/// module exporting:
+///
+/// - `matcher` (the user's const, emitted verbatim via module_statements)
+/// - `middleware(req)` — the user's function VERBATIM (TS stripped), wrapped
+///   in the session request context when it uses session()/setSession() (same
+///   seam as api handlers)
+/// - `next`/`redirect`/`respond` — the three result-shape helpers
+/// - `__matchPath(path)` — the SINGLE canonical matcher implementation. It is
+///   the same code path the dev server AND adapter-node delegate to; the
+///   patterns are baked in as precompiled regexes.
+///
+/// The module is self-contained: env()/session() carry the same build-time
+/// snapshot + HMAC runtime as api modules. The user's body is emitted
+/// verbatim, so `return next()` / `return redirect(url)` / `return
+/// respond(res)` just work — the helpers are in module scope.
+pub fn generate_middleware(component: &ComponentFile, env: &EnvMap) -> Result<String, String> {
+    let mut output = String::new();
+
+    for imp in &component.imports {
+        if imp.is_css {
+            continue; // rejected by the validator anyway — never emitted
+        }
+        let source = if imp.source.starts_with("./") || imp.source.starts_with("../") {
+            format!("{}.mjs", imp.source.trim_end_matches(".tsx").trim_end_matches(".ts"))
+        } else {
+            imp.source.clone()
+        };
+        let names = imp
+            .imported_names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!("import {{ {} }} from '{}';\n", names, source));
+    }
+    if !component.imports.is_empty() {
+        output.push('\n');
+    }
+
+    let mut referenced_keys = component.env_call_keys.clone();
+    if component.has_session_call {
+        for key in ["SESSION_SECRET", "NODE_ENV"] {
+            if !referenced_keys.iter().any(|k| k == key) {
+                referenced_keys.push(key.to_string());
+            }
+        }
+    }
+    if component.has_env_call || component.has_session_call {
+        output.push_str(&emit_env_helper(env, &referenced_keys));
+        output.push('\n');
+    }
+
+    if component.has_session_call {
+        output.push_str(&emit_session_block());
+        output.push('\n');
+    }
+
+    // The matcher const (and any other module-level helpers) verbatim, in
+    // source order. `export const matcher` keeps its `export` keyword so the
+    // dev server and adapter-node can read the patterns if they need to.
+    for stmt in &component.module_statements {
+        output.push_str(stmt);
+        output.push('\n');
+    }
+
+    // The three result-shape helpers. The shape contract lives HERE (single
+    // definition of truth): the middleware function returns one of these
+    // objects, and every caller (dev server, adapter-node) switches on
+    // __m without knowing what the middleware did internally.
+    output.push_str("const next = () => ({ __m: 'next' });\n");
+    output.push_str("const redirect = (url, status = 302) => ({ __m: 'redirect', url, status });\n");
+    output.push_str("const respond = (response) => ({ __m: 'respond', response });\n\n");
+
+    // The canonical matcher. Regexes are precompiled here — patterns are
+    // escaped with regex-special chars quoted and `*` widened to `.*`.
+    // Matcher semantics are documented in SPEC §7d: raw pathname (not
+    // decoded), case-sensitive, trailing slashes significant, `*` matches
+    // any run of characters including `/` and empty.
+    let patterns: Vec<String> = match &component.matcher {
+        Some(patterns) => patterns
+            .iter()
+            .map(|pat| {
+                let mut re = String::from("^");
+                for (i, seg) in pat.split('*').enumerate() {
+                    if i > 0 {
+                        re.push_str(".*");
+                    }
+                    for c in seg.chars() {
+                        if "\\^$.|?+()[]{}".contains(c) {
+                            re.push('\\');
+                        }
+                        re.push(c);
+                    }
+                }
+                re.push('$');
+                serde_json::to_string(&re).unwrap_or_else(|_| "\"^$\"".to_string())
+            })
+            .collect(),
+        None => vec![serde_json::to_string("^$").unwrap()],
+    };
+    if patterns.is_empty() {
+        // `export const matcher = []` — documented as matching nothing.
+        output.push_str("export const __matchPath = (path) => { return false; };\n");
+    } else {
+        let regexes: Vec<String> = patterns
+            .iter()
+            .map(|re| format!("new RegExp({})", re))
+            .collect();
+        output.push_str(&format!(
+            "export const __matchPath = (path) => {{\n  return [{}].some((re) => re.test(path));\n}};\n",
+            regexes.join(", ")
+        ));
+    }
+    output.push('\n');
+
+    // The user's middleware function verbatim, session-wrapped when needed.
+    let mut emitted_middleware = false;
+    for (name, source) in &component.exported_fn_sources {
+        if name != "middleware" {
+            continue;
+        }
+        let emitted = if component.has_session_call {
+            wrap_handler_with_session_context(name, source)
+        } else {
+            source.clone()
+        };
+        output.push_str(&emitted);
+        if !emitted.trim_end().ends_with('}') {
+            output.push('\n');
+        }
+        output.push('\n');
+        emitted_middleware = true;
+    }
+    if !emitted_middleware {
+        return Err("no middleware function emitted".to_string());
+    }
+
+    Ok(output)
+}
+
 /// Emits the module-scope env helper carrying the build-time snapshot:
 /// `const env = (key) => ({...values})[key];`. Keys/values are JSON-escaped,
 /// so any value (quotes, newlines, non-ASCII) survives the round trip.

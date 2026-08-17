@@ -710,6 +710,111 @@ client` files — and remain publicly served for hydration.
 as a missing directive (`MISSING_RUNSON`) and fails the build; it is never
 silently reclassified.
 
+### 7d. Middleware
+
+A single request gate for the whole site. Middleware runs on the server for every
+request whose path matches a declared pattern — **before** any page/API route
+dispatch and before any static-file serving. It can allow the request through,
+redirect it, or short-circuit with its own response. It is the v1 answer to
+auth-gating (e.g. "protect `/admin/*` behind a session check"), not a general
+request pipeline.
+
+```ts
+// middleware.ts — project root, sibling to pages/ and api/
+export function middleware(req: Request): MiddlewareResult {
+  const s = session();
+  if (!s) return redirect('/login');
+  return next();
+}
+
+export const matcher: string[] = ['/admin/*'];
+```
+
+**Conventions (validator-enforced):**
+
+- **One file, one function.** The file is exactly `middleware.ts` at the project
+  root. It exports exactly one function, named `middleware`, and one array,
+  named `matcher`. There is exactly one middleware for the whole site — no
+  per-route middleware files, no chaining, no arrays of middlewares. This is
+  the v1 scope, stated plainly.
+- **Signature.** `export function middleware(req: Request): MiddlewareResult`.
+  The function receives the same standard Web `Request` the matched route would
+  receive.
+- **Exactly three sanctioned result shapes, no others.** The function must
+  `return` one of:
+  - `next()` — allow the request through unchanged, proceeding to normal
+    page/API routing.
+  - `redirect(url: string, status?: number)` — send a real HTTP redirect
+    (`status` defaults to `302`). The browser follows it.
+  - `respond(response: Response)` — short-circuit: send the given standard
+    `Response` and **stop** — the matched route's handler is never invoked.
+  Any other return — a bare `return;`, `return undefined`, a return of an
+  arbitrary value, a conditional expression that is not one of the three — is
+  a **hard validator error** (`MIDDLEWARE_RESULT`). These helpers are
+  middleware-scoped runtime functions; a call to `next()`/`redirect()`/
+  `respond()` that is **not** the direct return value of the function is also
+  a hard error (`MIDDLEWARE_HELPER_NOT_RETURNED`) — a discarded gate result is
+  a silent pass-through waiting to happen.
+- **Matcher semantics — exact and unambiguous (this is a security property, not
+  a convenience):**
+  - `matcher` must be present and an array of strings (`MATCHER_REQUIRED` /
+    `MATCHER_NOT_ARRAY` / `MATCHER_NOT_STRING`).
+  - Matching is performed against the request **pathname** exactly as received
+    from the request line (percent-encoding preserved, **not** URL-decoded,
+    matching how routing itself matches). Routing and middleware agree by
+    construction, so an encoded variant cannot slip past the gate to a route
+    that only the raw pathname reaches — both see the same string.
+  - **Case-sensitive.** `/Admin/*` and `/admin/*` are different patterns.
+  - **Trailing slashes are significant.** `/admin` matches only `/admin`;
+    `/admin/` matches only `/admin/`; `/admin/*` matches `/admin/`,
+    `/admin/anything`, and `/admin/a/b` — but not `/admin` (the `*` may match
+    an empty run, but the literal `/` after `admin` must be present). To match
+    a directory with or without its trailing slash, write `/admin*` (a bare
+    `*` matches any run of characters including `/` and the empty string).
+  - `*` is the only wildcard: it matches any run of characters (including `/`
+    and the empty string). Everything else is literal. There is no `?` and no
+    character class. `*` alone matches every path.
+  - An empty `matcher` array (`[]`) matches nothing — middleware never runs.
+  - A request matches if **any** pattern matches (the array is an OR).
+- **`session()` and `env()` are callable inside `middleware.ts`** — the same
+  enforcement tier as `@runsOn api`. The session secret gate applies: a
+  middleware that calls `session()`/`setSession()` must build with a strong
+  `SESSION_SECRET`. `data()` is **not** callable (`MIDDLEWARE_DATA_CALL`) — it
+  is page-render-time fetching, and middleware is a request gate, not a renderer.
+  A `@runsOn` directive is not allowed in `middleware.ts` (`MIDDLEWARE_NO_RUNSON`);
+  middleware is implicitly server-side for the whole site. The reserved runtime
+  names in `middleware.ts` are `middleware`, `matcher`, `next`, `redirect`,
+  `respond`, `session`, `setSession`, `env`, and `__matchPath` — a user binding
+  with any of them is a hard error (`RUNTIME_NAME_COLLISION`), same mechanism
+  as session files.
+- Middleware is compiled into the private `dist/_server/` tree (E4-01): it is
+  only reachable through the server dispatchers, never served statically.
+
+**Documented v1 limitations (deliberate, honest tradeoffs — the same tone as
+every other v1 limitation in this spec):**
+
+- **No response rewriting or header injection on `next()`-ed requests.** If
+  middleware returns `next()`, the request proceeds untouched — middleware
+  cannot add headers to, rewrite the body of, or otherwise mutate the eventual
+  response. If you need to stamp a header on every response, that is per-route
+  handler code, not middleware.
+- **No multi-file middleware chaining.** Exactly one middleware for the site.
+  Composability is application code: call one function from another inside
+  `middleware.ts`.
+- **Middleware must not consume the request body unless it `respond()`s.** The
+  matched route receives the request fresh; if middleware has already read the
+  body stream (adapter-node passes a streaming body), the handler's body is
+  consumed. Gates that need the body (e.g. validating a signature) should
+  `respond()` or `redirect()` after reading it, never `next()`. The dev server
+  buffers bodies in memory, so this asymmetry is dev-only-invisible — the
+  adapter is the source of truth.
+
+**Routing precedence:** middleware evaluation runs first (for matched paths);
+then API routes (which still dispatch before page routes — a matched `/api/*`
+request that middleware `next()`s falls through to the API dispatcher); then
+page routes / SSR; then static files. `redirect()` and `respond()` return
+without touching any of them.
+
 ---
 
 ## 8. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)

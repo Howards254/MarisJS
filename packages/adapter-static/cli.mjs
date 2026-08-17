@@ -63,6 +63,21 @@ if (serverRoutes.length > 0) {
   process.exit(1);
 }
 
+// §7d: fail-loud — middleware executes server code (auth gating, redirects,
+// session reads) on every matching request before any route. A static host
+// cannot run it. A build that declares middleware is never static, no matter
+// how static its pages are.
+if (manifest.middleware) {
+  console.error(`Error: build declares middleware (${manifest.middleware.file}).`);
+  console.error('This adapter only produces fully static output.');
+  console.error('Middleware runs server-side on every matching request and cannot run on a static host.');
+  console.error('Use one of these options:');
+  console.error('  1. Remove middleware.ts to make the build fully static.');
+  console.error('  2. Use @marisjs/adapter-node for a server that runs middleware.');
+  console.error('  3. Use a platform adapter (Vercel, Netlify) that supports request middleware.');
+  process.exit(1);
+}
+
 // ── Copy static files ───────────────────────────────────────────────────
 
 console.log(`Validating static build: ${manifest.routes.length} route(s), all mode "static"`);

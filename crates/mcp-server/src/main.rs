@@ -142,7 +142,25 @@ fn dispatch(input: ValidateInput) -> ValidateResult {
 /// validator's validate_for_path (ancestor-api-dir or @runsOn api
 /// directive) — no second, possibly-divergent classification here.
 fn validate_path_dispatch(path: &str) -> ValidateResult {
-    match parser::parse_component_file(path) {
+    // §7d: ONLY the project-root middleware.ts is the middleware — a file
+    // named middleware.ts nested under api/, pages/ or components/ is an
+    // ordinary module and must validate with its own rule set (the CLI
+    // honors exactly the root file). Mirror that here: treat the file as
+    // middleware only when no ancestor directory is one of the known
+    // project subdirectories.
+    let p = std::path::Path::new(path);
+    let is_root_middleware = p.file_name().map_or(false, |n| n == "middleware.ts")
+        && !p.ancestors().skip(1).any(|anc| {
+            anc.file_name().map_or(false, |f| {
+                matches!(f.to_str(), Some("api") | Some("pages") | Some("components"))
+            })
+        });
+    let parsed = if is_root_middleware {
+        parser::parse_middleware_file(path)
+    } else {
+        parser::parse_component_file(path)
+    };
+    match parsed {
         Ok(component) => {
             diagnostics_to_result(validator::validate_for_path(&component, std::path::Path::new(path)))
         }
