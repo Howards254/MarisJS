@@ -102,7 +102,7 @@ if [ $EXIT_CODE -ne 0 ]; then
   fail "npx marisjs --version exited with code $EXIT_CODE: $OUTPUT"
 fi
 
-EXPECTED="marisjs 0.1.0"
+EXPECTED="marisjs $(node -e "console.log(require('./packages/marisjs/package.json').version)")"
 if [ "$OUTPUT" = "$EXPECTED" ]; then
   pass "version output matches: '$OUTPUT'"
 else
