@@ -669,6 +669,35 @@ fn collect_hydrate(node: &JsxNode, names: &mut Vec<String>) {
     }
 }
 
+/// §7e (v1.1): hydrate islands WITH children get a different mount call — the
+/// script adopts `el.firstChild` as the children value instead of passing
+/// props only. Dedupes by name like collect_hydrate (one import, all mounts).
+pub fn collect_hydrate_roots_with_children(node: &JsxNode) -> Vec<(String, bool)> {
+    let mut roots = Vec::new();
+    collect_hydrate_flags(node, &mut roots);
+    roots
+}
+
+fn collect_hydrate_flags(node: &JsxNode, roots: &mut Vec<(String, bool)>) {
+    match node {
+        JsxNode::Element { tag, is_hydrate_root, children, .. } => {
+            if *is_hydrate_root && !roots.iter().any(|(name, _)| name == tag) {
+                let has_children = !parser::real_children(children).is_empty();
+                roots.push((tag.clone(), has_children));
+            }
+            for child in children {
+                collect_hydrate_flags(child, roots);
+            }
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            collect_hydrate_flags(cons, roots);
+            collect_hydrate_flags(alt, roots);
+        }
+        JsxNode::ForEach { body, .. } => collect_hydrate_flags(body, roots),
+        _ => {}
+    }
+}
+
 fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> Result<(), String> {
     match node {
         JsxNode::Text(text) => {
@@ -687,11 +716,26 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
                 // Emit the REAL props object (computed at SSR render time, so
                 // dynamic values work) into the placeholder. The client-side
                 // mount call reads them back via dataset.props.
+                // §7e (v1.1): children are rendered INSIDE the placeholder —
+                // they are server-composed by construction (children of a
+                // server page's hydrate island cannot be client-reactive), so
+                // the mount script adopts el.firstChild as the children value
+                // instead of serializing it. gen_html_children drops
+                // whitespace-only text, so the placeholder contains exactly
+                // the children root with no incidental whitespace siblings.
                 let props_arg = build_props_object(attrs)?;
-                output.push_str(&format!(
-                    "'<div data-hydrate=\"{}\" data-props=\\'' + JSON.stringify({}) + '\\'></div>'",
+                let mut placeholder = format!(
+                    "'<div data-hydrate=\"{}\" data-props=\\'' + JSON.stringify({}) + '\\'",
                     tag, props_arg
-                ));
+                );
+                if let Some(children_expr) = gen_html_children(children, parent_is_async)? {
+                    placeholder.push_str(">' + ");
+                    placeholder.push_str(&children_expr);
+                    placeholder.push_str(" + '</div>'");
+                } else {
+                    placeholder.push_str("></div>'");
+                }
+                output.push_str(&placeholder);
                 return Ok(());
             }
             if *is_component {

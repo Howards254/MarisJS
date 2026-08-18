@@ -1616,21 +1616,6 @@ fn convert_jsx_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
         .collect();
     let children: Vec<JsxNode> = el.children.iter().map(|c| convert_jsx_child(c, cm, errors)).collect();
 
-    // §7e: hydration serializes props as JSON into data-props — a children
-    // DOM subtree cannot be serialized, and the SSR placeholder could not
-    // match the client-rendered content. children + client:hydrate on the
-    // same element is a hard parse error (v1 limitation, stated in §7e).
-    if is_hydrate && has_real_children(&children) {
-        errors.push(ParserError {
-            code: "UNSUPPORTED_JSX_CONSTRUCT",
-            message: format!(
-                "<{} client:hydrate> with nested children — hydration components receive props only; a children subtree cannot be serialized into the SSR placeholder",
-                tag
-            ),
-            fix_hint: "Move the nested content out of the hydrate component and pass it via typed props instead.",
-        });
-    }
-
     JsxNode::Element {
         tag,
         attrs,

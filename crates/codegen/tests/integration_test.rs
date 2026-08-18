@@ -7431,3 +7431,353 @@ if (ok) {
 "#;
     run_node(&dir, runner);
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase E6 v1.1 — hydrate islands with children (SSR + adoption)
+// ═══════════════════════════════════════════════════════════════
+
+/// The server page renders the children INSIDE the hydrate placeholder, and
+/// the mount script uses the adoption form (children: _children) instead of
+/// the props-only form.
+#[test]
+fn hydrate_island_renders_children_into_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Panel.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type PanelProps = { title: string; children: JSX.Element; };\n",
+            "export function Panel(props: PanelProps) {\n",
+            "  return (\n",
+            "    <div class=\"panel\">\n",
+            "      <h2>{props.title}</h2>\n",
+            "      {props.children}\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Panel } from '../components/Panel';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return (\n",
+            "    <Panel title={'Notice'} client:hydrate>\n",
+            "      <p class=\"nested\">Nested</p>\n",
+            "    </Panel>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    let placeholder_start = html.find("data-hydrate=\"Panel\"").expect("placeholder present");
+    let children_pos = html.find("<p class=\"nested\">Nested</p>").expect("children present");
+    let placeholder_end = html.find("</div>").expect("closing div");
+
+    assert!(
+        placeholder_start < children_pos && children_pos < placeholder_end,
+        "children must be nested INSIDE the placeholder"
+    );
+    assert!(
+        html.contains("children: _children"),
+        "mount script must use the adoption form, got:\n{}",
+        html
+    );
+}
+
+/// Text-only children: the placeholder holds exactly the text node with NO
+/// incidental whitespace siblings — the firstChild adoption contract depends
+/// on it (the architect's whitespace condition).
+#[test]
+fn hydrate_island_text_only_child_whitespace_guarantee() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Badge.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type BadgeProps = { children: JSX.Element; };\n",
+            "export function Badge(props: BadgeProps) {\n",
+            "  return <span class=\"badge\">{props.children}</span>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Badge } from '../components/Badge';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return (\n",
+            "    <Badge client:hydrate>New</Badge>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    // The placeholder must contain ONLY the text — no whitespace siblings.
+    assert!(
+        html.contains("data-hydrate=\"Badge\" data-props='{}'>New</div>"),
+        "placeholder must hold exactly the text child with no whitespace, got:\n{}",
+        html
+    );
+
+    // End-to-end: adopting firstChild yields a text node whose content is New.
+    let runner = format!(
+        r#"import {{ JSDOM }} from 'jsdom';
+import {{ mount }} from '@marisjs/runtime';
+import {{ Badge }} from './dist/components/Badge.mjs';
+
+const html = {html:?};
+const dom = new JSDOM(html, {{ url: 'http://localhost/' }});
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+
+for (const el of document.querySelectorAll('[data-hydrate="Badge"]')) {{
+  const _children = el.firstChild;
+  if (_children) _children.remove();
+  mount(el, () => Badge({{ ...(el.dataset.props ? JSON.parse(el.dataset.props) : {{}}), children: _children }}));
+}}
+
+const badge = dom.window.document.querySelector('.badge');
+const ok = badge !== null
+    && badge.textContent === 'New'
+    && badge.childNodes.length === 1
+    && badge.firstChild.nodeType === 3;
+
+if (ok) {{
+    console.log('PASS');
+}} else {{
+    console.error('FAIL', {{
+        text: badge ? badge.textContent : null,
+        childNodes: badge ? badge.childNodes.length : null,
+        nodeType: badge && badge.firstChild ? badge.firstChild.nodeType : null,
+    }});
+    process.exit(1);
+}}
+"#,
+        html = html
+    );
+    run_node(&dir, &runner);
+}
+
+/// End-to-end adoption in a real DOM: the mount loop in the generated page
+/// detaches el.firstChild, mounts the island, and the wrapper re-places the
+/// adopted node at its {props.children} position.
+#[test]
+fn hydrate_adopts_children_in_browser() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Panel.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type PanelProps = { title: string; children: JSX.Element; };\n",
+            "export function Panel(props: PanelProps) {\n",
+            "  return (\n",
+            "    <div class=\"panel\">\n",
+            "      <h2>{props.title}</h2>\n",
+            "      {props.children}\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Panel } from '../components/Panel';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return (\n",
+            "    <Panel title={'Notice'} client:hydrate>\n",
+            "      <p class=\"nested\">Nested</p>\n",
+            "    </Panel>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+
+    let runner = format!(
+        r#"import {{ JSDOM }} from 'jsdom';
+import {{ mount }} from '@marisjs/runtime';
+import {{ Panel }} from './dist/components/Panel.mjs';
+
+const dom = new JSDOM({html:?}, {{ url: 'http://localhost/' }});
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+
+for (const el of document.querySelectorAll('[data-hydrate="Panel"]')) {{
+  const _children = el.firstChild;
+  if (_children) _children.remove();
+  mount(el, () => Panel({{ ...(el.dataset.props ? JSON.parse(el.dataset.props) : {{}}), children: _children }}));
+}}
+
+const panel = dom.window.document.querySelector('.panel');
+const h2 = dom.window.document.querySelector('h2');
+const nested = dom.window.document.querySelector('.nested');
+
+const ok = panel !== null
+    && h2 !== null && h2.textContent === 'Notice'
+    && nested !== null && nested.textContent === 'Nested'
+    && panel.contains(nested);
+
+if (ok) {{
+    console.log('PASS');
+}} else {{
+    console.error('FAIL', {{
+        h2: h2 ? h2.textContent : null,
+        nested: nested ? nested.textContent : null,
+        insidePanel: nested !== null && panel !== null && panel.contains(nested),
+    }});
+    process.exit(1);
+}}
+"#,
+        html = html
+    );
+    run_node(&dir, &runner);
+}
+
+/// Nested hydrate islands inside children: the outer island adopts the inner
+/// placeholder (moving, not destroying it) and the inner island hydrates into
+/// its new position — document-order mounting makes this work.
+#[test]
+fn hydrate_nested_islands_inside_children() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Panel.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type PanelProps = { children: JSX.Element; };\n",
+            "export function Panel(props: PanelProps) {\n",
+            "  return <div class=\"panel\">{props.children}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        components.join("Widget.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type WidgetProps = { label: string; };\n",
+            "export function Widget(props: WidgetProps) {\n",
+            "  return <button class=\"wbtn\">{props.label}</button>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Panel } from '../components/Panel';\n",
+            "import { Widget } from '../components/Widget';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return (\n",
+            "    <Panel client:hydrate>\n",
+            "      <Widget label={'Go'} client:hydrate />\n",
+            "    </Panel>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    // SSR: the Widget placeholder must be nested inside the Panel placeholder.
+    let panel_pos = html.find("data-hydrate=\"Panel\"").expect("panel placeholder");
+    let widget_pos = html.find("data-hydrate=\"Widget\"").expect("widget placeholder");
+    assert!(panel_pos < widget_pos, "widget placeholder must be inside panel placeholder");
+
+    let runner = format!(
+        r#"import {{ JSDOM }} from 'jsdom';
+import {{ mount }} from '@marisjs/runtime';
+import {{ Panel }} from './dist/components/Panel.mjs';
+import {{ Widget }} from './dist/components/Widget.mjs';
+
+const dom = new JSDOM({html:?}, {{ url: 'http://localhost/' }});
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+
+for (const el of document.querySelectorAll('[data-hydrate="Panel"]')) {{
+  const _children = el.firstChild;
+  if (_children) _children.remove();
+  mount(el, () => Panel({{ ...(el.dataset.props ? JSON.parse(el.dataset.props) : {{}}), children: _children }}));
+}}
+for (const el of document.querySelectorAll('[data-hydrate="Widget"]')) {{
+  mount(el, () => Widget(el.dataset.props ? JSON.parse(el.dataset.props) : {{}}));
+}}
+
+const panel = dom.window.document.querySelector('.panel');
+const btn = dom.window.document.querySelector('.wbtn');
+
+const ok = panel !== null
+    && btn !== null && btn.textContent === 'Go'
+    && panel.contains(btn);
+
+if (ok) {{
+    console.log('PASS');
+}} else {{
+    console.error('FAIL', {{
+        btn: btn ? btn.textContent : null,
+        insidePanel: btn !== null && panel !== null && panel.contains(btn),
+    }});
+    process.exit(1);
+}}
+"#,
+        html = html
+    );
+    run_node(&dir, &runner);
+}

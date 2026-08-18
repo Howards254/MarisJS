@@ -76,7 +76,7 @@ struct PageRoute {
     route: String,
     html_file: String,
     mjs_rel: String,
-    page_roots: Vec<(String, String)>,
+    page_roots: Vec<(String, String, bool)>,
     css_files: Vec<String>,
     has_data: bool,
 }
@@ -705,12 +705,16 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                     // adapter-node's SSR dispatcher, never served statically.
                     let mjs_rel = format!("_server/{}", normalize_path(&rel.with_extension("mjs")));
 
-                    // Collect hydrate roots for THIS page specifically
-                    let mut page_roots: Vec<(String, String)> = Vec::new();
+                    // Collect hydrate roots for THIS page specifically.
+                    // §7e (v1.1): the third tuple element reports whether the
+                    // island receives children — its mount call must adopt
+                    // el.firstChild as the children value (children are
+                    // server-rendered inside the placeholder at SSR time).
+                    let mut page_roots: Vec<(String, String, bool)> = Vec::new();
                     if let Some(ref tree) = component.render_tree {
-                        for root_name in codegen::collect_hydrate_roots(tree) {
+                        for (root_name, has_children) in codegen::collect_hydrate_roots_with_children(tree) {
                             let import_path = resolve_client_import(rel, &root_name, &component.imports)?;
-                            page_roots.push((root_name, import_path));
+                            page_roots.push((root_name, import_path, has_children));
                         }
                     }
                     page_routes.push(PageRoute {
@@ -1101,7 +1105,7 @@ fn generate_page_html(out_dir: &Path, page: &PageRoute) -> Result<Option<String>
     if !page.page_roots.is_empty() {
         html.push_str("    import { mount } from '@marisjs/runtime';\n");
         let mut seen = std::collections::HashSet::new();
-        for (name, path) in &page.page_roots {
+        for (name, path, _has_children) in &page.page_roots {
             if !seen.insert(name.clone()) {
                 continue; // exactly ONE import per island component
             }
@@ -1114,15 +1118,28 @@ fn generate_page_html(out_dir: &Path, page: &PageRoute) -> Result<Option<String>
             };
             html.push_str(&format!("    import {{ {} }} from '{}';\n", name, import_ref));
         }
-        for (name, _path) in &page.page_roots {
+        for (name, _path, has_children) in &page.page_roots {
             // Mount EVERY instance: a page may use the same island several
             // times (or inside a <For>), so target all matching placeholders.
             // Each placeholder carries its own data-props, serialized at SSR
             // render time (fallback {} for HTML not produced by this compiler).
-            html.push_str(&format!(
-                "    for (const el of document.querySelectorAll('[data-hydrate=\"{}\"]')) {{ mount(el, () => {}(el.dataset.props ? JSON.parse(el.dataset.props) : {{}})); }}\n",
-                name, name
-            ));
+            // §7e (v1.1): islands with children adopt el.firstChild as the
+            // children value — SSR rendered the children INTO the placeholder
+            // (whitespace-only text is dropped, so firstChild is exactly the
+            // children root, element or text node). Detach BEFORE mount: the
+            // wrapper re-appends it at its {props.children} position, and an
+            // instance that received no children gets an empty text node.
+            if *has_children {
+                html.push_str(&format!(
+                    "    for (const el of document.querySelectorAll('[data-hydrate=\"{}\"]')) {{ const _children = el.firstChild; if (_children) _children.remove(); mount(el, () => {}({{ ...(el.dataset.props ? JSON.parse(el.dataset.props) : {{}}), children: _children }})); }}\n",
+                    name, name
+                ));
+            } else {
+                html.push_str(&format!(
+                    "    for (const el of document.querySelectorAll('[data-hydrate=\"{}\"]')) {{ mount(el, () => {}(el.dataset.props ? JSON.parse(el.dataset.props) : {{}})); }}\n",
+                    name, name
+                ));
+            }
         }
     }
     html.push_str("  </script>\n</body>\n</html>\n");
@@ -1249,7 +1266,7 @@ fn generate_routes_json(
     has_middleware: bool,
 ) -> Result<(), String> {
     let entries: Vec<RouteEntry> = page_routes.iter().map(|page| {
-        let modules: Vec<ClientModuleEntry> = page.page_roots.iter().map(|(name, path)| {
+        let modules: Vec<ClientModuleEntry> = page.page_roots.iter().map(|(name, path, _has_children)| {
             ClientModuleEntry { name: name.clone(), path: path.clone() }
         }).collect();
         let mode = if page.has_data { "server" } else { "static" };

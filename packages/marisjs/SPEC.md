@@ -862,10 +862,18 @@ form" discipline the language applies to ternaries, `<For>`, and event handlers.
   type file is the single source of truth there.
 - The `children` field's declared type is `JSX.Element` — a declaration convention like
   every other type in the language (the compiler strips annotations, never type-checks).
-- `client:hydrate` components cannot receive children. Hydration serializes props as
-  JSON into `data-props` at SSR time; a DOM node cannot be serialized, and the SSR
-  placeholder would not match the client-rendered content. Hydrate components receive
-  props only (`UNSUPPORTED_JSX_CONSTRUCT` if children are passed).
+- `client:hydrate` components MAY receive children — the children are server-composed by
+  construction (the server page that renders the island built them), so SSR renders the
+  children INSIDE the placeholder (`<div data-hydrate="X" data-props='...'>` +
+  children markup). The mount script then ADOPTS the existing DOM node as the `children`
+  value (`el.firstChild` — whitespace-only text is dropped, so the placeholder holds
+  exactly the single children root, element or text node) and the wrapper places it via
+  the normal `{props.children}` path. No serialization, no re-parsing, no
+  reconciliation: the client renders the exact same server-composed content, so the
+  placeholder and the client-rendered wrapper always match. This is transport, not
+  transformation — the "no transform" rule above is untouched. Nested hydrate islands
+  inside children hydrate correctly because adoption moves (never destroys) the nested
+  placeholder and mount loops run in document order (outer island first).
 
 **Documented v1 limitations (deliberate, honest tradeoffs — the same tone as every other
 v1 limitation in this spec):**
