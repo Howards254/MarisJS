@@ -140,6 +140,27 @@ pub struct JsxAttr {
     pub contains_env_call: bool,
 }
 
+/// §7e: one field of a component's Props type, extracted statically from the
+/// file's type declaration. `children` presence is what the validator checks
+/// for UNEXPECTED_CHILDREN.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PropField {
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+}
+
+/// §7e: a module-level `type X = { ... }` / `interface X { ... }` declaration.
+/// `complete` is false when the declaration's fields cannot be fully seen
+/// (interface `extends`, intersection/union/other non-literal type) — the
+/// children check must not guess in that case (fail-safe: no false positives).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDecl {
+    pub name: String,
+    pub fields: Vec<PropField>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsxNode {
     Element {
@@ -177,6 +198,17 @@ pub struct ComponentFile {
     pub runs_on_column: usize,
     pub exports: Vec<ExportInfo>,
     pub props: Option<PropsInfo>,
+    /// §7e: the Props type's field list, when the type is declared in this
+    /// file (`type X = { ... }` or `interface X { ... }`, name matching the
+    /// props parameter's annotation). None when the type is imported from a
+    /// *.types.ts file, or when the props parameter is untyped/any — in those
+    /// cases the UNEXPECTED_CHILDREN check cannot see the fields and skips.
+    pub props_type: Option<TypeDecl>,
+    /// Every module-level type alias / interface declaration in the file,
+    /// keyed by declared name. Resolved against the props parameter's type
+    /// annotation after the walk (declarations precede the component in
+    /// source order, so resolution must happen post-walk, not inline).
+    pub type_decls: Vec<TypeDecl>,
     pub imports: Vec<ImportInfo>,
     pub top_level_bindings: Vec<TopLevelBinding>,
     pub jsx_expressions: Vec<JsxExprInfo>,
@@ -265,6 +297,8 @@ impl ComponentFile {
             runs_on_column: 0,
             exports: Vec::new(),
             props: None,
+            props_type: None,
+            type_decls: Vec::new(),
             imports: Vec::new(),
             top_level_bindings: Vec::new(),
             jsx_expressions: Vec::new(),
@@ -709,6 +743,17 @@ fn walk_module(cm: &SourceMap, module: &Module, file: &mut ComponentFile) {
         pending_middleware_fn: false,
     };
     module.visit_with(&mut extractor);
+
+    // §7e: resolve the props parameter's type annotation against the file's
+    // module-level type declarations (declarations come first in source
+    // order, so this resolution must happen after the full walk).
+    if let Some(props) = &extractor.file.props {
+        if let TypeAnnotation::Named(name) = &props.type_annotation {
+            if let Some(decl) = extractor.file.type_decls.iter().find(|d| &d.name == name) {
+                extractor.file.props_type = Some(decl.clone());
+            }
+        }
+    }
 }
 
 impl Visit for Extractor<'_> {
@@ -841,6 +886,38 @@ impl Visit for Extractor<'_> {
             self.extract_fn_props(&fn_expr.function, name);
         }
 
+        n.visit_children_with(self);
+    }
+
+    fn visit_ts_type_alias_decl(&mut self, n: &TsTypeAliasDecl) {
+        // §7e: record module-level `type X = { ... }` declarations so the
+        // validator can see the Props type's fields. Module-level only — a
+        // type nested in a function body cannot be a Props type.
+        if self.depth == 0 && !n.declare {
+            let name = n.id.sym.to_string();
+            let (fields, complete) = match &*n.type_ann {
+                TsType::TsTypeLit(lit) => (extract_type_fields(self.cm, &lit.members), true),
+                _ => (Vec::new(), false),
+            };
+            self.file.type_decls.push(TypeDecl { name, fields, complete });
+        }
+        n.visit_children_with(self);
+    }
+
+    fn visit_ts_interface_decl(&mut self, n: &TsInterfaceDecl) {
+        // §7e: same recording for `interface X { ... }`. An interface with an
+        // `extends` clause inherits fields this file cannot see — mark it
+        // incomplete (the children check must not guess).
+        if self.depth == 0 {
+            let name = n.id.sym.to_string();
+            let complete = n.extends.is_empty();
+            let fields = if complete {
+                extract_type_fields(self.cm, &n.body.body)
+            } else {
+                Vec::new()
+            };
+            self.file.type_decls.push(TypeDecl { name, fields, complete });
+        }
         n.visit_children_with(self);
     }
 
@@ -1406,13 +1483,54 @@ fn extract_type_annotation(ts_type_ann: &Option<Box<TsTypeAnn>>) -> TypeAnnotati
                 TsKeywordTypeKind::TsAnyKeyword => TypeAnnotation::Any,
                 _ => TypeAnnotation::Named(format_type(&*type_ann.type_ann)),
             },
+            // §7e: a type reference must resolve to its plain declared name
+            // (`CardProps`), not a Debug-formatted dump of the whole node —
+            // the UNEXPECTED_CHILDREN check matches it against the file's
+            // type declarations by name.
+            TsType::TsTypeRef(ty_ref) => match &ty_ref.type_name {
+                TsEntityName::Ident(ident) => TypeAnnotation::Named(ident.sym.to_string()),
+                TsEntityName::TsQualifiedName(qualified) => {
+                    TypeAnnotation::Named(last_ident_of_qualified(&qualified))
+                }
+            },
             other => TypeAnnotation::Named(format_type(other)),
         },
     }
 }
 
+fn last_ident_of_qualified(qualified: &TsQualifiedName) -> String {
+    // This SWC version models TsQualifiedName.right as a plain Ident —
+    // the last segment is always what the props annotation names.
+    qualified.right.sym.to_string()
+}
+
 fn format_type(ty: &TsType) -> String {
     format!("{:?}", ty)
+}
+
+/// §7e: extract the named fields of a type-literal body (`{ title: string;
+/// children: JSX.Element; }`). Method signatures, index signatures, getters
+/// and computed names are not fields a caller could pass as children — they
+/// are skipped (only the `children` name matters for the check, and a
+/// computed/oddly-named property cannot be spelled as a JSX attribute anyway).
+fn extract_type_fields(cm: &SourceMap, members: &[TsTypeElement]) -> Vec<PropField> {
+    let mut fields = Vec::new();
+    for member in members {
+        if let TsTypeElement::TsPropertySignature(sig) = member {
+            // This SWC version models the key as a plain expression:
+            // `title: string` → Expr::Ident, `'x': string` → Expr::Lit(Str).
+            // Computed keys (Expr::Member etc.) cannot be spelled as a JSX
+            // attribute — skipped.
+            let name = match &*sig.key {
+                Expr::Ident(ident) => ident.sym.to_string(),
+                Expr::Lit(Lit::Str(s)) => s.value.to_string(),
+                _ => continue,
+            };
+            let (line, col) = pos(cm, sig.span);
+            fields.push(PropField { name, line, column: col });
+        }
+    }
+    fields
 }
 
 fn is_dot_map_call(call: &CallExpr) -> bool {
@@ -1460,6 +1578,13 @@ fn convert_jsx_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
         return extract_for_element(el, cm, errors);
     }
 
+    let is_component = tag
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+        && tag != "For";
+
     let mut is_hydrate = false;
     let attrs: Vec<JsxAttr> = el
         .opening
@@ -1470,18 +1595,41 @@ fn convert_jsx_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
                 is_hydrate = true;
                 None
             } else {
+                // §7e: `children={...}` on a component is rejected — nested
+                // JSX between the tags is the single sanctioned channel. The
+                // check is AST-based (attr name from the syntax tree, not
+                // text matching); intrinsics keep their attribute behavior.
+                if is_component && jsx_attr_name_is_children(a) {
+                    errors.push(ParserError {
+                        code: "CHILDREN_ATTRIBUTE",
+                        message: format!(
+                            "'children={{{{...}}}}' attribute on <{}> — children is a prop sourced from nested JSX syntax, not from an attribute",
+                            tag
+                        ),
+                        fix_hint: "Pass nested JSX between the component's tags instead: <Component>...content...</Component>.",
+                    });
+                    return None;
+                }
                 convert_jsx_attr_or_spread(a, errors)
             }
         })
         .collect();
-    let children = el.children.iter().map(|c| convert_jsx_child(c, cm, errors)).collect();
+    let children: Vec<JsxNode> = el.children.iter().map(|c| convert_jsx_child(c, cm, errors)).collect();
 
-    let is_component = tag
-        .chars()
-        .next()
-        .map(|c| c.is_uppercase())
-        .unwrap_or(false)
-        && tag != "For";
+    // §7e: hydration serializes props as JSON into data-props — a children
+    // DOM subtree cannot be serialized, and the SSR placeholder could not
+    // match the client-rendered content. children + client:hydrate on the
+    // same element is a hard parse error (v1 limitation, stated in §7e).
+    if is_hydrate && has_real_children(&children) {
+        errors.push(ParserError {
+            code: "UNSUPPORTED_JSX_CONSTRUCT",
+            message: format!(
+                "<{} client:hydrate> with nested children — hydration components receive props only; a children subtree cannot be serialized into the SSR placeholder",
+                tag
+            ),
+            fix_hint: "Move the nested content out of the hydrate component and pass it via typed props instead.",
+        });
+    }
 
     JsxNode::Element {
         tag,
@@ -1489,6 +1637,70 @@ fn convert_jsx_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
         children,
         is_hydrate_root: is_hydrate,
         is_component,
+    }
+}
+
+/// §7e: true when a JSX attribute is literally named `children`. AST-based
+/// (parsed attr name, never text matching).
+fn jsx_attr_name_is_children(attr: &JSXAttrOrSpread) -> bool {
+    if let JSXAttrOrSpread::JSXAttr(attr) = attr {
+        if let JSXAttrName::Ident(ident) = &attr.name {
+            return ident.sym.as_ref() == "children";
+        }
+    }
+    false
+}
+
+/// §7e: does a children list contain anything that is not whitespace-only
+/// text? `<Card>\n</Card>` (formatting artifacts) passes no children;
+/// `<Card>Hello</Card>` passes text. Used by the parser (hydrate rejection)
+/// and by the codegen (children prop emission) — one source of truth.
+pub fn has_real_children(children: &[JsxNode]) -> bool {
+    children.iter().any(|c| match c {
+        JsxNode::Text(t) => !t.trim().is_empty(),
+        _ => true,
+    })
+}
+
+/// §7e: the children minus whitespace-only text nodes (formatting artifacts
+/// like the collapsed newlines around multi-line nested JSX).
+pub fn real_children(children: &[JsxNode]) -> Vec<&JsxNode> {
+    children
+        .iter()
+        .filter(|c| match c {
+            JsxNode::Text(t) => !t.trim().is_empty(),
+            _ => true,
+        })
+        .collect()
+}
+
+/// §7e: the tags of every component called with real nested children, walked
+/// depth-first (deduplicated). The CLI resolves each tag to its target file
+/// and runs the UNEXPECTED_CHILDREN check against the target's Props type —
+/// a single file cannot know its neighbors' Props types, so the call-site
+/// walk and the target resolution are separate concerns.
+pub fn collect_children_call_tags(tree: &JsxNode) -> Vec<String> {
+    let mut tags = Vec::new();
+    collect_children_call_tags_in(tree, &mut tags);
+    tags
+}
+
+fn collect_children_call_tags_in(node: &JsxNode, tags: &mut Vec<String>) {
+    match node {
+        JsxNode::Element { tag, children, is_component, .. } => {
+            if *is_component && has_real_children(children) && !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+            for child in children {
+                collect_children_call_tags_in(child, tags);
+            }
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            collect_children_call_tags_in(cons, tags);
+            collect_children_call_tags_in(alt, tags);
+        }
+        JsxNode::ForEach { body, .. } => collect_children_call_tags_in(body, tags),
+        _ => {}
     }
 }
 

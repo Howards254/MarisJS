@@ -406,12 +406,14 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
     let needs_bind = tree_reads_signal(render_tree, &signal_names, props_param)
         || has_for_each_or_conditional(render_tree);
     let needs_style = tree_has_style_expr(render_tree);
+    let needs_child_node = tree_has_expr_child(render_tree);
 
     let mut imports = Vec::new();
     if has_signal { imports.push("signal"); }
     if has_computed { imports.push("computed"); }
     if needs_bind { imports.push("bind"); }
     if needs_style { imports.push("styleString"); }
+    if needs_child_node { imports.push("childNode"); }
 
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
@@ -693,7 +695,23 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
                 return Ok(());
             }
             if *is_component {
-                let props_arg = build_props_object(attrs)?;
+                // §7e (server path, designed together with the client path —
+                // the two must never drift): nested JSX children compile to
+                // their own HTML-string code, spliced into the wrapping
+                // component's props object as the `children` prop — exactly
+                // how server codegen already handles nested component calls
+                // generally. The wrapping component references props.children
+                // in its own render tree, where the Expr node splices the
+                // string into its output. Children pass through unchanged.
+                let mut props_arg = build_props_object(attrs)?;
+                if let Some(children_expr) = gen_html_children(children, parent_is_async)? {
+                    props_arg = if props_arg == "{}" {
+                        format!("{{ children: {} }}", children_expr)
+                    } else {
+                        let inner = &props_arg[1..props_arg.len() - 1];
+                        format!("{{ {}, children: {} }}", inner.trim(), children_expr)
+                    };
+                }
                 let await_kw = if parent_is_async { "await " } else { "" };
                 output.push_str(&format!("({}{}({}))", await_kw, tag, props_arg));
                 return Ok(());
@@ -740,6 +758,36 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
 /// the client codegen's behavior (which calls setAttribute with the value).
 /// Boolean attributes use presence semantics, mirroring the client's
 /// setAttribute/removeAttribute pair.
+/// §7e (server): compiles a component call's nested JSX children into a
+/// single HTML-string expression for the `children` prop. Whitespace-only
+/// texts (formatting artifacts) are dropped; a single child passes through
+/// directly; multiple siblings join with `+` (defensive — the validator's
+/// MULTIPLE_CHILDREN rejects that shape first). None when there is no real
+/// content — the component receives no children prop at all.
+fn gen_html_children(
+    children: &[JsxNode],
+    parent_is_async: bool,
+) -> Result<Option<String>, String> {
+    let real = parser::real_children(children);
+    if real.is_empty() {
+        return Ok(None);
+    }
+    let mut buffer = String::new();
+    if real.len() == 1 {
+        gen_html_node(real[0], &mut buffer, parent_is_async)?;
+    } else {
+        buffer.push('(');
+        for (i, child) in real.iter().enumerate() {
+            if i > 0 {
+                buffer.push_str(" + ");
+            }
+            gen_html_node(child, &mut buffer, parent_is_async)?;
+        }
+        buffer.push(')');
+    }
+    Ok(Some(buffer))
+}
+
 fn gen_open_tag_js(tag: &str, attrs: &[parser::JsxAttr]) -> String {
     let mut toks: Vec<String> = Vec::new();
     let mut static_acc = format!("<{}", tag);
@@ -803,6 +851,20 @@ fn has_for_each_or_conditional(node: &JsxNode) -> bool {
     match node {
         JsxNode::Conditional { .. } | JsxNode::ForEach { .. } => true,
         JsxNode::Element { children, .. } => children.iter().any(has_for_each_or_conditional),
+        _ => false,
+    }
+}
+
+/// §7e: true when the tree contains any `{expr}` child — those compile to
+/// childNode(...) calls, so the runtime helper must be imported.
+fn tree_has_expr_child(node: &JsxNode) -> bool {
+    match node {
+        JsxNode::Expr(_) => true,
+        JsxNode::Element { children, .. } => children.iter().any(tree_has_expr_child),
+        JsxNode::Conditional { cons, alt, .. } => {
+            tree_has_expr_child(cons) || tree_has_expr_child(alt)
+        }
+        JsxNode::ForEach { body, .. } => tree_has_expr_child(body),
         _ => false,
     }
 }
@@ -1084,7 +1146,7 @@ fn gen_element(
     props_param: &str,
 ) -> Result<String, String> {
     if is_component {
-        return gen_component_call(tag, attrs, output, counter, indent, signal_names);
+        return gen_component_call(tag, attrs, children, output, counter, indent, signal_names, props_param);
     }
     let var = format!("el{}", counter.next());
 
@@ -1166,13 +1228,14 @@ fn gen_element(
                 let escaped = text.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
                 writeln(output, indent, &format!("{}.textContent = '{}';", var, escaped));
             }
+            // §7e: an expression child may be a component's already-built
+            // children subtree (a DOM node) or a plain text value — childNode
+            // coerces either to a node, and the single-child path becomes the
+            // same append path as every other child (fresh element → identical
+            // DOM for plain text, node support for children subtrees).
             JsxNode::Expr(expr) => {
-                let dom_op = format!("{}.textContent = {}", var, expr);
-                if is_reactive_expr(expr, signal_names, props_param) {
-                    writeln(output, indent, &format!("bind(() => {{ {}; }});", dom_op));
-                } else {
-                    writeln(output, indent, &format!("{};", dom_op));
-                }
+                let tv = gen_expr(expr, output, counter, indent, signal_names, props_param);
+                writeln(output, indent, &format!("{}.appendChild({});", var, tv));
             }
             _ => {}
         }
@@ -1207,7 +1270,10 @@ fn gen_text(text: &str, output: &mut String, counter: &mut AtomicCounter, indent
 
 fn gen_expr(expr: &str, output: &mut String, counter: &mut AtomicCounter, indent: usize, signal_names: &[String], props_param: &str) -> String {
     let var = format!("txt{}", counter.next());
-    writeln(output, indent, &format!("const {} = document.createTextNode({});", var, expr));
+    // §7e: childNode coerces DOM nodes (component children subtrees) and
+    // text values alike into a node; reactive expressions are always text
+    // (signal reads), so the bind keeps updating the text node's nodeValue.
+    writeln(output, indent, &format!("const {} = childNode({});", var, expr));
     if is_reactive_expr(expr, signal_names, props_param) {
         writeln(output, indent, &format!("bind(() => {{ {}.nodeValue = {}; }});", var, expr));
     }
@@ -1226,11 +1292,36 @@ fn gen_expr_text_node(expr: &str, output: &mut String, counter: &mut AtomicCount
 fn gen_component_call(
     tag: &str,
     attrs: &[parser::JsxAttr],
+    children: &[JsxNode],
     output: &mut String,
     counter: &mut AtomicCounter,
     indent: usize,
     signal_names: &[String],
+    props_param: &str,
 ) -> Result<String, String> {
+    // §7e: nested JSX children compile to their own DOM construction FIRST,
+    // then the resulting node is passed as the `children` prop — the
+    // wrapping component receives an already-built value it can only place
+    // into its own render tree. Whitespace-only texts (formatting artifacts)
+    // are dropped. A single child passes through directly; multiple siblings
+    // are wrapped in a fragment (defensive — the validator's MULTIPLE_CHILDREN
+    // rejects that shape before codegen runs).
+    let mut children_expr: Option<String> = None;
+    let real_children = parser::real_children(children);
+    if !real_children.is_empty() {
+        if real_children.len() == 1 {
+            children_expr = Some(gen_node(real_children[0], output, counter, indent, signal_names, props_param)?);
+        } else {
+            let fvar = format!("_ch{}", counter.next());
+            writeln(output, indent, &format!("const {} = document.createDocumentFragment();", fvar));
+            for child in real_children {
+                let cv = gen_node(child, output, counter, indent, signal_names, props_param)?;
+                writeln(output, indent, &format!("{}.appendChild({});", fvar, cv));
+            }
+            children_expr = Some(fvar);
+        }
+    }
+
     let pairs: Vec<String> = attrs.iter().map(|a| {
         match &a.value {
             JsxAttrValue::Expr(expr) => {
@@ -1255,10 +1346,15 @@ fn gen_component_call(
         }
     }).collect::<Result<Vec<String>, String>>()?;
 
-    let props_arg = if pairs.is_empty() {
+    let mut all_pairs = pairs;
+    if let Some(expr) = children_expr {
+        all_pairs.push(format!("children: {}", expr));
+    }
+
+    let props_arg = if all_pairs.is_empty() {
         "{}".to_string()
     } else {
-        format!("{{ {} }}", pairs.join(", "))
+        format!("{{ {} }}", all_pairs.join(", "))
     };
 
     let var = format!("el{}", counter.next());

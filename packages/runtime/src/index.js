@@ -127,6 +127,18 @@ export function mount(rootElement, componentFn) {
   }
 }
 
+// §7e: coerces a JSX child expression to a DOM node. DOM nodes (component
+// children — an already-built subtree handed to the wrapping component)
+// pass through unchanged; every other value (string, number, null,
+// undefined) becomes a text node. Null/undefined become empty text — never
+// the string "null"/"undefined" that String() would produce.
+export function childNode(value) {
+  if (value !== null && value !== undefined && typeof value === 'object' && value.nodeType !== undefined) {
+    return value;
+  }
+  return document.createTextNode(value == null ? '' : String(value));
+}
+
 export function data(fetcher) {
   if (typeof fetcher !== 'function') {
     throw new Error('data() requires a function: data(async () => { ... })');

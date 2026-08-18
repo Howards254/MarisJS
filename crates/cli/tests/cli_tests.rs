@@ -575,3 +575,97 @@ fn test_api_directive_outside_api_dir_uses_api_rules() {
     );
     assert_no_code(&output, "FILENAME_MISMATCH");
 }
+
+// ── Phase E6 — children (SPEC §7e) ────────────────────────────────────
+
+#[test]
+fn test_multiple_children_rejected() {
+    let output = run_validate("Page.tsx");
+    assert_eq!(output["valid"], false);
+    let error = get_error_by_code(&output, "MULTIPLE_CHILDREN");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 sibling children"),
+        "message should count the siblings, got: {}",
+        error
+    );
+    assert!(
+        error["fix_hint"].as_str().unwrap().contains("Wrap the siblings"),
+        "fix hint should point at wrapping, got: {}",
+        error
+    );
+}
+
+/// The cross-file UNEXPECTED_CHILDREN check is build-orchestrated (like
+/// CLIENT_IMPORTS_SERVER): the page passes nested JSX to a component whose own
+/// file does not declare a `children` field. The build must fail with the
+/// diagnostic anchored at the page file.
+#[test]
+fn test_build_rejects_unexpected_children_cross_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("BadCard.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type BadCardProps = { title: string; };\n",
+            "export function BadCard(props: BadCardProps) {\n",
+            "  return <div class=\"badcard\">{props.title}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Bad.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { BadCard } from '../components/BadCard';\n",
+            "type BadProps = {};\n",
+            "export function Bad(props: BadProps) {\n",
+            "  return (\n",
+            "    <BadCard title={'Hi'}>\n",
+            "      <p>Nested</p>\n",
+            "    </BadCard>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on unexpected children, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("UNEXPECTED_CHILDREN"),
+        "build error must carry the UNEXPECTED_CHILDREN code, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("pages/Bad.tsx"),
+        "error must be anchored at the page file, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("BadCardProps"),
+        "error must name the Props type, got: {}",
+        stderr
+    );
+}

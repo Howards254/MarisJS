@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ── @marisjs/runtime publishability test ────────────────────────────────
 # Packs the runtime as a standalone tarball, installs it into a clean
-# temp Node project, then verifies all five exports (signal, computed,
-# bind, mount, data) work exactly as generated apps expect at runtime.
+# temp Node project, then verifies all six exports (signal, computed,
+# bind, mount, data, childNode) work exactly as generated apps expect
+# at runtime.
 #
 # Generated component code imports from '@marisjs/runtime' with simple ESM
 # import statements — this test replicates that exact consumer pattern.
@@ -56,7 +57,7 @@ say "installed"
 # ── 3. Run all-exports verification ──────────────────────────────────
 
 cat > "$PROJ_DIR/test-runtime.mjs" <<'TESTEOF'
-import { signal, computed, bind, mount, data } from '@marisjs/runtime';
+import { signal, computed, bind, mount, data, childNode } from '@marisjs/runtime';
 import { JSDOM } from 'jsdom';
 
 let failures = 0;
@@ -134,6 +135,43 @@ assert('data: works with sync fetcher', badResult === 42, `got ${badResult}`);
 let thrown = false;
 try { data(null); } catch (e) { thrown = true; }
 assert('data: throws on non-function argument', thrown);
+
+// ── childNode (SPEC §7e children slot) ─────────────────────────────
+
+const spanNode = dom.window.document.createElement('span');
+spanNode.textContent = 'node';
+assert('childNode: DOM node passes through', childNode(spanNode) === spanNode);
+
+const textFromString = childNode('plain');
+assert('childNode: string becomes a text node',
+  textFromString.nodeType === 3 && textFromString.textContent === 'plain',
+  `got nodeType ${textFromString.nodeType}`);
+
+const textFromEmpty = childNode('');
+assert('childNode: empty string becomes an empty text node',
+  textFromEmpty.nodeType === 3 && textFromEmpty.textContent === '',
+  `got nodeType ${textFromEmpty.nodeType}`);
+
+const textFromNull = childNode(null);
+assert('childNode: null becomes an empty text node',
+  textFromNull.nodeType === 3 && textFromNull.textContent === '',
+  `got nodeType ${textFromNull.nodeType}`);
+
+const textFromUndefined = childNode(undefined);
+assert('childNode: undefined becomes an empty text node',
+  textFromUndefined.nodeType === 3 && textFromUndefined.textContent === '',
+  `got nodeType ${textFromUndefined.nodeType}`);
+
+const numberNode = childNode(42);
+assert('childNode: number becomes a text node with its string form',
+  numberNode.nodeType === 3 && numberNode.textContent === '42',
+  `got ${numberNode.textContent}`);
+
+const childRoot = dom.window.document.createElement('div');
+childRoot.appendChild(childNode('a'));
+childRoot.appendChild(childNode('b'));
+assert('childNode: text nodes append in order',
+  childRoot.textContent === 'ab', `got ${childRoot.textContent}`);
 
 // ── Multiple observer teardown ────────────────────────────────────
 

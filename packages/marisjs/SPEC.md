@@ -817,6 +817,70 @@ without touching any of them.
 
 ---
 
+### 7e. Children (single `children` slot)
+
+`children` is an explicit, typed prop — not implicit magic. A component that wants to
+accept nested JSX must declare it in its Props type like any other field:
+
+```tsx
+type CardProps = {
+  title: string;
+  children: JSX.Element;
+};
+```
+
+When a caller writes `<Card title="Hi"><p>Nested</p></Card>`, the nested JSX is passed as
+the `children` prop — the same mechanism as any other prop, sourced from nested JSX syntax
+instead of an attribute. The attribute form (`children={...}` on a component) is a hard
+error (`CHILDREN_ATTRIBUTE`) — nested JSX between the tags is the single sanctioned
+channel, and its fix hint points at the nested form. This is the same "one canonical
+form" discipline the language applies to ternaries, `<For>`, and event handlers.
+
+**Rules (validator-enforced):**
+
+- **Exactly one root child element** — the same "one root element per return" discipline
+  established in §5. Multiple sibling children without a wrapping element are a hard
+  validator error: the caller must wrap them in a single parent (or an explicit fragment)
+  before passing. There is no implicit fragment-wrapping anywhere in the language.
+- **Whitespace-only text between tags is ignored** (line-break/indent formatting
+  artifacts, consistent with the parser's whitespace collapse). `<Card>\n</Card>` passes
+  no children; `<Card>Hello</Card>` passes the text `Hello`.
+- **Children are rendered once, at the point they're passed, and handed to the wrapping
+  component as an already-built value** — a DOM node on the client path, an HTML string
+  on the server path. The wrapping component cannot re-render, clone, or
+  inspect/transform children; it can only place the given value into its own render tree
+  wherever it references `props.children` (as an element child, or passed onward inside
+  another component's tags — `<Other>{props.children}</Other>` forwards the same value
+  unchanged). This is a deliberate v1 constraint, stated plainly like every other v1
+  scope decision in this spec: children are a value to be placed, never a tree to be
+  manipulated.
+- **A component invoked with nested JSX whose Props type does not declare `children` is
+  a hard validator error** (`UNEXPECTED_CHILDREN`), with a fix hint pointing at adding
+  the field. The check runs when the target component's Props type is visible to the
+  compiler (declared in the target file itself); when the Props type is imported from a
+  `*.types.ts` file, the compiler cannot see its fields and the check is skipped — the
+  type file is the single source of truth there.
+- The `children` field's declared type is `JSX.Element` — a declaration convention like
+  every other type in the language (the compiler strips annotations, never type-checks).
+- `client:hydrate` components cannot receive children. Hydration serializes props as
+  JSON into `data-props` at SSR time; a DOM node cannot be serialized, and the SSR
+  placeholder would not match the client-rendered content. Hydrate components receive
+  props only (`UNSUPPORTED_JSX_CONSTRUCT` if children are passed).
+
+**Documented v1 limitations (deliberate, honest tradeoffs — the same tone as every other
+v1 limitation in this spec):**
+
+- **No multiple named slots.** v1 is a single `children` prop only — no
+  header/footer/sidebar multi-slot system. If a genuine need for named slots surfaces
+  from real usage, that is a separate, future design decision.
+- **The wrapping component may not transform children** — no cloning, no inspection, no
+  conditional rendering of *parts* of the children value. If a component needs to
+  restructure content, that content belongs in props (typed fields), not in children.
+- **UNEXPECTED_CHILDREN cannot see into `*.types.ts` Props types** (see above) — the
+  check is exactly as strong as the compiler's view of the target's fields.
+
+---
+
 ## 8. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)
 
 | Pattern | Why forbidden |

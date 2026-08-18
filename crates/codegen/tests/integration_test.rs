@@ -7133,3 +7133,301 @@ fn adapter_static_refuses_middleware() {
         stderr
     );
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase E6 — children (single children slot, SPEC §7e)
+// ═══════════════════════════════════════════════════════════════
+
+/// Children render on the client: a Card wrapper declares a `children: JSX.Element`
+/// prop and renders `{props.children}`; the page passes nested JSX. Verified in a
+/// real DOM (jsdom) — the children arrive as a built DOM node, not as markup text.
+#[test]
+fn children_render_on_client() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let card_fixture = concat!(
+        "// @runsOn client\n",
+        "type CardProps = { title: string; children: JSX.Element; };\n",
+        "export function Card(props: CardProps) {\n",
+        "  return (\n",
+        "    <div class=\"card\">\n",
+        "      <h1>{props.title}</h1>\n",
+        "      {props.children}\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Card", card_fixture);
+
+    let page_fixture = concat!(
+        "// @runsOn client\n",
+        "import { Card } from './Card';\n",
+        "type PageProps = {};\n",
+        "export function Page(props: PageProps) {\n",
+        "  return (\n",
+        "    <Card title={'Hi'}>\n",
+        "      <p class=\"nested\">Nested</p>\n",
+        "    </Card>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Page", page_fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Page } from './Page.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+root.appendChild(Page({}));
+
+const card = root.querySelector('.card');
+const h1 = root.querySelector('h1');
+const p = root.querySelector('.nested');
+
+const ok = card !== null
+    && h1 !== null && h1.textContent === 'Hi'
+    && p !== null && p.textContent === 'Nested'
+    && card.contains(p);
+
+if (ok) {
+    console.log('PASS');
+} else {
+    console.error('FAIL', {
+        h1: h1 ? h1.textContent : null,
+        p: p ? p.textContent : null,
+        card: card !== null,
+    });
+    process.exit(1);
+}
+"#;
+    run_node(&dir, runner);
+}
+
+/// Children render on the server: a server wrapper component declares a children
+/// slot and the prerendered page contains the passed children nested inside it.
+#[test]
+fn children_render_on_server() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    std::fs::create_dir(&components).unwrap();
+    let scard = concat!(
+        "// @runsOn server\n",
+        "type SCardProps = { title: string; children: JSX.Element; };\n",
+        "export function SCard(props: SCardProps) {\n",
+        "  return (\n",
+        "    <div class=\"scard\">\n",
+        "      <h1>{props.title}</h1>\n",
+        "      {props.children}\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(components.join("SCard.tsx"), scard).unwrap();
+
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    let page = concat!(
+        "// @runsOn server\n",
+        "import { SCard } from '../components/SCard';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <SCard title={'Hi'}>\n",
+        "      <p class=\"nested\">Nested</p>\n",
+        "    </SCard>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(pages.join("Index.tsx"), page).unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    assert!(
+        html.contains("class=\"scard\""),
+        "HTML should contain the SCard wrapper"
+    );
+    assert!(
+        html.contains("<h1>Hi</h1>"),
+        "HTML should contain the wrapper's own content"
+    );
+    assert!(
+        html.contains("<p class=\"nested\">Nested</p>"),
+        "HTML should contain the passed children"
+    );
+    let scard_pos = html.find("class=\"scard\"").unwrap();
+    let p_pos = html.find("class=\"nested\"").unwrap();
+    assert!(
+        scard_pos < p_pos,
+        "children must render inside the wrapper, not before it"
+    );
+}
+
+/// Realistic Layout composition (SPEC §2a convention): a client Layout component
+/// imports the site-wide stylesheet and wraps page content in its children slot.
+/// The page is a CLIENT page (the hydrate island root) — the only legal way for a
+/// client component with a children slot to receive content, since hydration
+/// cannot carry children (UNSUPPORTED_JSX_CONSTRUCT, SPEC §7e). Verified end to
+/// end: the build copies the site CSS, and the client render nests the page
+/// content inside the Layout in a real DOM.
+#[test]
+fn layout_composition_with_children_and_site_css() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        components.join("styles.css"),
+        ".layout { display: flex; }",
+    )
+    .unwrap();
+
+    let layout = concat!(
+        "// @runsOn client\n",
+        "import \"./styles.css\";\n",
+        "type LayoutProps = { children: JSX.Element; };\n",
+        "export function Layout(props: LayoutProps) {\n",
+        "  return (\n",
+        "    <div class=\"layout\">\n",
+        "      <nav class=\"layout-nav\">MarisJS</nav>\n",
+        "      {props.children}\n",
+        "    </div>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(components.join("Layout.tsx"), layout).unwrap();
+
+    let page = concat!(
+        "// @runsOn client\n",
+        "import { Layout } from '../components/Layout';\n",
+        "type IndexProps = {};\n",
+        "export function Index(props: IndexProps) {\n",
+        "  return (\n",
+        "    <Layout>\n",
+        "      <div class=\"page-content\">\n",
+        "        <h1>Home</h1>\n",
+        "      </div>\n",
+        "    </Layout>\n",
+        "  );\n",
+        "}\n",
+    );
+    std::fs::write(pages.join("Index.tsx"), page).unwrap();
+
+    let out = build_fixture(&dir);
+
+    assert!(
+        out.join("components/styles.css").exists(),
+        "styles.css should be copied to the out dir"
+    );
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Index } from './dist/pages/Index.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+root.appendChild(Index({}));
+
+const layout = root.querySelector('.layout');
+const nav = root.querySelector('.layout-nav');
+const content = root.querySelector('.page-content');
+const h1 = root.querySelector('h1');
+
+const ok = layout !== null
+    && nav !== null && nav.textContent === 'MarisJS'
+    && content !== null
+    && h1 !== null && h1.textContent === 'Home'
+    && layout.contains(content);
+
+if (ok) {
+    console.log('PASS');
+} else {
+    console.error('FAIL', {
+        layout: layout !== null,
+        nav: nav ? nav.textContent : null,
+        content: content !== null,
+        h1: h1 ? h1.textContent : null,
+        nested: layout !== null && content !== null && layout.contains(content),
+    });
+    process.exit(1);
+}
+"#;
+    run_node(&dir, runner);
+}
+
+/// Pass-through composition: a middle component forwards its own children into a
+/// child component (`<Other>{props.children}</Other>`), client path in jsdom.
+#[test]
+fn children_pass_through_middle_component() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let leaf_fixture = concat!(
+        "// @runsOn client\n",
+        "type BoxProps = { children: JSX.Element; };\n",
+        "export function Box(props: BoxProps) {\n",
+        "  return <section class=\"box\">{props.children}</section>;\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Box", leaf_fixture);
+
+    let middle_fixture = concat!(
+        "// @runsOn client\n",
+        "import { Box } from './Box';\n",
+        "type PanelProps = { children: JSX.Element; };\n",
+        "export function Panel(props: PanelProps) {\n",
+        "  return <Box>{props.children}</Box>;\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Panel", middle_fixture);
+
+    let page_fixture = concat!(
+        "// @runsOn client\n",
+        "import { Panel } from './Panel';\n",
+        "type PageProps = {};\n",
+        "export function Page(props: PageProps) {\n",
+        "  return (\n",
+        "    <Panel>\n",
+        "      <span class=\"deep\">Deep</span>\n",
+        "    </Panel>\n",
+        "  );\n",
+        "}\n",
+    );
+    parse_validate_generate(&dir, "Page", page_fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { Page } from './Page.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+const root = dom.window.document.createElement('div');
+root.appendChild(Page({}));
+
+const box = root.querySelector('.box');
+const span = root.querySelector('.deep');
+
+const ok = box !== null
+    && span !== null
+    && span.textContent === 'Deep'
+    && box.contains(span);
+
+if (ok) {
+    console.log('PASS');
+} else {
+    console.error('FAIL', { box: box !== null, span: span ? span.textContent : null });
+    process.exit(1);
+}
+"#;
+    run_node(&dir, runner);
+}

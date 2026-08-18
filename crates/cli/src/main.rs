@@ -596,6 +596,71 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                 }
             }
 
+// §7e: UNEXPECTED_CHILDREN — a component call with nested JSX
+            // whose Props type declares no children field. The call site's
+            // file cannot know the TARGET's Props type, so this check is
+            // build-orchestrated (same reason as CLIENT_IMPORTS_SERVER): the
+            // tag is resolved through the file's imports, the target file is
+            // parsed, and its declared Props fields are inspected. Targets
+            // whose Props type the compiler cannot see (untyped/any, or
+            // imported from a *.types.ts file) are skipped — their own
+            // validation already flags broken props parameters, and the
+            // check is exactly as strong as the view it has.
+            let children_calls = component
+                .render_tree
+                .as_ref()
+                .map(parser::collect_children_call_tags)
+                .unwrap_or_default();
+            let file_parent = rel.parent().unwrap_or(Path::new(""));
+            for tag in children_calls {
+                let target_props_type = if component
+                    .exports
+                    .first()
+                    .map(|e| e.name == tag)
+                    .unwrap_or(false)
+                {
+                    component.props_type.clone()
+                } else {
+                    let mut resolved: Option<parser::TypeDecl> = None;
+                    for imp in &component.imports {
+                        if imp.is_css
+                            || !(imp.source.starts_with("./") || imp.source.starts_with("../"))
+                            || !imp.imported_names.contains(&tag)
+                        {
+                            continue;
+                        }
+                        let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+                        let target_rel = normalize_path(&file_parent.join(trimmed));
+                        for ext in ["tsx", "ts"] {
+                            let target = base.join(format!("{}.{}", target_rel, ext));
+                            if target.exists() {
+                                if let Ok(target_file) = parser::parse_component_file(target.to_str().unwrap()) {
+                                    resolved = target_file.props_type;
+                                }
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    resolved
+                };
+                if let Some(diag) = validator::unexpected_children_diagnostic(&tag, target_props_type.as_ref()) {
+                    return Err(format!(
+                        "{}:{} — {}: {} (fix: {})",
+                        rel.display(),
+                        component
+                            .imports
+                            .iter()
+                            .find(|i| i.imported_names.contains(&tag))
+                            .map(|i| i.line)
+                            .unwrap_or(1),
+                        diag.code,
+                        diag.message,
+                        diag.fix_hint
+                    ));
+                }
+            }
+
             if is_api {
                 let js = codegen::generate_api(&component, env)
                     .map_err(|e| format!("codegen error in {}: {}", rel.display(), e))?;

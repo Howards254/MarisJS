@@ -1012,11 +1012,93 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_server_boundaries(file, &mut diagnostics);
     check_statement_ordering(file, &mut diagnostics);
     check_unwrapped_signal_prop(file, &mut diagnostics);
+    check_children_shape(file, &mut diagnostics);
     check_unsupported_constructs(file, &mut diagnostics);
     check_css_imports(file, &mut diagnostics);
     check_handler_jsx(file, &mut diagnostics);
     check_runtime_collisions(file, &mut diagnostics);
     diagnostics
+}
+
+/// §7e: a component call with nested content whose Props type does not
+/// declare a `children` field is UNEXPECTED_CHILDREN, with a fix hint
+/// pointing at adding the field.
+///
+/// `props_type` is the TARGET component's Props declaration — the file's own
+/// when the call targets the file's exported component, or a parsed
+/// neighbor's when the call targets an imported component (the CLI resolves
+/// imports; a single file cannot know its neighbors' Props types, the same
+/// reason CLIENT_IMPORTS_SERVER is build-orchestrated). None → the compiler
+/// cannot see the target's fields (untyped/any props, or a *.types.ts
+/// imported type) — no diagnostic, exactly as strong as the view it has.
+/// This is what "integrates with the existing props- rules" means: a target
+/// with a broken props parameter (NO_PROPS / PROPS_UNTYPED / PROPS_ANY)
+/// already fails its own file's validation; UNEXPECTED_CHILDREN never stacks
+/// on top of that, it only fires when the props type is a known, declared
+/// shape.
+pub fn unexpected_children_diagnostic(
+    tag: &str,
+    props_type: Option<&parser::TypeDecl>,
+) -> Option<Diagnostic> {
+    let decl = props_type?;
+    if !decl.complete {
+        return None;
+    }
+    let has_children = decl.fields.iter().any(|f| f.name == "children");
+    if has_children {
+        return None;
+    }
+    Some(Diagnostic::new(
+        "UNEXPECTED_CHILDREN",
+        format!(
+            "<{}> is called with nested JSX, but its Props type '{}' does not declare a children field — children is an explicit prop, not implicit magic",
+            tag, decl.name
+        ),
+        "Add a `children: JSX.Element` field to the component's Props type.",
+        None,
+        None,
+    ))
+}
+
+/// §7e: multiple sibling children passed without a wrapping element — the
+/// same "one root element per return" discipline from §5, applied to a
+/// component's children slot. The caller must wrap siblings in a single
+/// parent (or an explicit fragment) before passing; there is no implicit
+/// fragment-wrapping anywhere in the language.
+fn check_children_shape(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(tree) = &file.render_tree else { return };
+    check_children_shape_in_node(tree, diagnostics);
+}
+
+fn check_children_shape_in_node(node: &JsxNode, diagnostics: &mut Vec<Diagnostic>) {
+    match node {
+        JsxNode::Element { tag, children, is_component, .. } => {
+            if *is_component {
+                let real = parser::real_children(children);
+                if real.len() > 1 {
+                    diagnostics.push(Diagnostic::new(
+                        "MULTIPLE_CHILDREN",
+                        format!(
+                            "<{}> is passed {} sibling children — a component's children must be a single root element, the same discipline as §5's one-root-per-return",
+                            tag, real.len()
+                        ),
+                        "Wrap the siblings in a single parent element (or an explicit fragment) before passing them.",
+                        None,
+                        None,
+                    ));
+                }
+            }
+            for child in children {
+                check_children_shape_in_node(child, diagnostics);
+            }
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            check_children_shape_in_node(cons, diagnostics);
+            check_children_shape_in_node(alt, diagnostics);
+        }
+        JsxNode::ForEach { body, .. } => check_children_shape_in_node(body, diagnostics),
+        _ => {}
+    }
 }
 
 /// §7d: the middleware.ts rule set — the single request-gating surface, so
@@ -1275,9 +1357,9 @@ fn normalize_path(p: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use parser::{
-        ComponentFile, ExportInfo, ExportKind, ImportInfo, JsxAttr, JsxAttrValue, JsxExprInfo,
-        JsxExpression, JsxNode, PropsInfo, RunsOn, SignalDecl, SignalKind, TopLevelBinding,
-        TypeAnnotation, BodyStmt, BodyStmtKind, ParserError,
+        ComponentFile, ExportInfo, ExportKind, ImportInfo, JsxExprInfo,
+        JsxExpression, JsxNode, PropField, PropsInfo, RunsOn, SignalDecl, SignalKind,
+        TopLevelBinding, TypeAnnotation, TypeDecl, BodyStmt, BodyStmtKind, ParserError,
     };
 
     fn make_file() -> ComponentFile {
@@ -2843,5 +2925,207 @@ mod tests {
         let diags = validate_imports(&file, Path::new("pages/Shop.tsx"), dir.path());
         let only_widget = diags.iter().all(|d| d.code == "IMPORT_NOT_FOUND" && d.message.contains("Widget"));
         assert!(only_widget, "CSS import should be skipped, got: {:?}", diags);
+    }
+
+    // ── §7e: unexpected children / children shape ─────────────────────────
+
+    fn make_card_type() -> TypeDecl {
+        TypeDecl {
+            name: "CardProps".into(),
+            complete: true,
+            fields: vec![
+                PropField {
+                    name: "title".into(),
+                    line: 3,
+                    column: 5,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn unexpected_children_fires_with_fix_hint() {
+        let diag = unexpected_children_diagnostic("Card", Some(&make_card_type())).unwrap();
+        assert_eq!(diag.code, "UNEXPECTED_CHILDREN");
+        assert!(
+            diag.message.contains("CardProps"),
+            "message should name the Props type, got: {}",
+            diag.message
+        );
+        assert_eq!(
+            diag.fix_hint,
+            "Add a `children: JSX.Element` field to the component's Props type."
+        );
+    }
+
+    #[test]
+    fn children_field_silences_unexpected_children() {
+        let mut decl = make_card_type();
+        decl.fields.push(PropField {
+            name: "children".into(),
+            line: 4,
+            column: 5,
+        });
+        assert!(unexpected_children_diagnostic("Card", Some(&decl)).is_none());
+    }
+
+    #[test]
+    fn incomplete_type_silences_unexpected_children() {
+        let mut decl = make_card_type();
+        decl.complete = false;
+        assert!(unexpected_children_diagnostic("Card", Some(&decl)).is_none());
+    }
+
+    #[test]
+    fn unknown_props_type_silences_unexpected_children() {
+        assert!(unexpected_children_diagnostic("Card", None).is_none());
+    }
+
+    fn make_component_tree(children: Vec<JsxNode>) -> ComponentFile {
+        ComponentFile {
+            filename: "Card.tsx".into(),
+            runs_on: Some(RunsOn::Client),
+            runs_on_count: 1,
+            runs_on_line: 1,
+            runs_on_column: 1,
+            exports: vec![ExportInfo {
+                name: "Card".into(),
+                kind: ExportKind::NamedFunction,
+                line: 5,
+                column: 1,
+            }],
+            props: Some(PropsInfo {
+                name: "props".into(),
+                type_annotation: TypeAnnotation::Named("CardProps".into()),
+                is_destructured: false,
+                line: 5,
+                column: 29,
+            }),
+            render_tree: Some(JsxNode::Element {
+                tag: "Wrapper".into(),
+                attrs: vec![],
+                children,
+                is_hydrate_root: false,
+                is_component: true,
+            }),
+            ..make_file()
+        }
+    }
+
+    #[test]
+    fn multiple_children_on_component_are_rejected() {
+        let file = make_component_tree(vec![
+            JsxNode::Element {
+                tag: "p".into(),
+                attrs: vec![],
+                children: vec![],
+                is_hydrate_root: false,
+                is_component: false,
+            },
+            JsxNode::Element {
+                tag: "p".into(),
+                attrs: vec![],
+                children: vec![],
+                is_hydrate_root: false,
+                is_component: false,
+            },
+        ]);
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "MULTIPLE_CHILDREN");
+        assert!(diags[0].message.contains("2 sibling children"));
+    }
+
+    #[test]
+    fn single_child_on_component_is_allowed() {
+        let file = make_component_tree(vec![JsxNode::Element {
+            tag: "p".into(),
+            attrs: vec![],
+            children: vec![],
+            is_hydrate_root: false,
+            is_component: false,
+        }]);
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_children_are_ignored() {
+        let file = make_component_tree(vec![JsxNode::Text("\n  ".into())]);
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert!(diags.is_empty(), "whitespace-only children are not real children");
+    }
+
+    #[test]
+    fn fragment_wrapped_children_are_allowed() {
+        let file = make_component_tree(vec![JsxNode::Element {
+            tag: "p".into(),
+            attrs: vec![],
+            children: vec![
+                JsxNode::Element {
+                    tag: "span".into(),
+                    attrs: vec![],
+                    children: vec![],
+                    is_hydrate_root: false,
+                    is_component: false,
+                },
+                JsxNode::Element {
+                    tag: "span".into(),
+                    attrs: vec![],
+                    children: vec![],
+                    is_hydrate_root: false,
+                    is_component: false,
+                },
+            ],
+            is_hydrate_root: false,
+            is_component: false,
+        }]);
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert!(diags.is_empty(), "siblings wrapped in a single parent are fine");
+    }
+
+    #[test]
+    fn multiple_children_on_html_element_are_allowed() {
+        let file = ComponentFile {
+            filename: "Card.tsx".into(),
+            render_tree: Some(JsxNode::Element {
+                tag: "div".into(),
+                attrs: vec![],
+                children: vec![
+                    JsxNode::Element {
+                        tag: "p".into(),
+                        attrs: vec![],
+                        children: vec![],
+                        is_hydrate_root: false,
+                        is_component: false,
+                    },
+                    JsxNode::Element {
+                        tag: "p".into(),
+                        attrs: vec![],
+                        children: vec![],
+                        is_hydrate_root: false,
+                        is_component: false,
+                    },
+                ],
+                is_hydrate_root: false,
+                is_component: false,
+            }),
+            ..make_file()
+        };
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert!(diags.is_empty(), "MULTIPLE_CHILDREN is for components only");
+    }
+
+    #[test]
+    fn empty_tree_skips_children_check() {
+        let file = make_file();
+        let mut diags = Vec::new();
+        check_children_shape(&file, &mut diags);
+        assert!(diags.is_empty());
     }
 }
