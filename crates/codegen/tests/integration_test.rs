@@ -7950,14 +7950,65 @@ fn sitemap_lists_pages_excludes_api_and_noindex() {
     let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
     eprintln!("SITEMAP:\n{}", sitemap);
 
-    assert!(sitemap.contains("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"));
-    assert!(sitemap.contains("<loc>https://example.com/</loc>"), "root loc");
-    assert!(sitemap.contains("<loc>https://example.com/about</loc>"), "about loc");
-    assert!(
-        !sitemap.contains("private") && !sitemap.contains("noindex"),
-        "noindex page must be excluded"
+    // The sitemap must be REAL XML, not merely string-shaped: parse it with an
+    // actual XML parser (jsdom DOMParser, text/xml) in the node runner and
+    // assert on the parsed document — correct namespace, urlset/url/loc
+    // structure, and exact loc values. A string check could pass "almost
+    // valid" XML that a real crawler would reject.
+    let runner = format!(
+        r#"
+import {{ readFileSync }} from 'node:fs';
+import {{ JSDOM }} from 'jsdom';
+
+const dom = new JSDOM('');
+const parser = new dom.window.DOMParser();
+const doc = parser.parseFromString(readFileSync('dist/sitemap.xml', 'utf8'), 'text/xml');
+
+const problems = [];
+
+// A parse error produces a <parsererror> element instead of the document.
+if (doc.getElementsByTagName('parsererror').length > 0) {{
+    problems.push('XML parse failed: ' + doc.getElementsByTagName('parsererror')[0].textContent);
+}}
+
+const NS = 'http://www.sitemaps.org/schemas/sitemap/0.9';
+if (doc.documentElement.namespaceURI !== NS) {{
+    problems.push('urlset namespace must be ' + NS + ', got: ' + doc.documentElement.namespaceURI);
+}}
+if (doc.documentElement.tagName !== 'urlset') {{
+    problems.push('document element must be urlset, got: ' + doc.documentElement.tagName);
+}}
+
+const urls = doc.getElementsByTagNameNS(NS, 'url');
+const locs = [];
+for (const url of urls) {{
+    const children = url.getElementsByTagNameNS(NS, 'loc');
+    if (children.length !== 1) {{
+        problems.push('url element must contain exactly one loc, got: ' + children.length);
+        continue;
+    }}
+    locs.push(children[0].textContent);
+}}
+locs.sort();
+const expected = ['https://example.com/', 'https://example.com/about'].sort();
+if (JSON.stringify(locs) !== JSON.stringify(expected)) {{
+    problems.push('loc values must be ' + JSON.stringify(expected) + ', got: ' + JSON.stringify(locs));
+}}
+
+const serialized = doc.documentElement.outerHTML;
+if (serialized.includes('private') || serialized.includes('api')) {{
+    problems.push('noindex/API routes leaked into sitemap: ' + serialized);
+}}
+
+if (problems.length > 0) {{
+    console.error('FAIL', problems.join('; '));
+    process.exit(1);
+}}
+console.log('PASS');
+"#,
     );
-    assert!(!sitemap.contains("api"), "API routes must be excluded");
+    std::fs::write(dir.path().join("sitemap_runner.mjs"), &runner).unwrap();
+    run_node(&dir, &runner);
 
     let private_html = std::fs::read_to_string(out.join("private.html")).unwrap();
     assert!(
