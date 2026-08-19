@@ -268,6 +268,158 @@ export function Index(props: IndexProps) {
   page's CSS links (as before). A `head` const on a `@runsOn client` file has no special
   meaning — it is an ordinary derived const.
 
+**Structured metadata helper — `meta(fields: MetaFields): string`:**
+
+`meta()` is a plain server-side helper (the env() pattern — emitted inline into the
+compiled server page module; no runtime import, no new primitive). It returns the exact
+concatenated `<title>`/`<meta>`/`<link>` tag string for the given fields, and is used as
+the `head` const value or combined with a raw HTML string. This is a **contract**, not a
+convenience: a page that calls `meta()` gets precisely the tags below, byte for byte.
+
+```tsx
+// @runsOn server
+type IndexProps = {};
+
+export function Index(props: IndexProps) {
+  const head = meta({
+    title: 'MarisJS',
+    description: 'A tiny, opinionated web framework.',
+    ogTitle: 'MarisJS',
+    ogDescription: 'A tiny, opinionated web framework.',
+    ogImage: 'https://marisjs.example/og.png',
+    ogUrl: 'https://marisjs.example/',
+    twitterCard: 'summary_large_image',
+  });
+  return (
+    <div>
+      <h1>Hello</h1>
+    </div>
+  );
+}
+```
+
+**Exact tag per field (the contract):**
+
+| field | type | exact output |
+|---|---|---|
+| `title` | string | `<title>{title}</title>` |
+| `description` | string | `<meta name="description" content="{description}">` |
+| `ogTitle` | string | `<meta property="og:title" content="{ogTitle}">` |
+| `ogDescription` | string | `<meta property="og:description" content="{ogDescription}">` |
+| `ogImage` | string | `<meta property="og:image" content="{ogImage}">` |
+| `ogUrl` | string | `<meta property="og:url" content="{ogUrl}">` |
+| `twitterCard` | string | `<meta name="twitter:card" content="{twitterCard}">` |
+| `noindex` | boolean | `<meta name="robots" content="noindex">` |
+
+Output order is fixed: `title`, `description`, `ogTitle`, `ogDescription`, `ogImage`,
+`ogUrl`, `twitterCard`, then `noindex`. Absent fields emit nothing; only the tags for
+present fields appear, in that order.
+
+**Rules:**
+
+- **Escaping is the existing server-rendering mechanism, reused — there is no second
+  escaping path.** Every field value is escaped with the same attribute escaping used
+  for static JSX attributes and server-rendered text (`&` → `&amp;`, `"` → `&quot;`,
+  `'` → `&#39;`, `<` → `&lt;`, `>` → `&gt;`). The same value produces the same bytes
+  whether it appears in a JSX attribute, in a `meta()` call, or in a hand-written raw
+  head string.
+- **Field values must be string literals** (v1 constraint) — a page's own SEO metadata
+  is fixed at build time. Non-literal values are a parser error. This is what makes the
+  escaping guarantee hold: it happens at compile time, in the exact codegen that
+  escapes every other server-rendered string.
+- `ogImage` is a URL string field only. No image fetching, resizing, or optimization —
+  that is out of scope (E9); the compiler never touches the URL's target.
+- **`meta()` is additive/composable with a raw head string** — it does not replace the
+  escape hatch. Use `meta()` for the common fields and append raw HTML for anything it
+  does not cover:
+
+  ```tsx
+  const head = meta({ title: 'MarisJS' })
+    + '<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"MarisJS","url":"https://marisjs.example"}</script>';
+  ```
+
+- `noindex: true` has two effects: it emits the `<meta name="robots" content="noindex">`
+  tag AND it excludes the route from the generated `sitemap.xml` (see below). The
+  sitemap exclusion is driven by this field — no other signal controls it.
+
+**Sitemap generation:**
+
+`marisjs build` writes `sitemap.xml` at the build output root, derived from the finalized
+route manifest (`routes.json`):
+
+- **Every page route is included by default** — fully-static pages and server-rendered
+  (data) pages alike. **API routes (`@runsOn api`) are excluded** — they are not pages.
+- **A page with `noindex: true` in its `meta()` call is excluded.**
+- The sitemap must contain absolute URLs (the sitemap protocol requires it), so the
+  build reads `SITE_URL` from the build-time env (process env or `.env`, exactly like
+  `env()`). The root route maps to `<SITE_URL>/`, every other route maps to
+  `<SITE_URL>/<route-path>`.
+- **If `SITE_URL` is not set, the build emits a warning and skips sitemap generation**
+  (a relative-URL sitemap would violate the protocol — no file is written).
+- Output is a single, spec-valid sitemap document:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url><loc>https://marisjs.example/</loc></url>
+    <url><loc>https://marisjs.example/about</loc></url>
+  </urlset>
+  ```
+
+- v1 scope is a single `sitemap.xml` — no sitemap index or multi-sitemap splitting. This
+  is revisited only if a real project's page count ever makes it a genuine problem.
+
+**robots.txt:**
+
+`marisjs build` writes a default `robots.txt` at the build output root — **but only when
+the project does not provide its own**. A project-provided `robots.txt` at the source
+root (the static-passthrough location, alongside images and other copied assets) always
+wins; the build never overwrites or modifies it.
+
+The default is permissive and references the sitemap when the site URL is known:
+
+```
+User-agent: *
+Allow: /
+
+Sitemap: https://marisjs.example/sitemap.xml
+```
+
+The `Sitemap:` line appears only when `SITE_URL` is set (it is the sitemap's address).
+When `SITE_URL` is missing, the default is still written but without the `Sitemap:` line
+(the sitemap itself was skipped).
+
+**Structured data (JSON-LD):**
+
+JSON-LD is a supported pattern using the existing raw-head escape hatch — no new
+primitive. It is, after all, just a `<script type="application/ld+json">` block, which a
+raw head string already handles verbatim. Complete, copyable example (Organization
+schema), composed with `meta()`:
+
+```tsx
+// @runsOn server
+type IndexProps = {};
+
+export function Index(props: IndexProps) {
+  const head = meta({
+    title: 'MarisJS',
+    description: 'A tiny, opinionated web framework.',
+    ogUrl: 'https://marisjs.example/',
+  })
+    + '<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"MarisJS","url":"https://marisjs.example","logo":"https://marisjs.example/logo.png","sameAs":[]}</script>';
+  return (
+    <div>
+      <h1>Hello</h1>
+    </div>
+  );
+}
+```
+
+The JSON-LD block is inserted into `<head>` verbatim, exactly as written — the framework
+does not parse, validate, or reformat it. Developers are responsible for the JSON-LD
+itself (shape, escaping, `@id` consistency); the framework's only job is to carry it
+through to the prerendered HTML intact.
+
 ---
 
 ## 3. Component Definition

@@ -7781,3 +7781,262 @@ if (ok) {{
     );
     run_node(&dir, &runner);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase E2.1 — Metadata, Sitemap & SEO
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_fixture_with_env(dir: &tempfile::TempDir, env_vars: &[(&str, &str)]) -> std::path::PathBuf {
+    let out = dir.path().join("dist");
+    let mut cmd = Command::new(cli_binary());
+    cmd.arg("build").arg(dir.path()).arg("--out").arg(&out);
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+    let status = cmd.output().unwrap();
+    assert!(
+        status.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    out
+}
+
+/// §E2.1: every meta() field expands to its exact documented tag, in fixed
+/// order, with the same escaping as static JSX (no second escaping path).
+#[test]
+fn meta_full_fields_render_exact_tags_in_prerendered_html() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  const head = meta({ title: 'Sales & Deals <2026>', description: \"Fast & reliable 'stuff' \\\"quoted\\\"\", ogTitle: 'OG title', ogDescription: 'OG desc', ogImage: '/og.png', ogUrl: 'https://example.com/', twitterCard: 'summary_large_image' });\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    assert!(html.contains("<title>Sales &amp; Deals &lt;2026&gt;</title>"), "title tag escaped");
+    assert!(
+        html.contains("<meta name=\"description\" content=\"Fast &amp; reliable &#39;stuff&#39; &quot;quoted&quot;\">"),
+        "description tag escaped"
+    );
+    assert!(html.contains("<meta property=\"og:title\" content=\"OG title\">"));
+    assert!(html.contains("<meta property=\"og:description\" content=\"OG desc\">"));
+    assert!(html.contains("<meta property=\"og:image\" content=\"/og.png\">"));
+    assert!(html.contains("<meta property=\"og:url\" content=\"https://example.com/\">"));
+    assert!(html.contains("<meta name=\"twitter:card\" content=\"summary_large_image\">"));
+
+    // Fixed output order: title, description, ogTitle, ogDescription, ogImage,
+    // ogUrl, twitterCard.
+    let title_pos = html.find("<title>").expect("title present");
+    let desc_pos = html.find("name=\"description\"").expect("description present");
+    let og_title_pos = html.find("og:title").expect("og:title present");
+    let og_desc_pos = html.find("og:description").expect("og:description present");
+    let og_img_pos = html.find("og:image").expect("og:image present");
+    let og_url_pos = html.find("og:url").expect("og:url present");
+    let tw_pos = html.find("twitter:card").expect("twitter:card present");
+    assert!(
+        title_pos < desc_pos
+            && desc_pos < og_title_pos
+            && og_title_pos < og_desc_pos
+            && og_desc_pos < og_img_pos
+            && og_img_pos < og_url_pos
+            && og_url_pos < tw_pos,
+        "meta() tags must appear in the documented fixed order"
+    );
+}
+
+/// §E2.1: meta() is additive — it composes with a raw head string (JSON-LD
+/// goes through the raw-head escape hatch, exactly as documented).
+#[test]
+fn meta_composes_with_raw_head_json_ld() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  const head = meta({ title: 'Home' }) + '<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"Organization\",\"name\":\"MarisJS\",\"url\":\"https://marisjs.example\",\"logo\":\"https://marisjs.example/logo.png\",\"sameAs\":[]}</script>';\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    eprintln!("HTML:\n{}", html);
+
+    assert!(html.contains("<title>Home</title>"), "meta() tag present");
+    assert!(
+        html.contains(
+            "<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"Organization\",\"name\":\"MarisJS\",\"url\":\"https://marisjs.example\",\"logo\":\"https://marisjs.example/logo.png\",\"sameAs\":[]}</script>"
+        ),
+        "JSON-LD script must pass through the raw head verbatim"
+    );
+}
+
+/// §E2.1: sitemap.xml lists every page, excludes API routes and noindex pages,
+/// and the noindex page still gets the robots meta tag in its HTML.
+#[test]
+fn sitemap_lists_pages_excludes_api_and_noindex() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+
+    for (name, body, head) in [
+        (
+            "Index.tsx",
+            "return <div class=\"home\">Home</div>;",
+            "const head = meta({ title: 'Home' });\n",
+        ),
+        (
+            "About.tsx",
+            "return <div class=\"about\">About</div>;",
+            "const head = meta({ title: 'About' });\n",
+        ),
+        (
+            "Private.tsx",
+            "return <div class=\"private\">Private</div>;",
+            "const head = meta({ title: 'Private', noindex: true });\n",
+        ),
+    ] {
+        std::fs::write(
+            pages.join(name),
+            format!(
+                "// @runsOn server\n\
+                 type {0}Props = {{}};\n\
+                 export function {0}(props: {0}Props) {{\n  {head}  {body}\n}}\n",
+                name.trim_end_matches(".tsx")
+            ),
+        )
+        .unwrap();
+    }
+
+    // api/ routes must never appear in the sitemap.
+    let api_dir = dir.path().join("api");
+    std::fs::create_dir_all(&api_dir).unwrap();
+    std::fs::write(
+        api_dir.join("data.ts"),
+        concat!(
+            "// @runsOn api\n",
+            "export async function GET(req: Request): Promise<Response> {\n",
+            "  return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture_with_env(&dir, &[("SITE_URL", "https://example.com")]);
+    let sitemap = std::fs::read_to_string(out.join("sitemap.xml")).unwrap();
+    eprintln!("SITEMAP:\n{}", sitemap);
+
+    assert!(sitemap.contains("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"));
+    assert!(sitemap.contains("<loc>https://example.com/</loc>"), "root loc");
+    assert!(sitemap.contains("<loc>https://example.com/about</loc>"), "about loc");
+    assert!(
+        !sitemap.contains("private") && !sitemap.contains("noindex"),
+        "noindex page must be excluded"
+    );
+    assert!(!sitemap.contains("api"), "API routes must be excluded");
+
+    let private_html = std::fs::read_to_string(out.join("private.html")).unwrap();
+    assert!(
+        private_html.contains("<meta name=\"robots\" content=\"noindex\">"),
+        "noindex page HTML must carry the robots meta tag"
+    );
+}
+
+/// §E2.1: without SITE_URL the build warns and skips sitemap.xml (the sitemap
+/// protocol mandates absolute URLs), but the build still succeeds.
+#[test]
+fn sitemap_skipped_when_site_url_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    assert!(!out.join("sitemap.xml").exists(), "no sitemap without SITE_URL");
+}
+
+/// §E2.1: robots.txt is generated by default (with the Sitemap line when
+/// SITE_URL is known) and a project-provided robots.txt is left untouched.
+#[test]
+fn robots_txt_default_generated_or_project_file_preserved() {
+    // Case 1: no project robots.txt → default generated with Sitemap line.
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    let out = build_fixture_with_env(&dir, &[("SITE_URL", "https://example.com")]);
+    let robots = std::fs::read_to_string(out.join("robots.txt")).unwrap();
+    assert_eq!(robots, "User-agent: *\nAllow: /\n\nSitemap: https://example.com/sitemap.xml\n");
+    assert!(out.join("sitemap.xml").exists(), "sitemap written alongside");
+
+    // Case 2: project-provided robots.txt → copied through untouched.
+    let dir2 = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir2);
+    let pages2 = dir2.path().join("pages");
+    std::fs::create_dir(&pages2).unwrap();
+    std::fs::write(
+        pages2.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir2.path().join("robots.txt"),
+        "User-agent: *\nDisallow: /private/\n",
+    )
+    .unwrap();
+    let out2 = build_fixture_with_env(&dir2, &[("SITE_URL", "https://example.com")]);
+    let robots2 = std::fs::read_to_string(out2.join("robots.txt")).unwrap();
+    assert_eq!(robots2, "User-agent: *\nDisallow: /private/\n", "project robots.txt must be preserved");
+}

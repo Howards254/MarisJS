@@ -669,3 +669,147 @@ fn test_build_rejects_unexpected_children_cross_file() {
         stderr
     );
 }
+
+/// §E2.1: meta() is only callable inside the head const of a @runsOn server
+/// page — a client component calling meta() fails the build with
+/// META_UNSUPPORTED.
+#[test]
+fn test_meta_on_client_file_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("BadMeta.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type BadMetaProps = {};\n",
+            "export function BadMeta(props: BadMetaProps) {\n",
+            "  const head = meta({ title: 'Nope' });\n",
+            "  return <div class=\"bad\">Bad</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on client-file meta(), got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("META_UNSUPPORTED"),
+        "build error must carry the META_UNSUPPORTED code, got: {}",
+        stderr
+    );
+}
+
+/// §E2.1: meta() field values must be compile-time constants — a non-literal
+/// value (e.g. from props) fails the build with META_NON_LITERAL.
+#[test]
+fn test_meta_non_literal_field_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  const head = meta({ title: props.title });\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on non-literal meta() field, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("META_NON_LITERAL"),
+        "build error must carry the META_NON_LITERAL code, got: {}",
+        stderr
+    );
+}
+
+/// §E2.1: meta() outside the head const (any other const in the body) fails
+/// the build with META_UNSUPPORTED.
+#[test]
+fn test_meta_outside_head_const_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  const x = meta({ title: 'Nope' });\n",
+            "  const head = 'plain';\n",
+            "  return <div class=\"home\">Home</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on meta() outside the head const, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("META_UNSUPPORTED"),
+        "build error must carry the META_UNSUPPORTED code, got: {}",
+        stderr
+    );
+}

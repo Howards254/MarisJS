@@ -79,6 +79,8 @@ struct PageRoute {
     page_roots: Vec<(String, String, bool)>,
     css_files: Vec<String>,
     has_data: bool,
+    /// §E2.1: meta({ noindex: true }) — the route is excluded from sitemap.xml.
+    noindex: bool,
 }
 
 /// One built API route. `file` is the REAL compiled output path
@@ -366,6 +368,13 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     // Generate routes.json manifest
     generate_routes_json(out_dir, &page_routes, &api_routes, has_middleware)?;
     eprintln!("  generated routes.json");
+
+    // §E2.1: sitemap.xml (all pages, API routes excluded, noindex excluded,
+    // SITE_URL required) + default robots.txt (only when the project provides
+    // none at the source root).
+    let site_url = env.get("SITE_URL").cloned();
+    generate_sitemap(out_dir, &page_routes, site_url.as_deref())?;
+    generate_default_robots(source_dir, out_dir, site_url.as_deref())?;
 
     write_reload_timestamp(out_dir);
     Ok(count)
@@ -724,6 +733,7 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                         page_roots,
                         css_files: Vec::new(),
                         has_data: component.has_data_call,
+                        noindex: component.head_noindex,
                     });
                 }
 
@@ -1303,6 +1313,76 @@ fn generate_routes_json(
     let json = serde_json::to_string_pretty(&manifest).map_err(|e| format!("json: {}", e))?;
     std::fs::write(out_dir.join("routes.json"), json).map_err(|e| format!("write routes.json: {}", e))?;
     Ok(())
+}
+
+/// §E2.1: generate sitemap.xml from the built page routes. API routes are
+/// never listed (they are not documents); pages with meta({ noindex: true })
+/// opt out. SITE_URL is required — the sitemap protocol mandates absolute
+/// URLs — so the build warns and skips when it is absent.
+fn generate_sitemap(
+    out_dir: &Path,
+    page_routes: &[PageRoute],
+    site_url: Option<&str>,
+) -> Result<(), String> {
+    let Some(site_url) = site_url else {
+        eprintln!("  skipping sitemap.xml — set SITE_URL (absolute site URL, e.g. https://example.com) to generate");
+        return Ok(());
+    };
+    let base = site_url.trim_end_matches('/');
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+    for page in page_routes {
+        if page.noindex {
+            continue;
+        }
+        let loc = if page.route == "/" {
+            format!("{base}/")
+        } else {
+            format!("{base}{}", xml_escape(&page.route))
+        };
+        xml.push_str(&format!("  <url><loc>{}</loc></url>\n", xml_escape(&loc)));
+    }
+    xml.push_str("</urlset>\n");
+    std::fs::write(out_dir.join("sitemap.xml"), xml)
+        .map_err(|e| format!("write sitemap.xml: {}", e))?;
+    eprintln!("  generated sitemap.xml");
+    Ok(())
+}
+
+/// §E2.1: write a default robots.txt ONLY when the project provides none at
+/// the source root (a project-provided robots.txt is copied through by the
+/// static-asset pass and must never be overwritten). The Sitemap line is
+/// included only when SITE_URL is known.
+fn generate_default_robots(
+    source_dir: &Path,
+    out_dir: &Path,
+    site_url: Option<&str>,
+) -> Result<(), String> {
+    if source_dir.join("robots.txt").exists() {
+        eprintln!("  keeping project-provided robots.txt");
+        return Ok(());
+    }
+    let mut content = String::from("User-agent: *\nAllow: /\n");
+    if let Some(site_url) = site_url {
+        content.push_str(&format!(
+            "\nSitemap: {}/sitemap.xml\n",
+            site_url.trim_end_matches('/')
+        ));
+    }
+    std::fs::write(out_dir.join("robots.txt"), content)
+        .map_err(|e| format!("write robots.txt: {}", e))?;
+    eprintln!("  generated robots.txt");
+    Ok(())
+}
+
+/// §E2.1: XML-escape a URL for sitemap.xml (route segments are path-safe, but
+/// the protocol is strict XML).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn load_routes(out_dir: &Path) -> HashMap<String, String> {

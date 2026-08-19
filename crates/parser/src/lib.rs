@@ -161,6 +161,37 @@ pub struct TypeDecl {
     pub complete: bool,
 }
 
+/// §E2.1: one meta() field value — string fields (title, description, og*,
+/// twitterCard) or the boolean noindex.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaValue {
+    Str(String),
+    Bool(bool),
+}
+
+/// §E2.1: one field of a meta({ ... }) call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaField {
+    pub name: String,
+    pub value: MetaValue,
+}
+
+/// §E2.1: one operand of the head const initializer — either a raw source
+/// snippet (anything that is not a meta() call) or a structured meta() call
+/// that codegen expands into the exact documented tags.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeadPart {
+    Raw(String),
+    Meta(Vec<MetaField>),
+}
+
+/// §E2.1: one meta() call site, positioned for diagnostics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetaCallSite {
+    pub line: usize,
+    pub column: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsxNode {
     Element {
@@ -237,6 +268,18 @@ pub struct ComponentFile {
     pub handler_has_jsx: Vec<bool>,
     pub derived_consts: Vec<String>,
     pub module_consts: Vec<String>,
+    /// §E2.1: `const head = meta({...})` — the head const's initializer split
+    /// into parts (raw source snippets for non-meta() operands, structured
+    /// meta() calls for expansion). Some only when the head const actually
+    /// calls meta(); otherwise codegen emits the raw line as before.
+    pub head_parts: Option<Vec<HeadPart>>,
+    /// §E2.1: any meta({ noindex: true }) call in the head const — the build
+    /// excludes the route from sitemap.xml.
+    pub head_noindex: bool,
+    /// §E2.1: every meta() call site in the file (line/column). Consumed by
+    /// process_const_meta for head consts; anything left after the walk is
+    /// reported as META_UNSUPPORTED (meta() outside the head const).
+    pub meta_call_sites: Vec<MetaCallSite>,
     /// Ordered top-level statements (source text, TS annotations stripped) —
     /// EVERYTHING at module scope except imports, exported function
     /// declarations (see exported_fn_sources), and the directive comment.
@@ -320,6 +363,9 @@ impl ComponentFile {
             handler_has_jsx: Vec::new(),
             derived_consts: Vec::new(),
             module_consts: Vec::new(),
+            head_parts: None,
+            head_noindex: false,
+            meta_call_sites: Vec::new(),
             module_statements: Vec::new(),
             exported_fn_sources: Vec::new(),
             unsupported_errors: Vec::new(),
@@ -537,6 +583,7 @@ fn parse_source_with_options(
 
     extract_runs_on_from_comments(&cm, &comments, first_code_pos, &mut file);
     walk_module(&cm, &module, &mut file);
+    finalize_meta_calls(&mut file);
 
     Ok(file)
 }
@@ -1301,6 +1348,15 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
                 self.file.session_call_line = line;
                 self.file.session_call_column = col;
             }
+            // §E2.1: meta() call sites are recorded here and consumed by
+            // process_const_meta when they sit inside the head const of a
+            // server file; leftover sites are reported after the walk.
+            if name == "meta" {
+                self.file.meta_call_sites.push(MetaCallSite {
+                    line,
+                    column: col,
+                });
+            }
         }
 
         n.visit_children_with(self);
@@ -1323,6 +1379,45 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
 }
 
 impl Extractor<'_> {
+    /// §E2.1: handle a const initializer that contains meta() calls. meta()
+    /// is only valid in the head const of a @runsOn server file; everywhere
+    /// else it is a ParserError (META_UNSUPPORTED). For the head const the
+    /// initializer is split into raw parts + structured meta() calls.
+    fn process_const_meta(&mut self, init: &Expr, is_head: bool) {
+        let mut spans: Vec<Span> = Vec::new();
+        collect_meta_call_spans(init, &mut spans);
+        if spans.is_empty() {
+            return;
+        }
+        let is_server = self.file.runs_on == Some(RunsOn::Server);
+        if !is_server || !is_head {
+            for _span in &spans {
+                self.file.unsupported_errors.push(ParserError {
+                    code: "META_UNSUPPORTED",
+                    message: "meta() is only callable inside the head const of a @runsOn server page".to_string(),
+                    fix_hint: "call meta() from `const head = ...` in a server page; client and API files cannot emit meta tags",
+                });
+            }
+            return;
+        }
+        let mut parts: Vec<HeadPart> = Vec::new();
+        let mut bad = false;
+        collect_head_parts(self.cm, init, &mut parts, &mut self.file.unsupported_errors, &mut bad);
+        if bad {
+            return;
+        }
+        let has_meta = parts.iter().any(|p| matches!(p, HeadPart::Meta(_)));
+        if !has_meta {
+            return;
+        }
+        self.file.head_noindex = parts.iter().any(|p| match p {
+            HeadPart::Meta(fields) => fields
+                .iter()
+                .any(|f| f.name == "noindex" && f.value == MetaValue::Bool(true)),
+            _ => false,
+        });
+        self.file.head_parts = Some(parts);
+    }
     fn extract_fn_props(&mut self, function: &Function, _component_name: String) {
         if self.file.props.is_some() {
             return;
@@ -1406,6 +1501,18 @@ impl Extractor<'_> {
                 if let Ok(src) = self.cm.span_to_snippet(stmt.span()) {
                     if let Stmt::Decl(Decl::Var(var_decl)) = stmt {
                         self.file.derived_consts.push(strip_var_ts(&src, stmt.span(), var_decl));
+                    }
+                }
+                // §E2.1: `const head = meta({...})` — split the initializer
+                // into raw parts + structured meta() calls (exact-tag contract,
+                // expanded by codegen with the existing escaping). meta() is
+                // allowed ONLY here (the head const of a server file).
+                if let Stmt::Decl(Decl::Var(var_decl)) = stmt {
+                    if let Some(decl) = var_decl.decls.first() {
+                        let is_head = matches!(&decl.name, Pat::Ident(ident) if ident.id.sym == "head");
+                        if let Some(init) = &decl.init {
+                            self.process_const_meta(init, is_head);
+                        }
                     }
                 }
             }
@@ -1559,6 +1666,262 @@ fn is_signal_or_computed(expr: &Expr) -> bool {
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// §E2.1: does this expression resolve to the `meta` identifier? (meta is a
+/// reserved helper name, like env/data — an author-defined `meta` would be
+/// shadowed by the compiler's expansion.)
+fn is_meta_ident(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(ident) => ident.sym.as_ref() == "meta",
+        Expr::Paren(paren) => is_meta_ident(&paren.expr),
+        _ => false,
+    }
+}
+
+/// §E2.1: collect the span of every meta() call reachable inside `expr`
+/// (walking the common expression shapes; arrow/function bodies are separate
+/// scopes and are handled by the leftover-site pass after the walk).
+fn collect_meta_call_spans(expr: &Expr, out: &mut Vec<Span>) {
+    match expr {
+        Expr::Call(call) => {
+            if let Callee::Expr(callee_expr) = &call.callee {
+                if is_meta_ident(callee_expr) {
+                    out.push(call.span);
+                }
+            }
+            for arg in &call.args {
+                collect_meta_call_spans(&arg.expr, out);
+            }
+        }
+        Expr::Bin(bin) => {
+            collect_meta_call_spans(&bin.left, out);
+            collect_meta_call_spans(&bin.right, out);
+        }
+        Expr::Unary(unary) => collect_meta_call_spans(&unary.arg, out),
+        Expr::Paren(paren) => collect_meta_call_spans(&paren.expr, out),
+        Expr::Member(member) => {
+            collect_meta_call_spans(&member.obj, out);
+            if let MemberProp::Computed(computed) = &member.prop {
+                collect_meta_call_spans(&computed.expr, out);
+            }
+        }
+        Expr::Cond(cond) => {
+            collect_meta_call_spans(&cond.test, out);
+            collect_meta_call_spans(&cond.cons, out);
+            collect_meta_call_spans(&cond.alt, out);
+        }
+        Expr::Assign(assign) => collect_meta_call_spans(&assign.right, out),
+        Expr::Seq(seq) => {
+            for e in &seq.exprs {
+                collect_meta_call_spans(e, out);
+            }
+        }
+        Expr::Object(obj) => {
+            for prop in &obj.props {
+                if let PropOrSpread::Prop(prop) = prop {
+                    if let Prop::KeyValue(kv) = &**prop {
+                        collect_meta_call_spans(&kv.value, out);
+                    }
+                }
+            }
+        }
+        Expr::Array(arr) => {
+            for elem in &arr.elems {
+                if let Some(elem) = elem {
+                    collect_meta_call_spans(&elem.expr, out);
+                }
+            }
+        }
+        Expr::Await(await_expr) => collect_meta_call_spans(&await_expr.arg, out),
+        Expr::Yield(yield_expr) => {
+            if let Some(arg) = &yield_expr.arg {
+                collect_meta_call_spans(arg, out);
+            }
+        }
+        Expr::OptChain(opt) => match &*opt.base {
+            OptChainBase::Call(call) => {
+                if is_meta_ident(&call.callee) {
+                    out.push(call.span);
+                }
+                for arg in &call.args {
+                    collect_meta_call_spans(&arg.expr, out);
+                }
+            }
+            OptChainBase::Member(member) => {
+                collect_meta_call_spans(&member.obj, out);
+                if let MemberProp::Computed(computed) = &member.prop {
+                    collect_meta_call_spans(&computed.expr, out);
+                }
+            }
+        },
+        Expr::Tpl(tpl) => {
+            for e in &tpl.exprs {
+                collect_meta_call_spans(e, out);
+            }
+        }
+        Expr::TaggedTpl(tagged) => {
+            collect_meta_call_spans(&tagged.tag, out);
+            for e in &tagged.tpl.exprs {
+                collect_meta_call_spans(e, out);
+            }
+        }
+        Expr::New(new_expr) => {
+            if let Some(args) = &new_expr.args {
+                for arg in args {
+                    collect_meta_call_spans(&arg.expr, out);
+                }
+            }
+        }
+        Expr::TsTypeAssertion(assert) => collect_meta_call_spans(&assert.expr, out),
+        Expr::TsAs(ts_as) => collect_meta_call_spans(&ts_as.expr, out),
+        Expr::TsNonNull(ts_non_null) => collect_meta_call_spans(&ts_non_null.expr, out),
+        Expr::TsSatisfies(ts_satisfies) => collect_meta_call_spans(&ts_satisfies.expr, out),
+        _ => {}
+    }
+}
+
+/// §E2.1: split a head const initializer into parts. The concat chain
+/// (`a + b + c`) is flattened; each top-level meta() call becomes a
+/// structured HeadPart::Meta, everything else a raw source snippet. Errors
+/// (non-literal field values, unknown fields, malformed calls) are pushed
+/// into `errors` and `bad` is set — the caller then leaves head_parts unset
+/// and lets the validator fail the build.
+fn collect_head_parts(
+    cm: &SourceMap,
+    expr: &Expr,
+    parts: &mut Vec<HeadPart>,
+    errors: &mut Vec<ParserError>,
+    bad: &mut bool,
+) {
+    match expr {
+        Expr::Bin(bin) if bin.op == BinaryOp::Add => {
+            collect_head_parts(cm, &bin.left, parts, errors, bad);
+            collect_head_parts(cm, &bin.right, parts, errors, bad);
+        }
+        Expr::Paren(paren) => collect_head_parts(cm, &paren.expr, parts, errors, bad),
+        Expr::Call(call) if matches!(&call.callee, Callee::Expr(callee_expr) if is_meta_ident(callee_expr)) => {
+            match extract_meta_fields(call, errors) {
+                Some(fields) => parts.push(HeadPart::Meta(fields)),
+                None => *bad = true,
+            }
+        }
+        _ => {
+            // Raw part — the exact source snippet (string literals, other
+            // consts, any non-meta expression). A meta() call nested deeper
+            // than the top-level concat operands is rejected.
+            let snippet = cm.span_to_snippet(expr.span()).unwrap_or_default();
+            if snippet.contains("meta(") {
+                errors.push(ParserError {
+                    code: "META_UNSUPPORTED",
+                    message: "meta() must be a top-level operand of the head concatenation".to_string(),
+                    fix_hint: "write `head = meta({...}) + '...'` (meta() calls joined at the top level of the head const)",
+                });
+                *bad = true;
+            } else {
+                parts.push(HeadPart::Raw(snippet));
+            }
+        }
+    }
+}
+
+/// §E2.1: evaluate one meta({ ... }) call. Every field value must be a string
+/// literal (or a boolean for noindex) and the field names must be in the
+/// documented contract — anything else is a ParserError and the head const is
+/// left uncompiled (the validator fails the build).
+fn extract_meta_fields(
+    call: &CallExpr,
+    errors: &mut Vec<ParserError>,
+) -> Option<Vec<MetaField>> {
+    let object = match call.args.as_slice() {
+        [arg] => match &*arg.expr {
+            Expr::Object(obj) => obj,
+            _ => {
+                errors.push(ParserError {
+                    code: "META_BAD_ARGUMENT",
+                    message: "meta() takes exactly one object argument: meta({ ... })".to_string(),
+                    fix_hint: "e.g. meta({ title: 'Home', description: '...' })",
+                });
+                return None;
+            }
+        },
+        _ => {
+            errors.push(ParserError {
+                code: "META_BAD_ARGUMENT",
+                message: "meta() takes exactly one object argument: meta({ ... })".to_string(),
+                fix_hint: "e.g. meta({ title: 'Home', description: '...' })",
+            });
+            return None;
+        }
+    };
+    let mut fields: Vec<MetaField> = Vec::new();
+    for prop in &object.props {
+        let PropOrSpread::Prop(prop) = prop else {
+            errors.push(ParserError {
+                code: "META_UNSUPPORTED",
+                message: "meta() object arguments cannot contain spread properties".to_string(),
+                fix_hint: "write each meta() field explicitly",
+            });
+            return None;
+        };
+        let Prop::KeyValue(kv) = &**prop else {
+            continue;
+        };
+        let name = match &kv.key {
+            PropName::Ident(ident) => ident.sym.as_ref().to_string(),
+            PropName::Str(s) => s.value.to_string(),
+            _ => {
+                errors.push(ParserError {
+                    code: "META_BAD_ARGUMENT",
+                    message: "meta() field names must be plain identifiers".to_string(),
+                    fix_hint: "e.g. meta({ title: 'Home' })",
+                });
+                return None;
+            }
+        };
+        let value = match &*kv.value {
+            Expr::Lit(Lit::Str(s)) => MetaValue::Str(s.value.to_string()),
+            Expr::Lit(Lit::Bool(b)) => MetaValue::Bool(b.value),
+            _ => {
+                errors.push(ParserError {
+                    code: "META_NON_LITERAL",
+                    message: format!("meta() field '{name}' must be a string literal (boolean literal for noindex)"),
+                    fix_hint: "meta() values are compile-time constants (v1 constraint)",
+                });
+                return None;
+            }
+        };
+        let known = match name.as_str() {
+            "title" | "description" | "ogTitle" | "ogDescription" | "ogImage" | "ogUrl" | "twitterCard" => {
+                matches!(value, MetaValue::Str(_))
+            }
+            "noindex" => matches!(value, MetaValue::Bool(_)),
+            _ => false,
+        };
+        if !known {
+            errors.push(ParserError {
+                code: "META_UNKNOWN_FIELD",
+                message: format!("unknown meta() field '{name}'"),
+                fix_hint: "supported fields: title, description, ogTitle, ogDescription, ogImage, ogUrl, twitterCard, noindex",
+            });
+            return None;
+        }
+        fields.push(MetaField { name, value });
+    }
+    Some(fields)
+}
+
+/// §E2.1: after the walk, any meta() call site not consumed by the head-const
+/// handling is reported — meta() inside JSX expressions, return statements,
+/// event handlers, or nested functions is unsupported.
+pub fn finalize_meta_calls(file: &mut ComponentFile) {
+    for _site in &file.meta_call_sites {
+        file.unsupported_errors.push(ParserError {
+            code: "META_UNSUPPORTED",
+            message: "meta() is only callable inside the head const of a @runsOn server page".to_string(),
+            fix_hint: "call meta() from `const head = ...` in a server page; client and API files cannot emit meta tags",
+        });
     }
 }
 

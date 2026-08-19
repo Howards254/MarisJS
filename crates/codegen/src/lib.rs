@@ -1,4 +1,4 @@
-use parser::{ComponentFile, JsxAttrValue, JsxNode, RunsOn, SignalKind};
+use parser::{ComponentFile, HeadPart, JsxAttrValue, JsxNode, MetaValue, RunsOn, SignalKind};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -606,6 +606,17 @@ fn generate_server(
     }
 
     for dc in &component.derived_consts {
+        if component.head_parts.is_some() {
+            let t = dc.trim_start();
+            let is_head = t
+                .strip_prefix("const")
+                .map(|rest| rest.trim_start().split([' ', '=']).next().unwrap_or("") == "head")
+                .unwrap_or(false);
+            if is_head {
+                output.push_str(&format!("  {};\n", expand_head_parts(component)));
+                continue;
+            }
+        }
         for line in dc.lines() {
             output.push_str(&format!("  {}\n", line));
         }
@@ -879,6 +890,91 @@ fn html_escape(s: &str) -> String {
 fn html_attr_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
         .replace('\'', "&#39;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// §E2.1: rebuild `const head = <parts>` where each meta() call expands to the
+/// exact documented tag string (fixed field order: title, description, ogTitle,
+/// ogDescription, ogImage, ogUrl, twitterCard, noindex) using the SAME escaping
+/// as static JSX — meta() introduces no second escaping path. Raw parts are
+/// emitted verbatim, so `meta({...}) + '<script>...'` composes exactly like a
+/// plain string concatenation.
+fn expand_head_parts(component: &ComponentFile) -> String {
+    let parts = component.head_parts.as_ref().expect("head_parts is Some");
+    let mut rebuilt = String::from("const head = ");
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            rebuilt.push_str(" + ");
+        }
+        match part {
+            HeadPart::Raw(snippet) => rebuilt.push_str(snippet),
+            HeadPart::Meta(fields) => {
+                let mut tags = String::new();
+                for field in fields {
+                    match field.name.as_str() {
+                        "title" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!("<title>{}</title>", html_escape(v)));
+                            }
+                        }
+                        "description" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta name=\"description\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "ogTitle" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta property=\"og:title\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "ogDescription" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta property=\"og:description\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "ogImage" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta property=\"og:image\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "ogUrl" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta property=\"og:url\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "twitterCard" => {
+                            if let MetaValue::Str(v) = &field.value {
+                                tags.push_str(&format!(
+                                    "<meta name=\"twitter:card\" content=\"{}\">",
+                                    html_attr_escape(v)
+                                ));
+                            }
+                        }
+                        "noindex" => {
+                            tags.push_str("<meta name=\"robots\" content=\"noindex\">");
+                        }
+                        _ => {}
+                    }
+                }
+                rebuilt.push_str(&format!("'{}'", tags));
+            }
+        }
+    }
+    rebuilt
 }
 
 // ---------------------------------------------------------------------------
