@@ -1,6 +1,6 @@
 {
   "name": "@marisjs/runtime",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Reactive signal runtime for marisjs — signal, computed, bind, mount, and data()",
   "type": "module",
   "exports": {
