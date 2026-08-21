@@ -8091,3 +8091,190 @@ fn robots_txt_default_generated_or_project_file_preserved() {
     let robots2 = std::fs::read_to_string(out2.join("robots.txt")).unwrap();
     assert_eq!(robots2, "User-agent: *\nDisallow: /private/\n", "project robots.txt must be preserved");
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// §FIX-1: .ts value imports must not be silently stripped from server codegen
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn server_value_import_from_ts_file_renders_in_prerender() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    std::fs::write(
+        lib.join("data.ts"),
+        "export const APP_NAME = 'MarisJS Test';\n",
+    )
+    .unwrap();
+
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { APP_NAME } from '../lib/data';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"app\">{APP_NAME}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(
+        html.contains("MarisJS Test"),
+        "Prerendered HTML must contain the value from the .ts import. Got:\n{}",
+        html
+    );
+}
+
+#[test]
+fn server_multiple_exports_from_ts_file_all_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    std::fs::write(
+        lib.join("constants.ts"),
+        "export const VERSION = '1.0';\nexport const AUTHOR = 'Test';\n",
+    )
+    .unwrap();
+
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { VERSION, AUTHOR } from '../lib/constants';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"info\">\n",
+            "    <span class=\"version\">{VERSION}</span>\n",
+            "    <span class=\"author\">{AUTHOR}</span>\n",
+            "  </div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(html.contains("1.0"), "Should contain VERSION value");
+    assert!(html.contains("Test"), "Should contain AUTHOR value");
+}
+
+#[test]
+fn server_chained_ts_imports_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    std::fs::write(
+        lib.join("config.ts"),
+        "export const SITE = 'MarisJS';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        lib.join("helpers.ts"),
+        "import { SITE } from './config';\nexport const greeting = () => `Hello from ${SITE}`;\n",
+    )
+    .unwrap();
+
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { greeting } from '../lib/helpers';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <div class=\"greet\">{greeting()}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(
+        html.contains("Hello from MarisJS"),
+        "Chained .ts imports must resolve. Got:\n{}",
+        html
+    );
+}
+
+#[test]
+fn ts_file_imported_by_both_server_and_client_island() {
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+
+    let lib = dir.path().join("lib");
+    std::fs::create_dir(&lib).unwrap();
+    std::fs::write(
+        lib.join("shared.ts"),
+        "export const SHARED_DATA = 'shared-value';\n",
+    )
+    .unwrap();
+
+    let components = dir.path().join("components");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::write(
+        components.join("Widget.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "import { SHARED_DATA } from '../lib/shared';\n",
+            "type WidgetProps = {};\n",
+            "export function Widget(props: WidgetProps) {\n",
+            "  return <div class=\"widget\">{SHARED_DATA}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&pages).unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { SHARED_DATA } from '../lib/shared';\n",
+            "import { Widget } from '../components/Widget';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return (\n",
+            "    <div>\n",
+            "      <span class=\"server\">{SHARED_DATA}</span>\n",
+            "      <Widget client:hydrate />\n",
+            "    </div>\n",
+            "  );\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = build_fixture(&dir);
+
+    // The server page renders its own value from shared.ts.
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(
+        html.contains("shared-value"),
+        "Server page should render the .ts value. Got:\n{}",
+        html
+    );
+
+    // The .ts file is compiled to the public tree (not _server/) so both
+    // client and server can import it.
+    assert!(
+        out.join("lib/shared.mjs").exists(),
+        "shared.ts must be compiled to public tree as shared.mjs"
+    );
+}

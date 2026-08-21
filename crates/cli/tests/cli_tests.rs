@@ -207,6 +207,176 @@ fn test_output_shape() {
     }
 }
 
+#[test]
+fn test_missing_hydrate_on_client_component_in_server_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Counter.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type CounterProps = { count: number; };\n",
+            "export function Counter(props: CounterProps) {\n",
+            "  return <div class=\"counter\">{props.count}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Bad.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Counter } from '../components/Counter';\n",
+            "type BadProps = {};\n",
+            "export function Bad(props: BadProps) {\n",
+            "  return <Counter count={42} />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on missing hydrate, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("MISSING_HYDRATE"),
+        "build error must carry the MISSING_HYDRATE code, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("pages/Bad.tsx"),
+        "error must be anchored at the page file, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_api_route_strips_ts_annotations_from_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = dir.path().join("api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    // API handler with TS annotations inside the body: `as`, `satisfies`,
+    // variable type annotations — all must be stripped from the .mjs output.
+    std::fs::write(
+        api.join("data.ts"),
+        concat!(
+            "// @runsOn api\n",
+            "export async function GET(req: Request): Promise<Response> {\n",
+            "  const name: string = 'world';\n",
+            "  const result = { greeting: `Hello ${name}` } as Record<string, string>;\n",
+            "  return Response.json(result);\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "build must succeed, got: {}",
+        stderr
+    );
+
+    let mjs = std::fs::read_to_string(out.join("_server/api/data.mjs")).unwrap();
+    // The function signature should be stripped of TS annotations.
+    assert!(
+        !mjs.contains(": Request"),
+        "return type and param type must be stripped. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains(": Promise<Response>"),
+        "return type must be stripped. Got:\n{}",
+        mjs
+    );
+    // Body-level TS annotations must also be stripped.
+    assert!(
+        !mjs.contains(": string"),
+        "body variable type annotation must be stripped. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("as Record"),
+        "as-assertion must be stripped. Got:\n{}",
+        mjs
+    );
+}
+
+#[test]
+fn test_hydrate_present_passes_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir(&components).unwrap();
+    std::fs::create_dir(&pages).unwrap();
+
+    std::fs::write(
+        components.join("Counter.tsx"),
+        concat!(
+            "// @runsOn client\n",
+            "type CounterProps = { count: number; };\n",
+            "export function Counter(props: CounterProps) {\n",
+            "  return <div class=\"counter\">{props.count}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Good.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Counter } from '../components/Counter';\n",
+            "type GoodProps = {};\n",
+            "export function Good(props: GoodProps) {\n",
+            "  return <Counter count={42} client:hydrate />;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "build must succeed when client:hydrate is present, got: {}",
+        stderr
+    );
+}
+
 /// Verify that diagnostics with real AST positions produce non-null coordinates.
 #[test]
 fn test_positions_are_not_all_null() {

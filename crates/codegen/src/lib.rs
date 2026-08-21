@@ -122,6 +122,59 @@ pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, S
     Ok(output)
 }
 
+/// §E3: plain .ts module codegen — compiles a value-only TypeScript file (no
+/// JSX, no component, no API handler) into an ESM .mjs module. The file may
+/// export const values, helper functions, or type declarations (stripped).
+/// Imports are rewritten by the same `rewrite_server_import` used for server
+/// components, so server-to-server .ts imports resolve correctly under _server/.
+pub fn generate_ts_module(
+    component: &ComponentFile,
+    rel: &Path,
+    server_files: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<String, String> {
+    let mut output = String::new();
+
+    // Emit all non-CSS imports. Public-tree .ts files keep their relative
+    // imports intact — they are compiled to the same path under dist/, so
+    // "./config" from dist/lib/helpers.mjs resolves to dist/lib/config.mjs.
+    // Only bare specifiers (e.g. @marisjs/runtime) pass through unchanged.
+    for imp in &component.imports {
+        if imp.is_css {
+            continue;
+        }
+        let source = if imp.source.starts_with("./") || imp.source.starts_with("../") {
+            // Append .mjs extension to the raw import specifier so the ESM
+            // loader finds the compiled module. Do NOT use rewrite_server_import
+            // — public .ts files live in the same tree as their consumers.
+            let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+            format!("{}.mjs", trimmed)
+        } else {
+            imp.source.clone()
+        };
+        let names = imp
+            .imported_names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!("import {{ {} }} from '{}';\n", names, source));
+    }
+    if !component.imports.is_empty() {
+        output.push('\n');
+    }
+
+    // module_statements are already TS-stripped by the parser. Emit them
+    // verbatim (the parser keeps `export` keywords on exported bindings).
+    for stmt in &component.module_statements {
+        output.push_str(&format!("{}\n", stmt));
+    }
+
+    if output.trim().is_empty() {
+        return Err("no module content emitted".to_string());
+    }
+    Ok(output)
+}
+
 /// §7d: middleware codegen. Emits dist/_server/middleware.mjs — a plain ESM
 /// module exporting:
 ///
@@ -533,6 +586,13 @@ fn generate_server(
 
     let mut output = String::new();
 
+    // §E3: emit ALL non-CSS imports, not just component imports. Plain value
+    // imports from .ts helper files are legitimate (the spec sanctions them;
+    // the validator accepts them) — silently dropping them caused runtime
+    // ReferenceErrors. Component imports get the same rewriting they always
+    // did; value imports are rewritten by the same function which now checks
+    // both .ts and .tsx extensions.
+    let mut emitted_sources = std::collections::HashSet::new();
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
         output.push_str(&format!(
@@ -540,8 +600,27 @@ fn generate_server(
             name,
             rewrite_server_import(rel, source, server_files)
         ));
+        emitted_sources.insert(source.clone());
     }
-    if !comp_imports.is_empty() {
+    for imp in &component.imports {
+        if imp.is_css || imp.source == "@marisjs/runtime" {
+            continue;
+        }
+        let normalized = format!(
+            "{}.mjs",
+            imp.source.trim_end_matches(".tsx").trim_end_matches(".ts")
+        );
+
+        if emitted_sources.contains(&normalized) {
+            continue;
+        }
+        output.push_str(&format!(
+            "import {{ {} }} from '{}';\n",
+            imp.imported_names.join(", "),
+            rewrite_server_import(rel, &imp.source, server_files)
+        ));
+    }
+    if !component.imports.is_empty() {
         output.push('\n');
     }
 
@@ -1188,9 +1267,25 @@ fn rewrite_server_import(
     }
 
     let imported_rel = normalize_join(rel.parent().unwrap_or(Path::new("")), source);
-    let imported_source = imported_rel.with_extension("tsx");
-    if server_files.contains(&imported_source) {
-        return source.to_string();
+    // §E3: check both .ts and .tsx extensions — value imports from plain .ts
+    // helper files are legitimate server-side imports (the spec sanctions them;
+    // the validator accepts them). Checking only .tsx caused these to be
+    // misidentified as client modules and silently rewritten to a path that
+    // doesn't exist.
+    for ext in ["tsx", "ts"] {
+        let imported_source = imported_rel.with_extension(ext);
+        if server_files.contains(&imported_source) {
+            // §E3: server-to-server import. Both modules are compiled under
+            // _server/. The source path (e.g. "../lib/data") resolves correctly
+            // from _server/pages/Index.mjs → _server/lib/data.mjs because both
+            // directories share the _server/ prefix. Strip any .ts/.tsx extension
+            // and append .mjs so the runtime loader finds the compiled module.
+            let trimmed = source
+                .trim_end_matches(".mjs")
+                .trim_end_matches(".tsx")
+                .trim_end_matches(".ts");
+            return format!("{}.mjs", trimmed);
+        }
     }
 
     // Client module — resolve a relative path from the server module's

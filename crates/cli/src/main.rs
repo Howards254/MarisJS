@@ -335,9 +335,29 @@ fn build_all(source: &str, out: &str) -> Result<usize, String> {
     // E4-01: pre-classify every compilable source file as server-side or not
     // BEFORE emitting anything, so server modules can rewrite imports of
     // client modules (hydrate islands) correctly.
-    let (server_files, runs_on_by_rel) = preclassify_files(source_dir)?;
+    let (server_files, runs_on_by_rel, ts_to_compile) = preclassify_files(source_dir)?;
 
     walk_and_build(source_dir, source_dir, out_dir, &mut count, &mut page_routes, &mut api_routes, &mut component_meta, &env, &server_files, &runs_on_by_rel)?;
+
+    // §E3: compile .ts value files imported by server components. These stay
+    // in the PUBLIC tree (not _server/) so both client and server can import
+    // them. Must run AFTER walk_and_build (which defines server_files) but
+    // BEFORE prerender (which needs the compiled .mjs to exist at import time).
+    for ts_rel in &ts_to_compile {
+        let ts_path = source_dir.join(ts_rel);
+        let out_path = out_dir.join(ts_rel).with_extension("mjs");
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {}", e))?;
+        }
+        let file_str = ts_path.to_str().ok_or("invalid path")?;
+        let component = parser::parse_component_file(file_str)
+            .map_err(|e| format!("parse error in {}: {}", ts_rel.display(), e))?;
+        let js = codegen::generate_ts_module(&component, ts_rel, &server_files)
+            .map_err(|e| format!("codegen error in {}: {}", ts_rel.display(), e))?;
+        std::fs::write(&out_path, js)
+            .map_err(|e| format!("write error for {}: {}", out_path.display(), e))?;
+        eprintln!("  compiled imported .ts → {}", ts_rel.display());
+    }
 
     // §7d: build the project-root middleware.ts (if any) into
     // dist/_server/middleware.mjs. Must run AFTER walk_and_build's
@@ -393,7 +413,7 @@ fn write_reload_timestamp(out_dir: &Path) {
 /// picture (a single file cannot know what its neighbors are).
 fn preclassify_files(
     source_dir: &Path,
-) -> Result<(HashSet<PathBuf>, HashMap<PathBuf, parser::RunsOn>), String> {
+) -> Result<(HashSet<PathBuf>, HashMap<PathBuf, parser::RunsOn>, Vec<PathBuf>), String> {
     let mut server_files = HashSet::new();
     let mut runs_on_by_rel: HashMap<PathBuf, parser::RunsOn> = HashMap::new();
     let mut stack: Vec<PathBuf> = vec![source_dir.to_path_buf()];
@@ -429,7 +449,7 @@ fn preclassify_files(
                     }
                 }
             } else if path.extension().map_or(false, |ext| ext == "ts")
-                && path.strip_prefix(source_dir).map_or(false, |rel| {
+                && path.strip_prefix(source_dir).map_err(|_| ()).map_or(false, |rel| {
                     rel == Path::new("middleware.ts")
                 })
             {
@@ -443,7 +463,49 @@ fn preclassify_files(
             }
         }
     }
-    Ok((server_files, runs_on_by_rel))
+
+    // §E3: second pass — identify .ts value files imported by server
+    // components. These stay in the PUBLIC tree (not _server/) so both client
+    // and server can import them. The actual compilation happens in build_all
+    // after walk_and_build, because out_dir isn't available here.
+    // §E3: follow imports transitively — helpers.ts importing config.ts must
+    // also be discovered even if helpers.ts itself is not a component.
+    let server_rels: Vec<PathBuf> = server_files.iter().cloned().collect();
+    let mut ts_to_compile: Vec<PathBuf> = Vec::new();
+    let mut worklist: Vec<PathBuf> = server_rels
+        .iter()
+        .filter(|r| r.extension().map_or(false, |ext| ext == "tsx"))
+        .cloned()
+        .collect();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    while let Some(rel) = worklist.pop() {
+        if !visited.insert(rel.clone()) {
+            continue;
+        }
+        let file_path = source_dir.join(&rel);
+        let Some(file_str) = file_path.to_str() else { continue };
+        let Ok(component) = parser::parse_component_file(file_str) else { continue };
+        for imp in &component.imports {
+            if imp.is_css
+                || !(imp.source.starts_with("./") || imp.source.starts_with("../"))
+            {
+                continue;
+            }
+            let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+            let resolved = normalize_path(&rel.parent().unwrap_or(Path::new("")).join(trimmed));
+            let ts_rel = PathBuf::from(format!("{}.ts", resolved));
+            if ts_rel.extension().map_or(false, |e| e == "ts")
+                && source_dir.join(&ts_rel).is_file()
+                && !ts_to_compile.contains(&ts_rel)
+            {
+                ts_to_compile.push(ts_rel.clone());
+                // Also follow the .ts file's own imports transitively.
+                worklist.push(ts_rel);
+            }
+        }
+    }
+
+    Ok((server_files, runs_on_by_rel, ts_to_compile))
 }
 
 fn walk_and_build(
@@ -667,6 +729,57 @@ walk_and_build(base, &path, out_base, count, page_routes, api_routes, component_
                         diag.message,
                         diag.fix_hint
                     ));
+                }
+            }
+
+            // §E3: client components used in server files MUST carry
+            // client:hydrate — the server codegen would otherwise call the
+            // component function as a server-side function, which crashes
+            // during prerender (DOM APIs like signal() are not available in
+            // Node). The check is build-orchestrated because only the CLI
+            // knows each imported component's runs_on.
+            if component.runs_on == Some(parser::RunsOn::Server) {
+                if let Some(ref tree) = component.render_tree {
+                    let usages = parser::collect_component_usages(tree);
+                    for (tag, is_hydrate) in &usages {
+                        if *is_hydrate {
+                            continue;
+                        }
+                        // Resolve the component tag through imports.
+                        let mut target_runs_on: Option<parser::RunsOn> = None;
+                        // Check if the tag is the file's own export.
+                        if component.exports.iter().any(|e| e.name == *tag) {
+                            target_runs_on = component.runs_on.clone();
+                        } else {
+                            for imp in &component.imports {
+                                if imp.is_css
+                                    || !(imp.source.starts_with("./") || imp.source.starts_with("../"))
+                                    || !imp.imported_names.contains(tag)
+                                {
+                                    continue;
+                                }
+                                let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+                                let target_rel = normalize_path(&file_parent.join(trimmed));
+                                for ext in ["tsx", "ts"] {
+                                    let target_key = PathBuf::from(format!("{}.{}", target_rel, ext));
+                                    if let Some(ro) = runs_on_by_rel.get(&target_key) {
+                                        target_runs_on = Some(ro.clone());
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        if target_runs_on == Some(parser::RunsOn::Client) {
+                            return Err(format!(
+                                "{}:{} — MISSING_HYDRATE: component '{}' is @runsOn client but is used without client:hydrate in a server file. The server prerender would call the component function directly, which crashes because client DOM APIs (signal(), document, ...) are unavailable in Node. (fix: add client:hydrate to the JSX tag, e.g. `<{} client:hydrate />`)",
+                                rel.display(),
+                                component.imports.iter().find(|i| i.imported_names.contains(tag)).map(|i| i.line).unwrap_or(1),
+                                tag,
+                                tag,
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -1036,10 +1149,47 @@ fn resolve_client_import(server_rel: &Path, root_name: &str, imports: &[parser::
     Ok(normalize_path(&resolved))
 }
 
+/// Convert a PascalCase or camelCase string to kebab-case.
+/// Handles sequences of uppercase letters (e.g. "HTMLElement" → "html-element")
+/// and standard camelCase boundaries (e.g. "BlogPost" → "blog-post").
+fn pascal_to_kebab(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(s.len() + 4);
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if c == '_' || c == '-' {
+            result.push('-');
+            continue;
+        }
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1).copied();
+            // Insert hyphen if:
+            // - prev was lowercase (camelCase boundary: "blogPost" → "blog-post")
+            // - prev was uppercase AND next is lowercase (acronym end: "HTMLElement" → "html-element")
+            let at_acronym_end = prev.is_uppercase() && next.map_or(false, |n| n.is_lowercase());
+            let at_word_start = prev.is_lowercase();
+            if at_word_start || at_acronym_end {
+                result.push('-');
+            }
+        }
+        result.push(c.to_lowercase().next().unwrap_or(c));
+    }
+    result
+}
+
 fn page_file_to_route(rel: &Path) -> String {
     let s = rel.with_extension("").to_str().unwrap_or("").to_string();
     let path = s.strip_prefix("pages/").or_else(|| s.strip_prefix("pages")).unwrap_or(&s);
-    let path = path.to_lowercase(); // lowercase for URL convention
+    // Convert each segment to kebab-case for clean URLs.
+    let path: String = path
+        .split('/')
+        .map(pascal_to_kebab)
+        .collect::<Vec<_>>()
+        .join("/");
     if path.is_empty() || path == "index" || path.ends_with("/index") {
         let parent = Path::new(&path).parent().and_then(|p| p.to_str()).unwrap_or("");
         if parent.is_empty() { return "/".to_string(); }
@@ -2249,5 +2399,33 @@ mod mime_tests {
         assert_eq!(api_file_to_route(std::path::Path::new("api/billing/charge.ts")), "/api/billing/charge");
         assert_eq!(api_file_to_route(std::path::Path::new("api/Index.ts")), "/api");
         assert_eq!(api_file_to_route(std::path::Path::new("api/webhooks/stripe.ts")), "/api/webhooks/stripe");
+    }
+
+    // ── §E4-05 kebab-case route derivation ─────────────────────────────
+
+    use super::{page_file_to_route, pascal_to_kebab};
+
+    #[test]
+    fn pascal_to_kebab_converts_correctly() {
+        assert_eq!(pascal_to_kebab("Index"), "index");
+        assert_eq!(pascal_to_kebab("About"), "about");
+        assert_eq!(pascal_to_kebab("BlogPost"), "blog-post");
+        assert_eq!(pascal_to_kebab("NotFoundPage"), "not-found-page");
+        assert_eq!(pascal_to_kebab("UserProfile"), "user-profile");
+        assert_eq!(pascal_to_kebab("HTMLElement"), "html-element");
+        assert_eq!(pascal_to_kebab("XMLParser"), "xml-parser");
+        assert_eq!(pascal_to_kebab("API"), "api");
+        assert_eq!(pascal_to_kebab("AboutUs"), "about-us");
+    }
+
+    #[test]
+    fn page_routes_are_kebab_case() {
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/Index.tsx")), "/");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/About.tsx")), "/about");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/BlogPost.tsx")), "/blog-post");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/NotFoundPage.tsx")), "/not-found-page");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/UserProfile.tsx")), "/user-profile");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/blog/Post.tsx")), "/blog/post");
+        assert_eq!(page_file_to_route(std::path::Path::new("pages/Docs/Api/Signals.tsx")), "/docs/api/signals");
     }
 }

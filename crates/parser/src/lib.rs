@@ -1166,7 +1166,19 @@ fn visit_module(&mut self, n: &Module) {
                     }
                 }
                 _ => {
-                    if let Ok(src) = self.cm.span_to_snippet(stmt.span()) {
+                    // Skip type-only declarations — they produce invalid JS
+                    // when emitted verbatim. Type aliases, interfaces, enums,
+                    // and `declare` statements are TypeScript-only constructs
+                    // that have no runtime representation.
+                    if matches!(
+                        stmt,
+                        Stmt::Decl(Decl::TsTypeAlias(_))
+                            | Stmt::Decl(Decl::TsInterface(_))
+                            | Stmt::Decl(Decl::TsEnum(_))
+                            | Stmt::Decl(Decl::TsModule(_))
+                    ) {
+                        // skip
+                    } else if let Ok(src) = self.cm.span_to_snippet(stmt.span()) {
                         self.file.module_statements.push(src);
                     }
                 }
@@ -2033,6 +2045,34 @@ pub fn collect_children_call_tags(tree: &JsxNode) -> Vec<String> {
     tags
 }
 
+/// Returns all component usages in the render tree as (tag, is_hydrate_root)
+/// pairs. Used by the CLI to enforce that client components in server files
+/// always carry `client:hydrate`.
+pub fn collect_component_usages(tree: &JsxNode) -> Vec<(String, bool)> {
+    let mut usages = Vec::new();
+    collect_component_usages_in(tree, &mut usages);
+    usages
+}
+
+fn collect_component_usages_in(node: &JsxNode, out: &mut Vec<(String, bool)>) {
+    match node {
+        JsxNode::Element { tag, is_component, is_hydrate_root, children, .. } => {
+            if *is_component {
+                out.push((tag.clone(), *is_hydrate_root));
+            }
+            for child in children {
+                collect_component_usages_in(child, out);
+            }
+        }
+        JsxNode::Conditional { cons, alt, .. } => {
+            collect_component_usages_in(cons, out);
+            collect_component_usages_in(alt, out);
+        }
+        JsxNode::ForEach { body, .. } => collect_component_usages_in(body, out),
+        _ => {}
+    }
+}
+
 fn collect_children_call_tags_in(node: &JsxNode, tags: &mut Vec<String>) {
     match node {
         JsxNode::Element { tag, children, is_component, .. } => {
@@ -2851,10 +2891,14 @@ fn strip_ts_annotations(src: &str, stmt_span: Span, fn_decl: &FnDecl) -> String 
 }
 
 /// Strip TS type annotations from a variable declaration using AST span info.
+/// Also strips type assertions (`as T`, `satisfies T`) from initializer expressions.
 fn strip_var_ts(src: &str, stmt_span: Span, var_decl: &VarDecl) -> String {
     let mut spans = Vec::new();
     for decl in &var_decl.decls {
         collect_pat_type_span(&decl.name, &mut spans);
+        if let Some(init) = &decl.init {
+            collect_expr_ts_spans(init, &mut spans);
+        }
     }
     splice_out_spans(src, stmt_span, &spans)
 }
@@ -2877,6 +2921,12 @@ fn collect_fn_ts_spans(func: &Function) -> Vec<Span> {
         collect_pat_type_span(&param.pat, &mut spans);
     }
 
+    // Recurse into function body to strip body-level type annotations,
+    // `as T` casts, `satisfies T`, non-null assertions, etc.
+    if let Some(body) = &func.body {
+        collect_body_ts_spans(body, &mut spans);
+    }
+
     spans
 }
 
@@ -2890,6 +2940,215 @@ fn collect_pat_type_span(pat: &Pat, spans: &mut Vec<Span>) {
         Pat::Rest(rest) => {
             collect_pat_type_span(&rest.arg, spans);
         }
+        _ => {}
+    }
+}
+
+/// Recursively walk a function body to collect all TS-only spans that must be
+/// stripped: variable type annotations, `as T` / `satisfies T` casts, type
+/// parameter declarations on nested functions/closures, and non-null assertions.
+fn collect_body_ts_spans(block: &BlockStmt, spans: &mut Vec<Span>) {
+    for stmt in &block.stmts {
+        collect_stmt_ts_spans(stmt, spans);
+    }
+}
+
+fn collect_stmt_ts_spans(stmt: &Stmt, spans: &mut Vec<Span>) {
+    match stmt {
+        Stmt::Decl(Decl::Var(var)) => {
+            for decl in &var.decls {
+                collect_pat_type_span(&decl.name, spans);
+                if let Some(init) = &decl.init {
+                    collect_expr_ts_spans(init, spans);
+                }
+            }
+        }
+        Stmt::Decl(Decl::Fn(fn_decl)) => {
+            let func_ts = collect_fn_ts_spans(&fn_decl.function);
+            spans.extend(func_ts);
+        }
+        Stmt::Return(ret) => {
+            if let Some(arg) = &ret.arg {
+                collect_expr_ts_spans(arg, spans);
+            }
+        }
+        Stmt::Expr(expr) => {
+            collect_expr_ts_spans(&expr.expr, spans);
+        }
+        Stmt::If(if_stmt) => {
+            collect_expr_ts_spans(&if_stmt.test, spans);
+            collect_stmt_ts_spans(&if_stmt.cons, spans);
+            if let Some(alt) = &if_stmt.alt {
+                collect_stmt_ts_spans(&alt, spans);
+            }
+        }
+        Stmt::For(for_stmt) => {
+            if let Some(VarDeclOrExpr::Expr(expr)) = &for_stmt.init {
+                collect_expr_ts_spans(expr, spans);
+            }
+            if let Some(test) = &for_stmt.test {
+                collect_expr_ts_spans(test, spans);
+            }
+            if let Some(update) = &for_stmt.update {
+                collect_expr_ts_spans(update, spans);
+            }
+            collect_stmt_ts_spans(&for_stmt.body, spans);
+        }
+        Stmt::ForIn(for_in) => {
+            collect_expr_ts_spans(&for_in.right, spans);
+            collect_stmt_ts_spans(&for_in.body, spans);
+        }
+        Stmt::ForOf(for_of) => {
+            collect_expr_ts_spans(&for_of.right, spans);
+            collect_stmt_ts_spans(&for_of.body, spans);
+        }
+        Stmt::Switch(switch) => {
+            collect_expr_ts_spans(&switch.discriminant, spans);
+            for case in &switch.cases {
+                if let Some(test) = &case.test {
+                    collect_expr_ts_spans(test, spans);
+                }
+                for stmt in &case.cons {
+                    collect_stmt_ts_spans(stmt, spans);
+                }
+            }
+        }
+        Stmt::Try(try_stmt) => {
+            collect_body_ts_spans(&try_stmt.block, spans);
+            if let Some(ref catch) = try_stmt.handler {
+                if let Some(param) = &catch.param {
+                    collect_pat_type_span(param, spans);
+                }
+                collect_body_ts_spans(&catch.body, spans);
+            }
+            if let Some(finalizer) = &try_stmt.finalizer {
+                collect_body_ts_spans(finalizer, spans);
+            }
+        }
+        Stmt::Block(block) => {
+            collect_body_ts_spans(block, spans);
+        }
+        Stmt::Throw(throw) => {
+            collect_expr_ts_spans(&throw.arg, spans);
+        }
+        Stmt::Labeled(labeled) => {
+            collect_stmt_ts_spans(&labeled.body, spans);
+        }
+        Stmt::While(while_stmt) => {
+            collect_expr_ts_spans(&while_stmt.test, spans);
+            collect_stmt_ts_spans(&while_stmt.body, spans);
+        }
+        _ => {}
+    }
+}
+
+fn collect_expr_ts_spans(expr: &Expr, spans: &mut Vec<Span>) {
+    match expr {
+        Expr::TsAs(ts_as) => {
+            spans.push(ts_as.type_ann.span());
+            collect_expr_ts_spans(&ts_as.expr, spans);
+        }
+        Expr::TsSatisfies(ts_sat) => {
+            spans.push(ts_sat.type_ann.span());
+            collect_expr_ts_spans(&ts_sat.expr, spans);
+        }
+        Expr::TsTypeAssertion(ts_assert) => {
+            spans.push(ts_assert.type_ann.span());
+            collect_expr_ts_spans(&ts_assert.expr, spans);
+        }
+        Expr::TsNonNull(ts_nn) => {
+            spans.push(ts_nn.span);
+            collect_expr_ts_spans(&ts_nn.expr, spans);
+        }
+        Expr::TsInstantiation(ts_inst) => {
+            spans.push(ts_inst.type_args.span);
+            collect_expr_ts_spans(&ts_inst.expr, spans);
+        }
+        Expr::Arrow(arrow) => {
+            if let Some(type_params) = &arrow.type_params {
+                spans.push(type_params.span);
+            }
+            if let Some(ret) = &arrow.return_type {
+                spans.push(ret.span);
+            }
+            for param in &arrow.params {
+                collect_pat_type_span(param, spans);
+            }
+            match &*arrow.body {
+                BlockStmtOrExpr::BlockStmt(block) => collect_body_ts_spans(block, spans),
+                BlockStmtOrExpr::Expr(expr) => collect_expr_ts_spans(expr, spans),
+            }
+        }
+        Expr::Paren(paren) => {
+            collect_expr_ts_spans(&paren.expr, spans);
+        }
+        Expr::Cond(cond) => {
+            collect_expr_ts_spans(&cond.test, spans);
+            collect_expr_ts_spans(&cond.cons, spans);
+            collect_expr_ts_spans(&cond.alt, spans);
+        }
+        Expr::Call(call) => {
+            if let Callee::Expr(callee_expr) = &call.callee {
+                collect_expr_ts_spans(callee_expr, spans);
+            }
+            for arg in &call.args {
+                collect_expr_ts_spans(&arg.expr, spans);
+            }
+        }
+        Expr::Bin(bin) => {
+            collect_expr_ts_spans(&bin.left, spans);
+            collect_expr_ts_spans(&bin.right, spans);
+        }
+        Expr::Assign(assign) => {
+            collect_expr_ts_spans(&assign.right, spans);
+        }
+        Expr::Tpl(tpl) => {
+            for expr in &tpl.exprs {
+                collect_expr_ts_spans(expr, spans);
+            }
+        }
+        Expr::Array(arr) => {
+            for elem in &arr.elems {
+                if let Some(elem) = elem {
+                    collect_expr_ts_spans(&elem.expr, spans);
+                }
+            }
+        }
+        Expr::Object(obj) => {
+            for prop in &obj.props {
+                if let PropOrSpread::Prop(prop) = prop {
+                    if let Prop::KeyValue(kv) = &**prop {
+                        collect_expr_ts_spans(&kv.value, spans);
+                    }
+                }
+            }
+        }
+        Expr::Seq(seq) => {
+            for expr in &seq.exprs {
+                collect_expr_ts_spans(expr, spans);
+            }
+        }
+        Expr::Await(await_expr) => {
+            collect_expr_ts_spans(&await_expr.arg, spans);
+        }
+        Expr::OptChain(opt) => {
+            if let OptChainBase::Member(member) = &*opt.base {
+                collect_expr_ts_spans(&member.obj, spans);
+            }
+        }
+        Expr::Member(member) => {
+            collect_expr_ts_spans(&member.obj, spans);
+        }
+        Expr::TaggedTpl(tagged) => {
+            collect_expr_ts_spans(&tagged.tag, spans);
+        }
+        Expr::Unary(unary) => {
+            collect_expr_ts_spans(&unary.arg, spans);
+        }
+        Expr::Update(update) => {
+            collect_expr_ts_spans(&update.arg, spans);
+        }
+        Expr::Lit(_) | Expr::Ident(_) | Expr::This(_) => {}
         _ => {}
     }
 }
