@@ -7,7 +7,7 @@
 A strict, signals-based, AI-agent-oriented full-stack framework for the web.
 
 marisjs is a small subset of TSX, compiled by a Rust toolchain straight to plain, vanilla
-JavaScript — no virtual DOM, no hydration overhead, no framework runtime beyond a ~2.8KB
+JavaScript — no virtual DOM, no hydration overhead, no framework runtime beyond a ~5.4KB
 signals library. It's designed from the ground up to be easy for a coding agent to generate
 correctly: one canonical way to do each thing, explicit rules a fast validator can check
 mid-generation, and no hidden execution order to get wrong.
@@ -157,13 +157,92 @@ export function Counter(props: Props) {
 On first build the server page is pre-rendered to static HTML. Client islands are hydrated
 on page load.
 
+Islands may also receive **JSX children** from the server page. The children are rendered on
+the server *inside* the hydrate placeholder — so the content exists in the prerendered HTML
+(crawlable, visible before JS loads) — and the runtime adopts that exact DOM at mount time
+instead of re-rendering it:
+
+```tsx
+<Tabs tabs={['Design', 'Build']} client:hydrate>
+  <div class="panels">…server-rendered panels…</div>
+</Tabs>
+```
+
+## Page metadata, sitemap & robots
+
+A server page declares `<head>` content by assigning a raw HTML string to a `const head`
+(injected verbatim into the built page's head), or by using the `meta()` helper, which emits
+a fixed, escaped tag set (`title`, `description`, Open Graph fields, `twitterCard`,
+`noindex`) and composes with raw HTML (e.g. a JSON-LD `<script>` block):
+
+```tsx
+const head = meta({
+  title: 'MarisJS',
+  description: 'A tiny, opinionated web framework.',
+  ogImage: 'https://marisjs.example/og.png',
+});
+```
+
+`marisjs build` also writes `sitemap.xml` at the output root (every page route included;
+API routes excluded; `meta({ noindex: true })` excludes a page; requires `SITE_URL` in the
+environment — skipped with a warning if unset) and a permissive default `robots.txt` unless
+the project provides its own at the source root. See the grammar spec's §2b for the exact
+contracts.
+
+## API routes, env, sessions & middleware
+
+Alongside `pages/`, a top-level `api/` directory holds HTTP endpoints mapped to `/api/*`
+URLs (`api/checkout.ts` → `/api/checkout`). Every file declares `// @runsOn api` and
+exports one function per HTTP method — the export list *is* the supported-methods list.
+Handlers receive and return standard Web `Request`/`Response` objects; async handlers are
+the norm:
+
+```tsx
+// src/api/checkout.ts
+// @runsOn api
+
+export async function POST(req: Request): Promise<Response> {
+  const key = env("STRIPE_SECRET_KEY");   // build-time secret, never shipped to clients
+  const body = await req.json();
+  // ...call an external service...
+  return Response.json({ received: true });
+}
+```
+
+Three more server-side primitives, all validator-enforced (calling any of them from a
+`@runsOn client` file is a hard error — none need an import; the compiler injects them):
+
+- **`env(key)`** — reads a value from `.env`/process environment at build time and bakes it
+  into compiled server/api modules only. A missing key yields `undefined`, so
+  `env("PORT") ?? "3000"` works.
+- **`session()` / `setSession(data, response)`** — stateless HMAC-signed cookie sessions
+  (`HttpOnly`, `SameSite=Lax`, `Secure` when built with `NODE_ENV=production`,
+  constant-time verification, every failure mode degrades safely to `null`). Modules using
+  sessions fail the build unless a strong `SESSION_SECRET` (16+ chars) is present.
+- **`middleware(req)`** — one optional `middleware.ts` at the project root gates matching
+  requests *before* any dispatch. It returns exactly one of `next()`, `redirect(url)`, or
+  `respond(response)`, scoped by a static `matcher` array (`*` wildcard supported).
+
+```ts
+// middleware.ts — project root
+export function middleware(req: Request) {
+  const s = session();
+  if (!s) return redirect('/login');
+  return next();
+}
+
+export const matcher: string[] = ['/admin/*'];
+```
+
+Dispatch precedence: middleware → API routes → pages/SSR → static files.
+
 ## CLI commands
 
 | Command | Description |
 |---------|-------------|
-| `marisjs dev` | Dev server with hot reload on file change (defaults: `src/` → `dist/`) |
+| `marisjs dev` | Dev server with hot reload on file change (defaults: `src/` → `dist/`; serves pages, API routes, and middleware) |
 | `marisjs build` | Compile source directory to static output (defaults: `src/` → `dist/`) |
-| `marisjs init` | Scaffold a starter `package.json` with `dev`/`build` scripts |
+| `marisjs init` | Scaffold a starter `package.json` with `dev`/`build` scripts, plus a `.gitignore` excluding `.env` and a `.env.example` |
 | `marisjs validate ./src/App.tsx` | Check a single file for errors |
 
 ## Language rules
@@ -172,7 +251,7 @@ The full grammar spec is at [`docs/framework-grammar-spec.md`](docs/framework-gr
 Key constraints:
 
 - One component per file. Filename must match the exported component name.
-- Every file begins with `// @runsOn client` or `// @runsOn server`.
+- Every file begins with `// @runsOn client`, `// @runsOn server`, or `// @runsOn api`.
 - Reactive state via `signal(initial)` and `computed(() => expr)` from `@marisjs/runtime`.
 - Lists use `<For each={array} key={fn}>{(item) => <li>...</li>}</For>` — no `.map()` in JSX.
 - Props are a single typed parameter (`props: MyType`), never destructured.
@@ -215,8 +294,8 @@ See [`docs/mcp-server.md`](docs/mcp-server.md) for build instructions and develo
 
 | Adapter | Package | Description |
 |---------|---------|-------------|
-| Node.js server | `@marisjs/adapter-node` | Zero-dependency HTTP server. Re-executes server routes per request, serves static routes from disk. `npx @marisjs/adapter-node ./dist` |
-| Static output | `@marisjs/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error if any route requires server execution. `npx @marisjs/adapter-static ./dist ./out` |
+| Node.js server | `@marisjs/adapter-node` | Zero-dependency HTTP server. Runs middleware, dispatches API routes, re-executes server routes per request, serves static routes from disk. `npx @marisjs/adapter-node ./dist` |
+| Static output | `@marisjs/adapter-static` | Produces a directory of HTML/CSS/JS for any static host (S3, GitHub Pages, Cloudflare Pages). Fails with a clear error listing every route that requires server execution — server-mode pages, API routes, and middleware. `npx @marisjs/adapter-static ./dist ./out` |
 
 See [`docs/adapter-interface.md`](docs/adapter-interface.md) for the adapter contract, and
 [`docs/writing-an-adapter.md`](docs/writing-an-adapter.md) for a walkthrough on writing your own.
@@ -236,7 +315,7 @@ See the `examples/` directory:
 ## Size
 
 A full `npm install marisjs` on Linux x64 is **4.9 MB** (16 KB wrapper + 4.8 MB native
-binary). No runtime dependencies beyond Node.js >= 18. The reactive runtime is 2,812 bytes
+binary). No runtime dependencies beyond Node.js >= 18. The reactive runtime is 5,450 bytes
 of zero-dependency JavaScript, embedded in the CLI binary at compile time.
 
 ## Cross-platform
@@ -264,9 +343,25 @@ native binary at runtime.
   state across parent re-renders.
 - Server-side rendering with `@runsOn server` components, including server-fetched data via
   `data()`.
-- File-based routing (`pages/` directory → URL paths).
-- Plain, co-located CSS files, globally scoped.
-- A local dev server with rebuild-on-save.
+- File-based routing (`pages/` directory → URL paths) and file-based API routes (`api/`
+  directory → `/api/*`, one exported handler per HTTP method over standard Web
+  `Request`/`Response`).
+- Build-time environment secrets via `env()` (`.env` + process env snapshot baked into
+  server/api modules only; `CLIENT_ENV_ACCESS` is a hard validator error).
+- Stateless signed-cookie sessions: `session()` / `setSession()` with HMAC-SHA256,
+  constant-time verification, `HttpOnly`/`SameSite=Lax`/`Secure`-in-production cookies,
+  and a build-time `SESSION_SECRET` strength gate.
+- A site-wide middleware gate: one optional root `middleware.ts` with a static `matcher`,
+  returning exactly `next()`, `redirect()`, or `respond()` — run before any dispatch by the
+  dev server and adapter-node.
+- Islands that accept server-composed JSX children — content is prerendered inside the
+  hydrate placeholder (crawlable) and adopted client-side at mount (§6a/§7e of the spec).
+- Page metadata and SEO: raw `const head` HTML, the `meta()` helper (exact escaped tag
+  contract), generated `sitemap.xml` (`SITE_URL`-driven, `noindex`-aware), default
+  `robots.txt`, verbatim JSON-LD passthrough.
+- Plain, co-located CSS files, globally scoped, copied verbatim — with a build-time
+  `CSS_CLASS_COLLISION` warning calibrated against intentional overlap patterns.
+- A local dev server with rebuild-on-save serving pages, API routes, and middleware.
 - A structured, agent-callable validator, available as both a CLI command and an MCP tool.
 - Two reference deployment adapters (Node.js server and static output).
 
@@ -281,7 +376,7 @@ native binary at runtime.
   expressions, tagged templates, and a few other constructs. This is deliberate scope, not
   an oversight — see the spec for the full list.
 - **A few known compiler limitations are tracked and documented in the spec** — see
-  Section 8 for the current list.
+  Section 9 for the current list.
 
 ## Philosophy
 
