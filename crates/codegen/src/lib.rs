@@ -575,14 +575,17 @@ fn generate_server(
     let has_data = component.has_data_call;
     let hydrates = collect_hydrate_roots(render_tree);
 
-    // A server page may declare `const head = '...'` (raw HTML injected into the
-    // built page's <head>). Codegen includes it in the return object as `head`.
-    let has_head = component.derived_consts.iter().any(|line| {
-        let t = line.trim_start();
-        t.strip_prefix("const")
-            .map(|rest| rest.trim_start().split([' ', '=']).next().unwrap_or("") == "head")
-            .unwrap_or(false)
-    });
+    // A server page may declare `const head = meta({...})` or raw HTML
+    // injected into the built page's <head>. Codegen includes it in the
+    // return object as `head`. The check covers both derived_consts
+    // (component-body) and head_parts (module-scope via process_const_meta).
+    let has_head = component.head_parts.is_some()
+        || component.derived_consts.iter().any(|line| {
+            let t = line.trim_start();
+            t.strip_prefix("const")
+                .map(|rest| rest.trim_start().split([' ', '=']).next().unwrap_or("") == "head")
+                .unwrap_or(false)
+        });
 
     let mut output = String::new();
 
@@ -684,6 +687,7 @@ fn generate_server(
         ));
     }
 
+    let mut head_from_derived = false;
     for dc in &component.derived_consts {
         if component.head_parts.is_some() {
             let t = dc.trim_start();
@@ -693,11 +697,22 @@ fn generate_server(
                 .unwrap_or(false);
             if is_head {
                 output.push_str(&format!("  {};\n", expand_head_parts(component)));
+                head_from_derived = true;
                 continue;
             }
         }
         for line in dc.lines() {
             output.push_str(&format!("  {}\n", line));
+        }
+    }
+
+    // §E2.1: module-scope `const head = meta({...})` — head_parts is set by
+    // process_const_meta but the const was removed from module_consts to avoid
+    // emitting raw meta(). Emit expand_head_parts here so the prerendered
+    // HTML gets the correct <meta>/<title> tags.
+    if has_head && !head_from_derived {
+        if component.head_parts.is_some() {
+            output.push_str(&format!("  {};\n", expand_head_parts(component)));
         }
     }
 

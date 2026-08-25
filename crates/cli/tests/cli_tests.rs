@@ -267,6 +267,186 @@ fn test_missing_hydrate_on_client_component_in_server_file() {
 }
 
 #[test]
+fn test_server_page_strips_non_null_as_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir_all(&pages).unwrap();
+
+    // Server page with TsNonNull (!), TsAs (as T), and TsSatisfies (satisfies T)
+    // in the component body. All three must be stripped from the .mjs output
+    // while preserving the underlying expressions. Prerender EXECUTES this
+    // code, so every expression must be runtime-valid once stripped.
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type Foo = { bar: string };\n",
+            "export function Index(props: {}) {\n",
+            "  const a = 'hello'!;\n",
+            "  const b = { bar: 'world' } as Foo;\n",
+            "  const c = 42 satisfies number;\n",
+            "  // chained combinations must generalize, not just isolated forms\n",
+            "  const d = ['z']![0];\n",
+            "  const e = ({ n: 7 })! as Foo;\n",
+            "  return <div>{a} {b.bar} {c}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "build must succeed, got: {}",
+        stderr
+    );
+
+    let mjs = std::fs::read_to_string(out.join("_server/pages/Index.mjs")).unwrap();
+
+    // TsNonNull: only the ! is removed, the expression must remain.
+    assert!(
+        mjs.contains("'hello'"),
+        "TsNonNull must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("'hello'!"),
+        "TsNonNull ! must be removed. Got:\n{}",
+        mjs
+    );
+
+    // TsAs: both `as Foo` and the type are removed, expression preserved.
+    assert!(
+        mjs.contains("{ bar: 'world' }"),
+        "TsAs must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("as Foo"),
+        "TsAs `as Foo` must be removed. Got:\n{}",
+        mjs
+    );
+
+    // TsSatisfies: both `satisfies number` and the type are removed.
+    assert!(
+        mjs.contains("42"),
+        "TsSatisfies must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("satisfies number"),
+        "TsSatisfies `satisfies number` must be removed. Got:\n{}",
+        mjs
+    );
+
+    // Chained: mid-chain non-null must keep the member access.
+    assert!(
+        mjs.contains("['z'][0]"),
+        "chained TsNonNull must preserve member access. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("['z']!"),
+        "chained TsNonNull ! must be removed. Got:\n{}",
+        mjs
+    );
+
+    // Chained: non-null wrapped in as-cast must remove BOTH.
+    assert!(
+        !mjs.contains("})!") && !mjs.contains("as Foo"),
+        "chained non-null + as-cast must strip both the ! and the cast. Got:\n{}",
+        mjs
+    );
+}
+
+#[test]
+fn test_api_route_strips_non_null_as_satisfies() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = dir.path().join("api");
+    std::fs::create_dir_all(&api).unwrap();
+
+    // API handler with TsNonNull (!), TsAs (as T), and TsSatisfies (satisfies T)
+    // in the function body. All three must be stripped from the .mjs output.
+    std::fs::write(
+        api.join("data.ts"),
+        concat!(
+            "// @runsOn api\n",
+            "type Res = { ok: boolean };\n",
+            "export async function GET(req: Request) {\n",
+            "  const a = fetch('/api')!;\n",
+            "  const b = JSON.parse('{}') as Res;\n",
+            "  const c = JSON.parse('[]') satisfies unknown[];\n",
+            "  return Response.json({ a, b, c });\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "build must succeed, got: {}",
+        stderr
+    );
+
+    let mjs = std::fs::read_to_string(out.join("_server/api/data.mjs")).unwrap();
+
+    // TsNonNull: only the ! is removed.
+    assert!(
+        mjs.contains("fetch('/api')"),
+        "TsNonNull must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("fetch('/api')!"),
+        "TsNonNull ! must be removed. Got:\n{}",
+        mjs
+    );
+
+    // TsAs: `as Res` is removed.
+    assert!(
+        mjs.contains("JSON.parse('{}')"),
+        "TsAs must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("as Res"),
+        "TsAs `as Res` must be removed. Got:\n{}",
+        mjs
+    );
+
+    // TsSatisfies: `satisfies unknown[]` is removed.
+    assert!(
+        mjs.contains("JSON.parse('[]')"),
+        "TsSatisfies must preserve the expression. Got:\n{}",
+        mjs
+    );
+    assert!(
+        !mjs.contains("satisfies unknown[]"),
+        "TsSatisfies `satisfies unknown[]` must be removed. Got:\n{}",
+        mjs
+    );
+}
+
+#[test]
 fn test_api_route_strips_ts_annotations_from_body() {
     let dir = tempfile::tempdir().unwrap();
     let api = dir.path().join("api");

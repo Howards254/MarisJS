@@ -653,6 +653,116 @@ const products = await data(async () => {
 <Cart items={products} client:hydrate />
 ```
 
+#### 6a. Islands and SEO — the empty-placeholder fact, and the sanctioned pattern
+
+**Stated plainly, because it is load-bearing:** a `client:hydrate` component used WITHOUT
+children prerenders to an **empty placeholder**:
+
+```html
+<!-- what the crawler / no-JS visitor sees for <Cart items={products} client:hydrate /> -->
+<div data-hydrate="Cart" data-props='...'></div>
+```
+
+The server does not execute client components (they may contain DOM code that crashes
+Node), so there is nothing to bake into the HTML. Everything the component would render
+appears only when the browser loads the bundle and `mount()` runs. The prerendered page is
+also the SEO surface: a search crawler that does not execute JavaScript sees an empty box.
+If the content inside such an island matters — service descriptions, product copy,
+article text — it is invisible to search engines. This is not a bug and will not be
+"fixed": it is the direct consequence of the boundary rule above, stated here so nobody
+discovers it from analytics.
+
+**The sanctioned pattern for SEO-visible interactive content is children-based composition**
+(§7e): pass the content as JSX children from the server page. The children are
+server-composed by construction, so SSR renders them INSIDE the placeholder; at mount time
+the runtime ADOPTS the existing DOM (`el.firstChild`) as the `children` value instead of
+re-rendering it. The content is in the prerendered HTML (crawlable, visible before JS
+loads); the island adds interactivity on top of markup that already exists.
+
+Worked example — a services page whose tabbed teasers must rank, with tab switching as
+progressive enhancement only:
+
+```tsx
+// src/components/ServiceTabs.tsx
+// @runsOn client
+import { signal } from '@marisjs/runtime';
+
+type ServiceTabsProps = {
+  tabs: string[];
+  active?: string;
+  children: JSX.Element;
+};
+
+export function ServiceTabs(props: ServiceTabsProps) {
+  const active = signal(props.active ?? props.tabs[0]);
+
+  return (
+    <section class="service-tabs">
+      <nav role="tablist">
+        <For each={props.tabs} key={(tab) => tab}>
+          {(tab) => (
+            <button role="tab" aria-selected={active.value === tab}
+                    onClick={() => { active.set(tab); }}>
+              {tab}
+            </button>
+          )}
+        </For>
+      </nav>
+      {props.children}
+    </section>
+  );
+}
+```
+
+```tsx
+// src/pages/Services.tsx
+// @runsOn server
+import { ServiceTabs } from '../components/ServiceTabs';
+
+export function Services(props: {}) {
+  return (
+    <main>
+      <h1>Our services</h1>
+      {/* Children are composed HERE, on the server — they land in the
+          prerendered HTML inside the placeholder. */}
+      <ServiceTabs tabs={['Design', 'Build', 'Operate']} client:hydrate>
+        <div class="panels">
+          <article id="panel-design"><h2>Design</h2><p>Research, prototyping, design systems…</p></article>
+          <article id="panel-build"><h2>Build</h2><p>Implementation, testing, delivery…</p></article>
+          <article id="panel-operate"><h2>Operate</h2><p>Monitoring, support, iteration…</p></article>
+        </div>
+      </ServiceTabs>
+    </main>
+  );
+}
+```
+
+What ships, compared side by side:
+
+- **Without children** (`<ServiceTabs tabs={...} client:hydrate />` with the articles
+  rendered inside the client component itself): the placeholder prerenders empty —
+  `<div data-hydrate="ServiceTabs" ...></div>` — and every article is missing from the
+  HTML a crawler reads.
+- **With children** (the example above): the same placeholder element now CONTAINS the
+  panels `<div>` (and every article inside it) in the prerendered HTML. After mount, the
+  runtime adopts that exact DOM as `props.children`, so the client renders the identical
+  content — no flash, no re-parse.
+
+Rules:
+
+- Interactive shells (tabs, accordions, carousels) belong in the `@runsOn client`
+  component; their CONTENT belongs in children passed from the server page. Split along
+  that line whenever the content should be crawlable or readable without JavaScript.
+- A bare island (no children) is correct when its content genuinely doesn't need to exist
+  before hydration — a cart widget, a theme toggle, a chat launcher. Choose it deliberately;
+  don't reach for it because it looks simpler.
+- Children remain a placed value (§7e): the client wrapper cannot transform or reorder
+  them, and they must be a single root element (`MULTIPLE_CHILDREN` otherwise — wrap
+  siblings in one parent). Tab panels that must show/hide per tab do this with CSS or
+  attributes around the whole children slot, or by passing multiple typed props instead.
+- Nested hydrate islands inside children work: adoption moves the nested placeholders
+  intact and mounts run outer-first (§7e).
+
 ---
 
 ## 7. Environment Variables, API Routes & Sessions

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use swc_common::comments::SingleThreadedComments;
 use swc_common::input::StringInput;
-use swc_common::{BytePos, FileName, SourceMap, Span, Spanned};
+use swc_common::{BytePos, FileName, SourceMap, Span, Spanned, SyntaxContext};
 use swc_common::SourceMapper;
 use swc_ecma_ast::*;
 use swc_ecma_parser::{Parser, Syntax, TsConfig};
@@ -1154,7 +1154,21 @@ fn visit_module(&mut self, n: &Module) {
             ModuleItem::ModuleDecl(_) => continue,
             ModuleItem::Stmt(stmt) => match stmt {
                 Stmt::Decl(Decl::Var(var)) => {
-                    if let Ok(src) = self.cm.span_to_snippet(var.span) {
+                    // §E2.1: `const head = meta({...})` at module scope must be
+                    // consumed by process_const_meta (which populates head_parts)
+                    // and NOT emitted as raw JS — `meta()` is a build-time call
+                    // that has no runtime representation.
+                    let is_head_const = var.decls.iter().any(|d| {
+                        matches!(&d.name, Pat::Ident(ident) if ident.id.sym == "head")
+                    });
+                    if is_head_const {
+                        if let Some(decl) = var.decls.first() {
+                            if let Some(init) = &decl.init {
+                                self.process_const_meta(init, true);
+                            }
+                        }
+                        // Skip emitting — meta() is consumed, not runtime code.
+                    } else if let Ok(src) = self.cm.span_to_snippet(var.span) {
                         let stripped = strip_var_ts(&src, var.span, var);
                         self.file.module_statements.push(stripped);
                     }
@@ -1265,16 +1279,17 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
                             },
                         ),
                         VarDeclKind::Const => {
-                            // Module-level const (e.g. a shared config array/object):
-                            // capture the source text (TS annotations stripped) the
-                            // same way in-component derived consts are captured, so
-                            // codegen can emit it at module scope of the output.
-                            // The NAME is recorded too (TopLevelBinding::Const) so
-                            // the validator can detect collisions with the emitted
-                            // session/env runtime declarations.
-                            if let Ok(src) = self.cm.span_to_snippet(n.span) {
-                                let stripped = strip_var_ts(&src, n.span, n);
-                                self.file.module_consts.push(stripped);
+                            // §E2.1: `const head = meta({...})` is consumed by
+                            // process_const_meta in visit_module — skip it here
+                            // to avoid emitting raw `meta()` as runtime JS.
+                            let is_head = n.decls.iter().any(|d| {
+                                matches!(&d.name, Pat::Ident(ident) if ident.id.sym == "head")
+                            });
+                            if !is_head {
+                                if let Ok(src) = self.cm.span_to_snippet(n.span) {
+                                    let stripped = strip_var_ts(&src, n.span, n);
+                                    self.file.module_consts.push(stripped);
+                                }
                             }
                             self.file.top_level_bindings.push(TopLevelBinding::Const {
                                 name: ident.id.sym.to_string(),
@@ -3045,19 +3060,28 @@ fn collect_stmt_ts_spans(stmt: &Stmt, spans: &mut Vec<Span>) {
 fn collect_expr_ts_spans(expr: &Expr, spans: &mut Vec<Span>) {
     match expr {
         Expr::TsAs(ts_as) => {
-            spans.push(ts_as.type_ann.span());
+            // Remove from end of inner expression to end of type annotation.
+            // This covers the `as` keyword, whitespace, and the type itself.
+            // E.g. `foo as string` → the span expr.hi..type_ann.hi covers ` as string`.
+            spans.push(Span::new(ts_as.expr.span().hi, ts_as.type_ann.span().hi, SyntaxContext::empty()));
             collect_expr_ts_spans(&ts_as.expr, spans);
         }
         Expr::TsSatisfies(ts_sat) => {
-            spans.push(ts_sat.type_ann.span());
+            // Same pattern as TsAs: `foo satisfies number` → ` satisfies number`.
+            spans.push(Span::new(ts_sat.expr.span().hi, ts_sat.type_ann.span().hi, SyntaxContext::empty()));
             collect_expr_ts_spans(&ts_sat.expr, spans);
         }
         Expr::TsTypeAssertion(ts_assert) => {
-            spans.push(ts_assert.type_ann.span());
+            // `<Type>expr` — remove from start of type annotation to start of
+            // inner expression. This covers `<`, the type, and `>`.
+            // E.g. `<Foo>foo` → span type_ann.lo..expr.lo covers `<Foo>`.
+            spans.push(Span::new(ts_assert.type_ann.span().lo, ts_assert.expr.span().lo, SyntaxContext::empty()));
             collect_expr_ts_spans(&ts_assert.expr, spans);
         }
         Expr::TsNonNull(ts_nn) => {
-            spans.push(ts_nn.span);
+            // Only remove the trailing `!` (exactly 1 byte after expr.hi).
+            // The old code pushed ts_nn.span which deleted the entire expression.
+            spans.push(Span::new(ts_nn.expr.span().hi, ts_nn.span.hi, SyntaxContext::empty()));
             collect_expr_ts_spans(&ts_nn.expr, spans);
         }
         Expr::TsInstantiation(ts_inst) => {
