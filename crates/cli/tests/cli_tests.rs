@@ -1163,3 +1163,170 @@ fn test_meta_outside_head_const_rejected() {
         stderr
     );
 }
+
+#[test]
+fn test_server_effect_access_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir_all(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Bad.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type BadProps = {};\n",
+            "export function Bad(props: BadProps) {\n",
+            "  effect(() => { console.log('nope'); });\n",
+            "  return <div>hi</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on effect() in a server file, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("SERVER_EFFECT_ACCESS"),
+        "error must carry SERVER_EFFECT_ACCESS, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_server_ref_access_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    std::fs::create_dir_all(&pages).unwrap();
+
+    std::fs::write(
+        pages.join("Bad.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "type BadProps = {};\n",
+            "export function Bad(props: BadProps) {\n",
+            "  const box = ref();\n",
+            "  return <div>hi</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "build must fail on ref() in a server file, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("SERVER_REF_ACCESS"),
+        "error must carry SERVER_REF_ACCESS, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_server_css_import_collected_and_linked() {
+    // §2a relaxed: a @runsOn server component importing .css must have that
+    // stylesheet collected through the transitive closure and linked in the
+    // prerendered HTML — no client:hydrate island required.
+    let dir = tempfile::tempdir().unwrap();
+    let components = dir.path().join("components");
+    let pages = dir.path().join("pages");
+    std::fs::create_dir_all(&components).unwrap();
+    std::fs::create_dir_all(&pages).unwrap();
+
+    std::fs::write(components.join("Banner.css"), ".banner { color: red; }\n").unwrap();
+    std::fs::write(
+        components.join("Banner.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import \"./Banner.css\";\n",
+            "type BannerProps = { text: string };\n",
+            "export function Banner(props: BannerProps) {\n",
+            "  return <div class=\"banner\">{props.text}</div>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        pages.join("Index.tsx"),
+        concat!(
+            "// @runsOn server\n",
+            "import { Banner } from '../components/Banner';\n",
+            "type IndexProps = {};\n",
+            "export function Index(props: IndexProps) {\n",
+            "  return <main><Banner text=\"Welcome\" /></main>;\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let out = dir.path().join("dist");
+    let output = Command::new(env!("CARGO_BIN_EXE_marisjs"))
+        .arg("build")
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .env("SITE_URL", "https://example.com")
+        .output()
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "server-file CSS import must build cleanly since §2a was relaxed, got: {}",
+        stderr
+    );
+
+    let html = std::fs::read_to_string(out.join("index.html")).unwrap();
+    assert!(
+        html.contains("<link rel=\"stylesheet\" href=\"components/Banner.css\">"),
+        "prerendered HTML must link the server component's CSS, got:\n{}",
+        html
+    );
+    assert!(
+        out.join("Banner.css").exists() || out.join("components/Banner.css").exists()
+            || walk_css_exists(&out, "Banner.css"),
+        "the CSS file itself must be copied to the output directory"
+    );
+
+    // and the page content itself is static HTML (no hydrate machinery needed)
+    assert!(html.contains("banner"), "page must contain the banner markup");
+}
+
+fn walk_css_exists(dir: &std::path::Path, name: &str) -> bool {
+    let mut found = false;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                found = found || walk_css_exists(&p, name);
+            } else if p.file_name().map(|f| f == name).unwrap_or(false) {
+                found = true;
+            }
+        }
+    }
+    found
+}

@@ -503,6 +503,41 @@ pub fn check_session_access_boundary(file: &ComponentFile, diagnostics: &mut Vec
     }
 }
 
+/// §7f: Reject `effect()` calls in files marked `@runsOn server` — the mirror
+/// image of CLIENT_DATA_CALL (that rule bans a server-only primitive on the
+/// client; this one bans a client-only primitive on the server), same
+/// enforcement tier and AST-based mechanism. Effects run on the client
+/// reactive scheduler against a live DOM; neither exists at prerender time.
+pub fn check_effect_access_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.has_effect_call {
+        if let Some(RunsOn::Server) = file.runs_on {
+            diagnostics.push(Diagnostic::new(
+                "SERVER_EFFECT_ACCESS",
+                "effect() call in @runsOn server file — effect() is only allowed in @runsOn client components. Effects subscribe to signal changes and touch the DOM; server code is executed once at prerender with no reactive scheduler.",
+                "Move the effect() into a @runsOn client component. If server work must react to data, do it directly in the component body (it re-runs per request/prerender by construction).",
+                Some(file.effect_call_line),
+                Some(file.effect_call_column),
+            ));
+        }
+    }
+}
+
+/// §7f: Reject `ref()` factory calls in files marked `@runsOn server` — refs
+/// hold live DOM nodes, which never exist during static HTML generation.
+pub fn check_ref_access_boundary(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>) {
+    if file.has_ref_call {
+        if let Some(RunsOn::Server) = file.runs_on {
+            diagnostics.push(Diagnostic::new(
+                "SERVER_REF_ACCESS",
+                "ref() call in @runsOn server file — ref() is only allowed in @runsOn client components. Refs hold live DOM nodes; server rendering produces an HTML string with no nodes to reference.",
+                "Move the ref() into a @runsOn client component, or pass structured data via props instead of reaching for a node handle.",
+                Some(file.ref_call_line),
+                Some(file.ref_call_column),
+            ));
+        }
+    }
+}
+
 /// §7a best-effort lint (WARNING, never a build failure): an env() call
 /// appearing anywhere within a `client:hydrate` component's prop expression
 /// — `<Widget apiKey={env("STRIPE_KEY")} client:hydrate />`,
@@ -733,6 +768,19 @@ pub fn check_statement_ordering(file: &ComponentFile, diagnostics: &mut Vec<Diag
                 }
                 has_derived_const = true;
             }
+            BodyStmtKind::EffectCall => {
+                // §7f: effect() subscriptions are declarations like signals —
+                // allowed among the consts section, but never after handlers.
+                if has_handler {
+                    diagnostics.push(Diagnostic::new(
+                        "STATEMENT_OUT_OF_ORDER",
+                        "effect() call appears after event handlers — effects are part of the component's declaration section and must come before handler declarations.",
+                        "Move this effect() call above all event handler declarations.",
+                        Some(stmt.line),
+                        Some(stmt.column),
+                    ));
+                }
+            }
             BodyStmtKind::EventHandler => {
                 has_handler = true;
             }
@@ -774,18 +822,13 @@ pub fn check_css_imports(file: &ComponentFile, diagnostics: &mut Vec<Diagnostic>
             ));
         }
 
-        if file.runs_on == Some(RunsOn::Server) {
-            diagnostics.push(Diagnostic::new(
-                "INVALID_CSS_IMPORT",
-                format!(
-                    "CSS import '{}' in @runsOn server file — CSS is only valid in @runsOn client components. Server components render static HTML without stylesheets.",
-                    import.source
-                ),
-                "Remove the CSS import from this server file. Style server output with inline attributes on JSX elements.",
-                Some(import.line),
-                Some(import.column),
-            ));
-        }
+        // §2a (relaxed): @runsOn server files MAY import .css — collected and
+        // linked via the same transitive CSS-closure mechanism as client
+        // components (the closure walk reads import declarations without
+        // executing anything, so a server file shipping only styles is fine).
+        // Forcing a client (JS-shipping) component purely to carry a
+        // site-wide stylesheet was an unintended consequence of the original
+        // client-only restriction, not a design goal.
 
         if file.runs_on == Some(RunsOn::Api) {
             diagnostics.push(Diagnostic::new(
@@ -1009,6 +1052,8 @@ pub fn validate(file: &ComponentFile) -> Vec<Diagnostic> {
     check_env_access_boundary(file, &mut diagnostics);
     check_env_leak_to_client_prop(file, &mut diagnostics);
     check_session_access_boundary(file, &mut diagnostics);
+    check_effect_access_boundary(file, &mut diagnostics);
+    check_ref_access_boundary(file, &mut diagnostics);
     check_server_boundaries(file, &mut diagnostics);
     check_statement_ordering(file, &mut diagnostics);
     check_unwrapped_signal_prop(file, &mut diagnostics);
@@ -2769,9 +2814,33 @@ mod tests {
     }
 
     #[test]
-    fn css_import_in_server_component_is_rejected() {
+    fn css_import_in_server_component_is_accepted() {
+        // §2a relaxed: server components may import .css — collected and
+        // linked via the same transitive closure as client CSS.
         let mut file = make_valid_file();
         file.runs_on = Some(RunsOn::Server);
+        file.imports.push(ImportInfo {
+            source: "./Cart.css".into(),
+            imported_names: vec![],
+            line: 2,
+            column: 1,
+            is_css: true,
+        });
+        let mut diags = Vec::new();
+        check_css_imports(&file, &mut diags);
+        assert!(
+            diags.is_empty(),
+            "bare CSS import in a server file must be accepted since §2a was relaxed, got: {:?}",
+            diags
+        );
+    }
+
+    #[test]
+    fn css_import_in_api_file_is_still_rejected() {
+        // API handlers return Responses — they never render stylesheets, so
+        // the api-file rejection survives the §2a relaxation untouched.
+        let mut file = make_valid_file();
+        file.runs_on = Some(RunsOn::Api);
         file.imports.push(ImportInfo {
             source: "./Cart.css".into(),
             imported_names: vec![],

@@ -460,6 +460,11 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
         || has_for_each_or_conditional(render_tree);
     let needs_style = tree_has_style_expr(render_tree);
     let needs_child_node = tree_has_expr_child(render_tree);
+    // §7f: effect()/ref() usage comes from the parser's AST-based call-site
+    // flags; <For> presence pulls in _disposeTree for the removal hook.
+    let needs_effect = component.has_effect_call;
+    let needs_ref = component.has_ref_call;
+    let needs_dispose = tree_has_for_each(render_tree);
 
     let mut imports = Vec::new();
     if has_signal { imports.push("signal"); }
@@ -467,6 +472,13 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
     if needs_bind { imports.push("bind"); }
     if needs_style { imports.push("styleString"); }
     if needs_child_node { imports.push("childNode"); }
+    if needs_effect {
+        imports.push("effect");
+        imports.push("_markEffects");
+        imports.push("_attachEffects");
+    }
+    if needs_ref { imports.push("ref"); }
+    if needs_dispose { imports.push("_disposeTree"); }
 
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
@@ -494,6 +506,17 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
     }
 
     output.push_str(&format!("export function {}(props) {{\n", component_name));
+
+    // §7f: bracket the component body so effect handles created during this
+    // invocation are attached to the returned root element. The mark is an
+    // index into the runtime's pending-handle list, which makes nested
+    // component calls interleave safely (the inner attach takes only handles
+    // created after the inner mark).
+    let mut mark_var = String::new();
+    if needs_effect {
+        mark_var = format!("_m{}", counter.next());
+        output.push_str(&format!("  const {} = _markEffects();\n", mark_var));
+    }
 
     for sig in &component.signals {
         let fn_name = match sig.kind {
@@ -537,12 +560,33 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
 
     let root_var = gen_node(render_tree, &mut output, &mut counter, 1, &signal_names, props_param)?;
 
+    // §7f: bare effect(...) subscription statements are emitted AFTER the
+    // render tree is built. This ordering is load-bearing: effects run their
+    // first pass synchronously at this point, so every ref={...} in the tree
+    // already holds its DOM node (useEffect-like timing). Effects emitted
+    // before the tree would see null .current and could never attach
+    // listeners or measure the element they target.
+    for es in &component.effect_stmts {
+        output.push_str(&format!("  {}\n", es));
+    }
+    if !component.effect_stmts.is_empty() {
+        output.push('\n');
+    }
+
     if !component.signals.is_empty() {
         let entries: Vec<String> = component.signals.iter().map(|s| s.name.clone()).collect();
         output.push_str(&format!(
             "  {}._signals = {{ {} }};\n",
             root_var,
             entries.join(", ")
+        ));
+    }
+
+    // §7f: attach this invocation's effect handles to the root element.
+    if needs_effect {
+        output.push_str(&format!(
+            "  _attachEffects({}, {});\n",
+            root_var, mark_var
         ));
     }
 
@@ -944,6 +988,11 @@ fn gen_open_tag_js(tag: &str, attrs: &[parser::JsxAttr]) -> String {
         if is_event_attr(&attr.name).is_some() {
             continue;
         }
+        // §7f: a ref attribute is a client-only DOM handle — a static HTML
+        // string has nothing to reference. Omitted, same as event handlers.
+        if attr.name == "ref" {
+            continue;
+        }
         match &attr.value {
             JsxAttrValue::String(value) => {
                 static_acc.push_str(&format!(" {}=\"{}\"", attr.name, html_attr_escape(value)));
@@ -1085,6 +1134,18 @@ fn has_for_each_or_conditional(node: &JsxNode) -> bool {
     match node {
         JsxNode::Conditional { .. } | JsxNode::ForEach { .. } => true,
         JsxNode::Element { children, .. } => children.iter().any(has_for_each_or_conditional),
+        _ => false,
+    }
+}
+
+/// §7f: true when the tree contains a <For> — its reconciliation emits a
+/// _disposeTree call when items are removed, so the runtime helper must be
+/// imported.
+fn tree_has_for_each(node: &JsxNode) -> bool {
+    match node {
+        JsxNode::ForEach { .. } => true,
+        JsxNode::Element { children, .. } => children.iter().any(tree_has_for_each),
+        JsxNode::Conditional { cons, alt, .. } => tree_has_for_each(cons) || tree_has_for_each(alt),
         _ => false,
     }
 }
@@ -1414,7 +1475,21 @@ fn gen_element(
 
     writeln(output, indent, &format!("const {} = document.createElement('{}');", var, tag));
 
+    // §7f: ref={expr} assigns the real DOM node to .current at the point of
+    // creation — before children are built, so effects that run during this
+    // component's body can rely on it for THIS element.
     for attr in attrs {
+        if attr.name == "ref" {
+            if let JsxAttrValue::Expr(expr) = &attr.value {
+                writeln(output, indent, &format!("{}.current = {};", expr, var));
+            }
+        }
+    }
+
+    for attr in attrs {
+        if attr.name == "ref" {
+            continue; // already wired above, at creation time
+        }
         if let Some(event_name) = is_event_attr(&attr.name) {
             if let JsxAttrValue::Expr(handler) = &attr.value {
                 writeln(output, indent, &format!("{}.addEventListener('{}', {});", var, event_name, handler));
@@ -1695,6 +1770,10 @@ fn gen_for_each(
     writeln(output, bi, "}");
     writeln(output, bi, &format!("for (const _k in {}) {{", map_var));
     writeln(output, bi + 1, "if (!(_k in _seen)) {");
+    // §7f: run effect cleanups registered on the removed item's subtree
+    // BEFORE detaching it — this is the one place "this instance is going
+    // away" is statically known.
+    writeln(output, bi + 2, &format!("_disposeTree({}[_k]);", map_var));
     writeln(output, bi + 2, &format!("{}[_k].remove();", map_var));
     writeln(output, bi + 2, &format!("delete {}[_k];", map_var));
     writeln(output, bi + 1, "}");

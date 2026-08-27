@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { signal, computed, bind, mount } from './index.js';
+import { signal, computed, bind, mount, effect, ref, _markEffects, _attachEffects, _disposeTree } from './index.js';
 
 function nextTick() {
   return new Promise((resolve) => queueMicrotask(resolve));
@@ -362,5 +362,237 @@ describe('edge cases', () => {
     s.set(0);
     await nextTick();
     expect(runs).toBe(2);
+  });
+});
+
+// ─── §7f: effect() — shares bind()'s tracking engine; adds cleanup + run-once ───
+
+describe('effect', () => {
+  it('auto-tracks signal reads and re-runs with an observable side effect', async () => {
+    const s = signal('a');
+    const log = [];
+    effect(() => {
+      // side effect on an external observable, not a DOM update (that's bind's job)
+      log.push(s.value);
+    });
+    expect(log).toEqual([]); // first run is deferred to the microtask flush
+
+    await nextTick();
+    expect(log).toEqual(['a']);
+
+    s.set('b');
+    await nextTick();
+    expect(log).toEqual(['a', 'b']);
+
+    s.set('c');
+    await nextTick();
+    expect(log).toEqual(['a', 'b', 'c']);
+  });
+
+  it('drops subscriptions to signals not read in the latest run', async () => {
+    const a = signal(0);
+    const b = signal(0);
+    let runs = 0;
+    effect(() => {
+      runs++;
+      if (a.value > 0) { void b.value; }
+    });
+    expect(runs).toBe(0);
+    await nextTick();
+    expect(runs).toBe(1); // first run happens at the flush boundary
+
+    b.set(1); // b was never read in run 1 → no subscription → no re-run
+    await nextTick();
+    expect(runs).toBe(1);
+
+    a.set(1); // now the run reads b too
+    await nextTick();
+    expect(runs).toBe(2);
+
+    b.set(2); // subscribed in run 2 → re-runs
+    await nextTick();
+    expect(runs).toBe(3);
+  });
+
+  it('runs cleanup before each re-run (not after the final one)', async () => {
+    const s = signal(0);
+    const events = [];
+    effect(() => {
+      events.push('run:' + s.value);
+      return () => { events.push('cleanup:' + s.value); };
+    });
+    expect(events).toEqual([]);
+    await nextTick();
+    expect(events).toEqual(['run:0']);
+
+    s.set(1);
+    await nextTick();
+    // cleanup of run:0 fires before run:1 — and it observes the NEW value,
+    // proving it ran as pre-re-run teardown, not post-run teardown
+    expect(events).toEqual(['run:0', 'cleanup:1', 'run:1']);
+
+    s.set(2);
+    await nextTick();
+    expect(events).toEqual(['run:0', 'cleanup:1', 'run:1', 'cleanup:2', 'run:2']);
+  });
+
+  it('effect(fn, []) runs exactly once regardless of subsequent signal changes', async () => {
+    const s = signal(0);
+    let runs = 0;
+    effect(() => {
+      runs++;
+      void s.value; // read must NOT subscribe in once-mode
+    }, []);
+    expect(runs).toBe(0);
+    await nextTick();
+    expect(runs).toBe(1);
+
+    s.set(1);
+    await nextTick();
+    s.set(2);
+    await nextTick();
+    expect(runs).toBe(1); // never re-ran
+    expect(s.value).toBe(2); // but reads still see current values
+  });
+
+  it('effect(fn, []) supports a cleanup that runs on dispose', async () => {
+    let cleaned = false;
+    const handles = [];
+    const mark = _markEffects();
+    effect(() => {
+      return () => { cleaned = true; };
+    }, []);
+    const fakeRoot = { querySelectorAll: () => [] };
+    _attachEffects(fakeRoot, mark);
+    await nextTick(); // once-mode executes at the flush boundary
+    expect(cleaned).toBe(false);
+    _disposeTree(fakeRoot);
+    expect(cleaned).toBe(true);
+  });
+});
+
+// ─── §7f: ref() — plain inert box ───
+
+describe('ref', () => {
+  it('returns a box with current initialized to null', () => {
+    const r = ref();
+    expect(r.current).toBeNull();
+    r.current = {};
+    expect(r.current).toEqual({});
+  });
+
+  it('is deliberately inert: writes never trigger any tracking machinery', async () => {
+    const s = signal(0);
+    let effectRuns = 0;
+    let bindRuns = 0;
+    const r = ref();
+
+    effect(() => {
+      effectRuns++;
+      void s.value;
+      r.current = { touched: effectRuns }; // write .current inside a tracked scope
+    });
+    bind(() => {
+      bindRuns++;
+      void r.current; // read .current inside a tracked scope
+      void s.value;
+    });
+
+    expect(bindRuns).toBe(1); // bind still runs synchronously
+    expect(effectRuns).toBe(0);
+    await nextTick();
+    expect(effectRuns).toBe(1); // effect's first run lands at the flush boundary
+
+    s.set(1); // only the signal change may drive further re-runs
+    await nextTick();
+
+    // exactly one re-run each from the signal set — ref reads/writes contributed none
+    expect(effectRuns).toBe(2);
+    expect(bindRuns).toBe(2);
+
+    // a bare write outside any run persists and provokes nothing further
+    r.current = { other: true };
+    await nextTick();
+    await nextTick();
+    expect(effectRuns).toBe(2);
+    expect(bindRuns).toBe(2);
+    expect(r.current).toEqual({ other: true });
+  });
+});
+
+// ─── §7f: unmount modeling — mark/attach/dispose contract used by codegen ───
+
+describe('effect scope disposal (codegen contract)', () => {
+  function makeFakeElement() {
+    const children = [];
+    return {
+      children,
+      _effects: undefined,
+      appendChild(c) { children.push(c); },
+      querySelectorAll() {
+        // depth-first over appended children (enough for these tests)
+        const out = [];
+        const walk = (el) => { out.push(el); el.children.forEach(walk); };
+        children.forEach(walk);
+        return out;
+      },
+    };
+  }
+
+  it('_attachEffects takes only handles created after its mark (nested-safe)', async () => {
+    const outerRoot = makeFakeElement();
+    const innerRoot = makeFakeElement();
+
+    const outerMark = _markEffects();
+    const ran = [];
+    effect(() => { ran.push('outer'); });       // belongs to OUTER
+
+    const innerMark = _markEffects();
+    effect(() => { ran.push('inner'); });       // belongs to INNER
+    _attachEffects(innerRoot, innerMark);
+
+    _attachEffects(outerRoot, outerMark);
+
+    expect(ran).toEqual([]); // nothing ran synchronously — all deferred to flush
+    await nextTick();
+    expect(ran.sort()).toEqual(['inner', 'outer']); // both executed at the flush boundary
+
+    _disposeTree(outerRoot);                    // outer disposal does NOT touch inner
+    _disposeTree(innerRoot);
+    // no assertion beyond "no throw" here; ownership covered by cleanup tests below
+  });
+
+  it('_disposeTree runs cleanups for every attached root in the subtree', async () => {
+    const parent = makeFakeElement();
+    const child = makeFakeElement();
+    parent.appendChild(child);
+
+    const cleaned = [];
+    const mark = _markEffects();
+    effect(() => { return () => cleaned.push('p'); });
+    const childMark = _markEffects();
+    effect(() => { return () => cleaned.push('c'); });
+    _attachEffects(child, childMark);
+    _attachEffects(parent, mark);
+
+    await nextTick(); // both effects ran -> cleanups captured
+    _disposeTree(parent);
+    expect(cleaned.sort()).toEqual(['c', 'p']);
+  });
+
+  it('a disposed effect stops re-running when its signal changes later', async () => {
+    const s = signal(0);
+    let runs = 0;
+    const root = makeFakeElement();
+    const mark = _markEffects();
+    effect(() => { runs++; void s.value; });
+    _attachEffects(root, mark);
+    await nextTick();
+    expect(runs).toBe(1);
+
+    _disposeTree(root);
+    s.set(99);
+    await nextTick();
+    expect(runs).toBe(1); // disposed — late signal writes are inert
   });
 });

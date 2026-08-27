@@ -96,6 +96,8 @@ pub struct JsxExprInfo {
 pub enum BodyStmtKind {
     Signal,
     DerivedConst,
+    /// §7f: a bare `effect(...)` call statement in the component body.
+    EffectCall,
     EventHandler,
     Return,
     Let,
@@ -260,6 +262,22 @@ pub struct ComponentFile {
     pub has_session_call: bool,
     pub session_call_line: usize,
     pub session_call_column: usize,
+    /// §7f: effect() call-site detection — same AST-based mechanism as
+    /// env()/session(). The validator hard-rejects effect() in @runsOn server
+    /// files (SERVER_EFFECT_ACCESS).
+    pub has_effect_call: bool,
+    pub effect_call_line: usize,
+    pub effect_call_column: usize,
+    /// §7f: bare `effect(...)` statements in the component body, source text
+    /// with TS annotations stripped, in declaration order. Codegen emits them
+    /// after derived consts, before the render tree.
+    pub effect_stmts: Vec<String>,
+    /// §7f: ref() factory-call detection (the `ref={...}` JSX attribute is a
+    /// separate, non-call surface handled by codegen). Hard-rejected in
+    /// @runsOn server files (SERVER_REF_ACCESS).
+    pub has_ref_call: bool,
+    pub ref_call_line: usize,
+    pub ref_call_column: usize,
     pub body_stmts: Vec<BodyStmt>,
     pub has_component_body: bool,
     pub render_tree: Option<JsxNode>,
@@ -355,6 +373,13 @@ impl ComponentFile {
             has_session_call: false,
             session_call_line: 0,
             session_call_column: 0,
+            has_effect_call: false,
+            effect_call_line: 0,
+            effect_call_column: 0,
+            effect_stmts: Vec::new(),
+            has_ref_call: false,
+            ref_call_line: 0,
+            ref_call_column: 0,
             body_stmts: Vec::new(),
             has_component_body: false,
             render_tree: None,
@@ -1375,6 +1400,19 @@ fn visit_import_decl(&mut self, n: &ImportDecl) {
                 self.file.session_call_line = line;
                 self.file.session_call_column = col;
             }
+            // §7f: effect()/ref() call sites — the same AST-based detection
+            // as env()/session(); the validator turns these into
+            // SERVER_EFFECT_ACCESS / SERVER_REF_ACCESS on @runsOn server files.
+            if name == "effect" {
+                self.file.has_effect_call = true;
+                self.file.effect_call_line = line;
+                self.file.effect_call_column = col;
+            }
+            if name == "ref" {
+                self.file.has_ref_call = true;
+                self.file.ref_call_line = line;
+                self.file.ref_call_column = col;
+            }
             // §E2.1: meta() call sites are recorded here and consumed by
             // process_const_meta when they sit inside the head const of a
             // server file; leftover sites are reported after the walk.
@@ -1544,6 +1582,23 @@ impl Extractor<'_> {
                 }
             }
 
+            if kind == BodyStmtKind::EffectCall {
+                if let Ok(src) = self.cm.span_to_snippet(stmt.span()) {
+                    // Strip any TS annotations inside the call's arguments
+                    // (e.g. typed arrow params) with the same proven
+                    // span-collection used for derived consts.
+                    let mut spans = Vec::new();
+                    if let Stmt::Expr(expr_stmt) = stmt {
+                        if let Expr::Call(call) = &*expr_stmt.expr {
+                            for arg in &call.args {
+                                collect_expr_ts_spans(&arg.expr, &mut spans);
+                            }
+                        }
+                    }
+                    self.file.effect_stmts.push(splice_out_spans(&src, stmt.span(), &spans));
+                }
+            }
+
             if let Stmt::Return(ret) = stmt {
                 if let Some(arg) = &ret.arg {
                     self.file.render_tree = extract_jsx_from_expr(arg, self.cm, &mut self.file.unsupported_errors);
@@ -1575,6 +1630,21 @@ impl Extractor<'_> {
                 }
             }
             Stmt::Return(_) => BodyStmtKind::Return,
+            // §7f: a bare `effect(...)` expression statement is a sanctioned
+            // component-body statement (subscription declaration, same family
+            // as signal()/computed() declarations).
+            Stmt::Expr(expr_stmt) => {
+                if matches!(
+                    &*expr_stmt.expr,
+                    Expr::Call(call) if direct_callee_ident(&call.callee)
+                        .map(|i| i.sym.as_ref() == "effect")
+                        .unwrap_or(false)
+                ) {
+                    BodyStmtKind::EffectCall
+                } else {
+                    BodyStmtKind::Other
+                }
+            }
             _ => BodyStmtKind::Other,
         }
     }

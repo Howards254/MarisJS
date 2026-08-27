@@ -8278,3 +8278,270 @@ fn ts_file_imported_by_both_server_and_client_island() {
         "shared.ts must be compiled to public tree as shared.mjs"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// §7f: Effects & Refs — end-to-end jsdom verification
+// ═══════════════════════════════════════════════════════════════════
+
+/// Cleanup on unmount: a component rendered inside <For> registers an effect
+/// with cleanup; removing the item from the signal must run that cleanup via
+/// the For reconciliation's _disposeTree hook.
+#[test]
+fn effect_cleanup_runs_on_for_item_removal() {
+    let item = concat!(
+        "// @runsOn client\n",
+        "import { effect } from '@marisjs/runtime';\n",
+        "type ItemProps = { label: string };\n",
+        "export function Item(props: ItemProps) {\n",
+        "  effect(() => {\n",
+        "    globalThis.__log.push('open:' + props.label);\n",
+        "    return () => { globalThis.__log.push('close:' + props.label); };\n",
+        "  }, []);\n",
+        "  return <li>{props.label}</li>;\n",
+        "}\n",
+    );
+    let list = concat!(
+        "// @runsOn client\n",
+        "import { signal } from '@marisjs/runtime';\n",
+        "import { Item } from './Item';\n",
+        "type ListProps = {};\n",
+        "export function List(props: ListProps) {\n",
+        "  const items = signal(['a', 'b', 'c']);\n",
+        "  return (\n",
+        "    <ul>\n",
+        "      <For each={items.value} key={(x) => x}>\n",
+        "        {(x) => <Item label={x} />}\n",
+        "      </For>\n",
+        "    </ul>\n",
+        "  );\n",
+        "}\n",
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    parse_validate_generate(&dir, "Item", item);
+    // List.tsx must sit next to Item.mjs for its relative import to resolve.
+    let list_path = dir.path().join("List.tsx");
+    std::fs::write(&list_path, list).unwrap();
+    let list_component = parser::parse_component_file(list_path.to_str().unwrap()).unwrap();
+    assert!(validator::validate(&list_component).is_empty(), "List validation failed: {:?}", validator::validate(&list_component));
+    let list_js = codegen::generate(&list_component, &codegen::EnvMap::new()).unwrap();
+    std::fs::write(dir.path().join("List.mjs"), &list_js).unwrap();
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { mount, signal } from '@marisjs/runtime';
+import { List } from './List.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+globalThis.__log = [];
+
+const root = document.createElement('div');
+document.body.appendChild(root);
+
+const items = ['a', 'b', 'c'];
+// drive the SAME signal the component reads by re-mounting is wrong — instead
+// reach into the element's exposed signals (el._signals) like real hydration does
+mount(root, () => List({}));
+const ul = root.querySelector('ul');
+if (!ul) { console.error('FAIL no ul'); process.exit(1); }
+
+const flush = () => new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
+
+(async () => {
+  await flush();
+  const lis = ul.querySelectorAll('li');
+  if (lis.length !== 3) { console.error('FAIL expected 3 items, got ' + lis.length + ' log=' + JSON.stringify(globalThis.__log)); process.exit(1); }
+  // <For> builds initial items back-to-front (insertBefore strategy), so
+  // effect first-runs land in reverse source order — an implementation
+  // detail. Assert the SET of opens, not their sequence.
+  const opens = [...globalThis.__log].sort();
+  if (JSON.stringify(opens) !== JSON.stringify(['open:a','open:b','open:c'])) {
+    console.error('FAIL initial opens wrong: ' + JSON.stringify(globalThis.__log)); process.exit(1);
+  }
+
+  // remove item 'b' via the exposed signal — For reconciliation removes its DOM
+  ul._signals.items.set(['a', 'c']);
+  await flush();
+  await flush();
+  const after = ul.querySelectorAll('li').length;
+  if (after !== 2) { console.error('FAIL expected 2 items after removal, got ' + after); process.exit(1); }
+  if (!globalThis.__log.includes('close:b')) {
+    console.error('FAIL cleanup for b never ran: ' + JSON.stringify(globalThis.__log)); process.exit(1);
+  }
+  if (globalThis.__log.includes('close:a') || globalThis.__log.includes('close:c')) {
+    console.error('FAIL unrelated cleanups ran: ' + JSON.stringify(globalThis.__log)); process.exit(1);
+  }
+  console.log('PASS');
+})().catch((e) => { console.error('FAIL', e); process.exit(1); });
+"#;
+    run_node(&dir, runner);
+}
+
+/// ref() attribute wiring: the real DOM node lands in .current at creation,
+/// and a run-once effect can act on it (focus) before any interaction.
+#[test]
+fn ref_focuses_via_run_once_effect() {
+    let fixture = concat!(
+        "// @runsOn client\n",
+        "import { ref, effect } from '@marisjs/runtime';\n",
+        "type FProps = {};\n",
+        "export function FocusBox(props: FProps) {\n",
+        "  const inputRef = ref();\n",
+        "  effect(() => {\n",
+        "    if (inputRef.current) { inputRef.current.focus(); }\n",
+        "  }, []);\n",
+        "  return <div><input ref={inputRef} placeholder=\"name\" /></div>;\n",
+        "}\n",
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    parse_validate_generate(&dir, "FocusBox", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { mount } from '@marisjs/runtime';
+import { FocusBox } from './FocusBox.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+
+(async () => {
+const root = document.createElement('div');
+document.body.appendChild(root);
+mount(root, () => FocusBox({}));
+
+// effect first-runs are commit-deferred (microtask flush) — wait for it
+await new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
+
+const input = root.querySelector('input');
+const ok = input !== null
+    && document.activeElement === input
+    && input.getAttribute('placeholder') === 'name';
+if (ok) { console.log('PASS'); }
+else {
+    console.error('FAIL', JSON.stringify({
+        hasInput: input !== null,
+        activeIsInput: document.activeElement === input,
+        activeTag: document.activeElement ? document.activeElement.tagName : null,
+    }));
+    process.exit(1);
+}
+})();
+"#;
+    run_node(&dir, runner);
+}
+
+/// The §7f spec worked example, verbatim semantics: keyboard-navigable tab
+/// list. Real keydown events dispatched in jsdom must move focus and update
+/// aria-selected; the auto-tracking focus effect re-runs per selection.
+#[test]
+fn keyboard_navigable_tabs_end_to_end() {
+    let fixture = r#"// @runsOn client
+import { signal, ref, effect } from '@marisjs/runtime';
+
+type ServiceTabsProps = {
+  tabs: string[];
+  children: JSX.Element;
+};
+
+export function ServiceTabs(props: ServiceTabsProps) {
+  const active = signal(props.tabs[0]);
+  const tablist = ref();
+
+  effect(() => {
+    const list = tablist.current;
+    if (!list) return;
+    const onKeyDown = (e) => {
+      const idx = props.tabs.indexOf(active.value);
+      if (e.key === 'ArrowRight') { active.set(props.tabs[(idx + 1) % props.tabs.length]); }
+      if (e.key === 'ArrowLeft')  { active.set(props.tabs[(idx - 1 + props.tabs.length) % props.tabs.length]); }
+    };
+    list.addEventListener('keydown', onKeyDown);
+    return () => { list.removeEventListener('keydown', onKeyDown); };
+  }, []);
+
+  effect(() => {
+    const btns = tablist.current ? tablist.current.querySelectorAll('[role="tab"]') : [];
+    for (const b of btns) {
+      if (b.textContent === active.value) { b.focus(); }
+    }
+  });
+
+  return (
+    <section>
+      <div role="tablist" ref={tablist}>
+        <For each={props.tabs} key={(t) => t}>
+          {(t) => (
+            <button role="tab" aria-selected={active.value === t} onClick={() => { active.set(t); }}>{t}</button>
+          )}
+        </For>
+      </div>
+    </section>
+  );
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    setup_test_dir(&dir);
+    parse_validate_generate(&dir, "ServiceTabs", fixture);
+
+    let runner = r#"import { JSDOM } from 'jsdom';
+import { mount } from '@marisjs/runtime';
+import { ServiceTabs } from './ServiceTabs.mjs';
+
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.document = dom.window.document;
+global.Node = dom.window.Node;
+
+const tabs = ['Design', 'Build', 'Operate'];
+const root = document.createElement('div');
+document.body.appendChild(root);
+mount(root, () => ServiceTabs({ tabs, children: null }));
+
+const fail = (msg) => { console.error('FAIL ' + msg); process.exit(1); };
+const selectedBtn = () => root.querySelector('[aria-selected="true"]');
+const focusedBtn = () => document.activeElement;
+const pressKey = (key) => {
+  root.querySelector('[role="tablist"]').dispatchEvent(
+    new dom.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true })
+  );
+};
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+(async () => {
+  const btns = root.querySelectorAll('[role="tab"]');
+  if (btns.length !== 3) fail('expected 3 tabs');
+
+  // effect first-runs are commit-deferred — let the flush land
+  await flush();
+
+  // initial state: first tab selected and focused (run-once listener + auto focus effect)
+  if (selectedBtn()?.textContent !== 'Design') fail('initial selection: ' + selectedBtn()?.textContent);
+  if (focusedBtn() !== btns[0]) fail('initial focus not on tab 0: ' + focusedBtn()?.textContent);
+
+  // ArrowRight moves selection AND focus (roving)
+  pressKey('ArrowRight');
+  await flush();
+  if (selectedBtn()?.textContent !== 'Build') fail('after ArrowRight selection: ' + selectedBtn()?.textContent);
+  if (focusedBtn() !== btns[1]) fail('after ArrowRight focus not on tab 1');
+
+  // wraps around at the end
+  pressKey('ArrowRight'); pressKey('ArrowRight');
+  await flush();
+  if (selectedBtn()?.textContent !== 'Design') fail('wrap-around selection: ' + selectedBtn()?.textContent);
+  if (focusedBtn() !== btns[0]) fail('wrap-around focus');
+
+  // ArrowLeft from index 0 wraps backwards to last
+  pressKey('ArrowLeft');
+  await flush();
+  if (selectedBtn()?.textContent !== 'Operate') fail('backwards wrap selection: ' + selectedBtn()?.textContent);
+  if (focusedBtn() !== btns[2]) fail('backwards wrap focus');
+
+  console.log('PASS');
+})().catch((e) => fail(String(e)));
+"#;
+    run_node(&dir, runner);
+}

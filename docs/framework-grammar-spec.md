@@ -84,10 +84,17 @@ import type { CartProps } from "./types";
   same path-resolution logic already implemented for component-to-component imports
   (the `collect_component_imports` mechanism from the codegen layer). A `.css` import whose
   path does not resolve to an existing file is a validation error.
-- CSS imports are only valid in `@runsOn client` files. In a `@runsOn server` file, a `.css`
-  import has no effect (the server renders static HTML, not a DOM with stylesheets) and is a
-  validation error: server components style their output via inline attributes on the JSX
-  elements themselves, per the existing HTML generation rules.
+- **CSS imports are valid in both `@runsOn client` and `@runsOn server` component files.**
+  A server component's CSS is collected and linked through exactly the same transitive
+  CSS-closure mechanism used for client components — the page that renders the component
+  gets a `<link rel="stylesheet">` for it, whether the importing file ships JS or not.
+  (Changed from the original client-only rule. Stated plainly why: the original
+  restriction forced teams to ship a real, hydrating client component purely to carry a
+  site-wide stylesheet — a static page wanting one shared `.css` file had to invent a
+  pointless island for it. That was an unintended consequence of the boundary rule, not a
+  deliberate design goal; CSS collection never executed the importing component anyway,
+  so the restriction bought nothing.) API files (`@runsOn api`) still reject CSS imports —
+  handlers return Responses and never render stylesheets.
 - A component may have zero or more `.css` imports. Each is a separate `import` statement.
   No bundling or concatenation of multiple `.css` imports into a single statement is permitted.
 
@@ -165,8 +172,10 @@ output — there is nothing else to configure.
 
 **Rules and caveats:**
 
-- The Layout must be `@runsOn client` because CSS imports are a validation error in
-  `@runsOn server` files (§2a).
+- The Layout in this convention is `@runsOn client` because it ships interactive page
+  chrome. A purely static layout may equally be `@runsOn server` — CSS imports are valid
+  in both file kinds since §2a was relaxed; prefer client only when the component is
+  genuinely interactive.
 - In page files, the Layout must be marked `client:hydrate` so the SSR prerender step
   skips it (client-side DOM code like `document.createElement` would crash Node.js during
   prerender). The CSS import metadata is still collected — the `collect_component_imports`
@@ -1149,6 +1158,169 @@ v1 limitation in this spec):**
 - **UNEXPECTED_CHILDREN cannot see into `*.types.ts` Props types** (see above) — the
   check is exactly as strong as the compiler's view of the target's fields.
 
+### 7f. Effects and Refs
+
+Two primitives for everything the declarative render path deliberately does not cover:
+subscribing to signal changes without touching the DOM, and holding a direct handle on a
+DOM node.
+
+#### `effect(fn: () => void | (() => void)): void`
+
+`effect()` runs `fn` immediately, auto-tracks every signal read inside it, and re-runs
+`fn` whenever any tracked signal changes. It reuses the exact reactive-tracking mechanism
+that powers `bind()` — there is one tracking engine in this framework. The distinction
+from `bind()` is intent only: **`bind()` is for DOM updates driven by signals; `effect()`
+is for everything else** — side effects, subscriptions (web sockets, media queries,
+`IntersectionObserver`), timers, and DOM measurement through a `ref()`.
+
+```tsx
+// @runsOn client
+import { signal, effect } from '@marisjs/runtime';
+
+export function Timer(props: {}) {
+  const elapsed = signal(0);
+
+  effect(() => {
+    const id = setInterval(() => { elapsed.set(elapsed.value + 1); }, 1000);
+    // optional cleanup — runs before the next re-run and on unmount
+    return () => { clearInterval(id); };
+  });
+
+  return <span>{elapsed.value}s</span>;
+}
+```
+
+Rules:
+
+- **Cleanup.** `fn` may return a function. It is called before every re-run of the effect
+  and when the owning component instance unmounts. An effect that acquires an external
+  resource (interval, listener, observer) must return its teardown; there is no second
+  mechanism.
+- **Re-run timing (commit-deferred).** The first run is NOT synchronous at the `effect()`
+  call site — it executes at the microtask flush boundary after the component's render
+  tree is built AND the island root is connected to the document (`mount()` / hydration
+  adoption). This is deliberate: by the time an effect runs, every `ref.current` in the
+  tree holds its live node and the nodes are in the document, so attaching listeners,
+  focusing, or measuring works on the first pass — the same commit timing React's
+  `useEffect` normalized. Re-runs are batched through the same flush as `bind()`.
+  Reading `.value` inside `fn` is what subscribes — conditionally-read signals subscribe
+  only on runs that actually read them, and stale subscriptions from previous runs are
+  dropped automatically.
+- **`effect(fn, [])` — run once.** The ONLY accepted second argument at v1 is an empty
+  array literal: run `fn` once on mount and ignore all signal reads inside it for
+  auto-tracking purposes (reads still return current values; they just never subscribe).
+  There is no dependency-array-of-values mechanism — not "yet", permanently. A list of
+  watched values reintroduces exactly the forgot-a-dependency footgun the auto-tracking
+  design exists to eliminate; if you need re-runs on a value, read a signal. Omitting the
+  second argument entirely means normal auto-tracking.
+- **Where effects may be declared.** In a component body, alongside signals and derived
+  consts (per Section 3 statement ordering). Effects are component-instance-scoped:
+  their cleanups run when that instance's rendered DOM is discarded (a `<For>` item
+  removed by reconciliation, or an island being torn down). Conditional JSX branches are
+  constructed eagerly (both alternates exist; switching detaches one), so a branch swap
+  does not create or destroy component instances and does not fire cleanups.
+- **Hard-rejected on server:** any `effect(` call in a `@runsOn server` file is a
+  validator error (`SERVER_EFFECT_ACCESS`) — the same enforcement tier as
+  `CLIENT_DATA_CALL`, and its mirror image: data() is server-only banned on client;
+  effect() is client-only banned on server. Server code has no reactive scheduler to run
+  effects on and no browser to observe.
+
+#### `ref(): { current: Element | null }`
+
+`ref()` returns a plain, non-reactive mutable box with a single `.current` field. Attach
+it to a JSX element via the `ref` attribute; the compiler assigns the real DOM node to
+`.current` at the point the element is created:
+
+```tsx
+// @runsOn client
+import { ref } from '@marisjs/runtime';
+
+export function NameField(props: {}) {
+  const inputRef = ref();
+
+  return <input ref={inputRef} placeholder="Your name" />;
+}
+```
+
+Rules:
+
+- **Deliberately inert.** Reading or writing `.current` never triggers any `bind()` or
+  `effect()` re-run. A ref is a mutable handle, not state — state lives in `signal()`.
+  Read `.current` explicitly, typically inside an `effect(fn, [])` or an event handler.
+- **Populated once.** `.current` is assigned when the element is created and is never
+  reassigned by the runtime afterwards.
+- **Client-only attribute semantics.** A `ref={...}` attribute on an element inside a
+  `@runsOn server` page is silently omitted from prerendered HTML, exactly like event
+  handler attributes today — a static HTML string has nothing to reference. Calling
+  `ref()` itself in a server file is hard-rejected (`SERVER_REF_ACCESS`, same tier as
+  `SERVER_EFFECT_ACCESS`) — refs are meaningless without a live DOM.
+- **One ref, one element.** Attaching the same ref object to multiple elements is not
+  sanctioned; each element gets its own `ref()` call.
+
+Worked example — keyboard-navigable tab list (the canonical pairing of both primitives:
+`ref()` to reach a node imperatively, `effect(fn, [])` to attach exactly-once listeners):
+
+```tsx
+// src/components/ServiceTabs.tsx
+// @runsOn client
+import { signal, ref, effect } from '@marisjs/runtime';
+
+type ServiceTabsProps = {
+  tabs: string[];
+  children: JSX.Element;
+};
+
+export function ServiceTabs(props: ServiceTabsProps) {
+  const active = signal(props.tabs[0]);
+  const tablist = ref();
+
+  effect(() => {
+    const list = tablist.current;
+    if (!list) return;
+    const onKeyDown = (e) => {
+      const idx = props.tabs.indexOf(active.value);
+      if (e.key === 'ArrowRight') { active.set(props.tabs[(idx + 1) % props.tabs.length]); }
+      if (e.key === 'ArrowLeft')  { active.set(props.tabs[(idx - 1 + props.tabs.length) % props.tabs.length]); }
+    };
+    list.addEventListener('keydown', onKeyDown);
+    return () => { list.removeEventListener('keydown', onKeyDown); };
+  }, []);
+
+  effect(() => {
+    // focus FOLLOWS selection — reads active.value, so this re-runs per change
+    const btns = tablist.current ? tablist.current.querySelectorAll('[role="tab"]') : [];
+    for (const b of btns) {
+      if (b.textContent.trim() === active.value) { b.focus(); }
+    }
+  });
+
+  return (
+    <section>
+      <div role="tablist" ref={tablist}>
+        <For each={props.tabs} key={(t) => t}>
+          {(t) => (
+            <button role="tab" aria-selected={active.value === t} onClick={() => { active.set(t); }}>{t}</button>
+          )}
+        </For>
+      </div>
+      {props.children}
+    </section>
+  );
+}
+```
+
+Notes on the example, since both primitives are doing real work: the keydown listener is
+attached once (`effect(fn, [])`) — it reads `active.value` inside the HANDLER (at event
+time, not subscription time), so no re-subscription is ever needed, and its cleanup
+removes the listener on unmount. The focus effect auto-tracks `active.value` and re-focuses
+the selected button whenever selection changes — the standard arrow-key tab pattern
+(roving focus). The cleanup functions are what make this correct inside a `<For>` item:
+when the item is removed, reconciliation disposes the subtree and both listeners go with
+it. Two details worth copying verbatim: the tab `<button>` content sits on ONE line
+(multi-line JSX puts whitespace text nodes inside the element, and the focus effect's
+`textContent` comparison would then need `.trim()`), and that comparison uses `.trim()`
+anyway as belt-and-braces against future formatting churn.
+
 ---
 
 ## 8. Forbidden Patterns (validator hard-rejects, full list — extend as discovered)
@@ -1411,7 +1583,7 @@ a server path was audited against tests:
 | data() | n/a (rejected CLIENT_DATA_CALL) | ✓ tested | |
 | Derived consts | ✓ tested | ✓ tested | |
 | head injection | n/a | ✓ tested | |
-| CSS imports | ✓ tested | rejected (INVALID_CSS_IMPORT) | by design |
+| CSS imports | ✓ tested | ✓ tested (relaxed 2026-08-25 — server CSS collected & linked, §2a) | was rejected INVALID_CSS_IMPORT; api files still reject |
 
 Beyond attribute expressions (#9), the audit found and fixed two more parity gaps: signals in
 server files passed validation then crashed prerender with a ReferenceError (now rejected with
