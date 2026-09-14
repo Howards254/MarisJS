@@ -214,6 +214,7 @@ pub enum JsxNode {
         each: String,
         key_fn: String,
         item_param: String,
+        index_param: Option<String>,
         body: Box<JsxNode>,
         /// Block-local declarations (function/const) inside the For item
         /// arrow's block body, to be emitted inside the render function _rX.
@@ -1173,6 +1174,31 @@ fn visit_module(&mut self, n: &Module) {
                         self.file.module_statements.push(stripped);
                     }
                     continue;
+                }
+                continue;
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportNamed(export)) => {
+                if let Ok(src) = self.cm.span_to_snippet(export.span) {
+                    self.file.module_statements.push(src);
+                }
+                continue;
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultDecl(export)) => {
+                if let Ok(src) = self.cm.span_to_snippet(export.span) {
+                    let stripped = match &export.decl {
+                        DefaultDecl::Fn(fn_expr) => {
+                            let spans = collect_fn_ts_spans(&fn_expr.function);
+                            splice_out_spans(&src, export.span, &spans)
+                        }
+                        _ => src,
+                    };
+                    self.file.module_statements.push(stripped);
+                }
+                continue;
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDefaultExpr(export)) => {
+                if let Ok(src) = self.cm.span_to_snippet(export.span) {
+                    self.file.module_statements.push(src);
                 }
                 continue;
             }
@@ -2887,6 +2913,7 @@ fn extract_for_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
     }
 
     let mut item_param = String::from("item");
+    let mut index_param: Option<String> = None;
     let mut body: Option<JsxNode> = None;
     let mut for_body_decls: Vec<String> = Vec::new();
 
@@ -2895,8 +2922,9 @@ fn extract_for_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
             if let JSXExpr::Expr(expr) = &container.expr {
                 if let Some(b) = extract_arrow_body_jsx(expr, cm, errors) {
                     item_param = b.0;
-                    body = Some(b.1);
-                    for_body_decls = b.2;
+                    index_param = b.1;
+                    body = Some(b.2);
+                    for_body_decls = b.3;
                     break;
                 }
             }
@@ -2907,23 +2935,26 @@ fn extract_for_element(el: &JSXElement, cm: &dyn swc_common::SourceMapper, error
         each,
         key_fn,
         item_param,
+        index_param,
         body: Box::new(body.unwrap_or(JsxNode::Text(String::new()))),
         for_body_decls,
     }
 }
 
-fn extract_arrow_body_jsx(expr: &Expr, cm: &dyn swc_common::SourceMapper, errors: &mut Vec<ParserError>) -> Option<(String, JsxNode, Vec<String>)> {
+fn extract_arrow_body_jsx(expr: &Expr, cm: &dyn swc_common::SourceMapper, errors: &mut Vec<ParserError>) -> Option<(String, Option<String>, JsxNode, Vec<String>)> {
     match expr {
         Expr::Paren(paren) => extract_arrow_body_jsx(&paren.expr, cm, errors),
         Expr::Arrow(arrow) => {
-            let param = arrow
+            let params: Vec<String> = arrow
                 .params
-                .first()
-                .and_then(|p| match p {
+                .iter()
+                .filter_map(|p| match p {
                     Pat::Ident(ident) => Some(ident.id.sym.to_string()),
                     _ => None,
                 })
-                .unwrap_or_else(|| "item".to_string());
+                .collect();
+            let item_param = params.first().cloned().unwrap_or_else(|| "item".to_string());
+            let index_param = params.get(1).cloned();
 
             match &*arrow.body {
                 BlockStmtOrExpr::BlockStmt(block) => {
@@ -2933,7 +2964,7 @@ fn extract_arrow_body_jsx(expr: &Expr, cm: &dyn swc_common::SourceMapper, errors
                             Stmt::Return(ret) => {
                                 if let Some(arg) = &ret.arg {
                                     return expr_to_jsx_node(arg, cm, errors)
-                                        .map(|node| (param, node, decls));
+                                        .map(|node| (item_param, index_param, node, decls));
                                 }
                                 return None;
                             }
@@ -2956,7 +2987,7 @@ fn extract_arrow_body_jsx(expr: &Expr, cm: &dyn swc_common::SourceMapper, errors
                     None
                 }
                 BlockStmtOrExpr::Expr(body_expr) => {
-                    expr_to_jsx_node(body_expr, cm, errors).map(|node| (param, node, Vec::new()))
+                    expr_to_jsx_node(body_expr, cm, errors).map(|node| (item_param, index_param, node, Vec::new()))
                 }
             }
         }

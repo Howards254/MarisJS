@@ -505,6 +505,43 @@ fn preclassify_files(
         }
     }
 
+    // §S1: follow imports from CLIENT components
+    let client_rels: Vec<PathBuf> = runs_on_by_rel.iter()
+        .filter(|(_, r)| **r == parser::RunsOn::Client)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let mut client_worklist: Vec<PathBuf> = client_rels
+        .iter()
+        .filter(|r| r.extension().map_or(false, |ext| ext == "tsx"))
+        .cloned()
+        .collect();
+    let mut client_visited: HashSet<PathBuf> = HashSet::new();
+    while let Some(rel) = client_worklist.pop() {
+        if !client_visited.insert(rel.clone()) {
+            continue;
+        }
+        let file_path = source_dir.join(&rel);
+        let Some(file_str) = file_path.to_str() else { continue };
+        let Ok(component) = parser::parse_component_file(file_str) else { continue };
+        for imp in &component.imports {
+            if imp.is_css
+                || !(imp.source.starts_with("./") || imp.source.starts_with("../"))
+            {
+                continue;
+            }
+            let trimmed = imp.source.trim_end_matches(".tsx").trim_end_matches(".ts");
+            let resolved = normalize_path(&rel.parent().unwrap_or(Path::new("")).join(trimmed));
+            let ts_rel = PathBuf::from(format!("{}.ts", resolved));
+            if ts_rel.extension().map_or(false, |e| e == "ts")
+                && source_dir.join(&ts_rel).is_file()
+                && !ts_to_compile.contains(&ts_rel)
+            {
+                ts_to_compile.push(ts_rel.clone());
+                client_worklist.push(ts_rel);
+            }
+        }
+    }
+
     Ok((server_files, runs_on_by_rel, ts_to_compile))
 }
 

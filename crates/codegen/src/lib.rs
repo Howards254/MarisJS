@@ -169,6 +169,10 @@ pub fn generate_ts_module(
         output.push_str(&format!("{}\n", stmt));
     }
 
+    for (_name, src) in &component.exported_fn_sources {
+        output.push_str(&format!("{}\n", src));
+    }
+
     if output.trim().is_empty() {
         return Err("no module content emitted".to_string());
     }
@@ -480,11 +484,30 @@ fn generate_client(component: &ComponentFile) -> Result<String, String> {
     if needs_ref { imports.push("ref"); }
     if needs_dispose { imports.push("_disposeTree"); }
 
+    let mut emitted_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let comp_imports = collect_component_imports(render_tree, &component.imports);
     for (name, source) in &comp_imports {
         output.push_str(&format!("import {{ {} }} from '{}';\n", name, source));
+        emitted_sources.insert(source.clone());
     }
-    if !comp_imports.is_empty() {
+    for imp in &component.imports {
+        if imp.is_css || imp.source == "@marisjs/runtime" {
+            continue;
+        }
+        let normalized = format!(
+            "{}.mjs",
+            imp.source.trim_end_matches(".tsx").trim_end_matches(".ts")
+        );
+        if emitted_sources.contains(&normalized) {
+            continue;
+        }
+        output.push_str(&format!(
+            "import {{ {} }} from '{}';\n",
+            imp.imported_names.join(", "),
+            normalized
+        ));
+    }
+    if !comp_imports.is_empty() || !component.imports.is_empty() {
         output.push('\n');
     }
 
@@ -618,6 +641,7 @@ fn generate_server(
 
     let has_data = component.has_data_call;
     let hydrates = collect_hydrate_roots(render_tree);
+    let has_components = !collect_child_component_tags(render_tree).is_empty();
 
     // A server page may declare `const head = meta({...})` or raw HTML
     // injected into the built page's <head>. Codegen includes it in the
@@ -764,11 +788,13 @@ fn generate_server(
         output.push_str("  // data() resolution (v1: direct await)\n");
     }
 
-    if hydrates.is_empty() && !has_head {
+    if hydrates.is_empty() && !has_head && !has_components {
         output.push_str("  return ");
         gen_html_node(render_tree, &mut output, has_data)?;
         output.push_str(";\n");
     } else {
+        output.push_str("  let __t;\n");
+        output.push_str("  const __c = [];\n");
         output.push_str("  const _html = ");
         gen_html_node(render_tree, &mut output, has_data)?;
         output.push_str(";\n");
@@ -779,7 +805,7 @@ fn generate_server(
         output.push_str(", clientBundles: [");
         let names: Vec<String> = hydrates.iter().map(|h| format!("'./{}.js'", h)).collect();
         output.push_str(&names.join(", "));
-        output.push_str("] };\n");
+        output.push_str("].concat(__c) };\n");
     }
 
     output.push_str("}\n");
@@ -906,7 +932,9 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
                     };
                 }
                 let await_kw = if parent_is_async { "await " } else { "" };
-                output.push_str(&format!("({}{}({}))", await_kw, tag, props_arg));
+                output.push_str(&format!(
+                    "((__t = {await_kw}{tag}({props_arg}), typeof __t === 'string' ? __t : (__c.push(...(__t.clientBundles || [])), __t.html)))"
+                ));
                 return Ok(());
             }
             if tag.is_empty() {
@@ -921,13 +949,17 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
                 return Ok(());
             }
             let open_js = gen_open_tag_js(tag, attrs);
-            let close = format!("</{}>", tag);
             output.push_str(&format!("({}", open_js));
-            for child in children {
-                output.push_str(" + ");
-                gen_html_node(child, output, parent_is_async)?;
+            if !is_void_element(tag) {
+                let close = format!("</{}>", tag);
+                for child in children {
+                    output.push_str(" + ");
+                    gen_html_node(child, output, parent_is_async)?;
+                }
+                output.push_str(&format!(" + '{}')", html_escape(&close)));
+            } else {
+                output.push(')');
             }
-            output.push_str(&format!(" + '{}')", html_escape(&close)));
         }
         JsxNode::Conditional { test, cons, alt } => {
             output.push_str(&format!("({} ? ", test));
@@ -936,8 +968,9 @@ fn gen_html_node(node: &JsxNode, output: &mut String, parent_is_async: bool) -> 
             gen_html_node(alt, output, parent_is_async)?;
             output.push(')');
         }
-        JsxNode::ForEach { each, key_fn: _, item_param, body, .. } => {
-            output.push_str(&format!("({}.map(({}) => ", each, item_param));
+        JsxNode::ForEach { each, key_fn: _, item_param, index_param, body, .. } => {
+            let idx = index_param.as_deref().unwrap_or("_idx");
+            output.push_str(&format!("({}.map(({}, {}) => ", each, item_param, idx));
             gen_html_node(body, output, parent_is_async)?;
             output.push_str(").join(''))");
         }
@@ -1009,7 +1042,10 @@ fn gen_open_tag_js(tag: &str, attrs: &[parser::JsxAttr]) -> String {
                     // objects at render time (same styleString as the client).
                     toks.push(format!("\" {}=\\\"\" + styleString({}) + \"\\\"\"", attr.name, expr));
                 } else {
-                    toks.push(format!("\" {}=\\\"\" + ({}) + \"\\\"\"", attr.name, expr));
+                    toks.push(format!(
+                        "(({0}) != null ? \" {1}=\\\"\" + ({0}) + \"\\\"\" : \"\")",
+                        expr, attr.name
+                    ));
                 }
             }
         }
@@ -1240,6 +1276,13 @@ fn is_boolean_attr(name: &str) -> bool {
         | "itemscope" | "typemustmatch")
 }
 
+fn is_void_element(tag: &str) -> bool {
+    matches!(tag,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input"
+        | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    )
+}
+
 fn needs_property_assignment(name: &str) -> bool {
     matches!(name, "value")
 }
@@ -1435,8 +1478,8 @@ fn gen_node(
     match node {
         JsxNode::Conditional { test, cons, alt } =>
             gen_conditional(test, cons, alt, output, counter, indent, signal_names, props_param),
-        JsxNode::ForEach { each, key_fn, item_param, body, for_body_decls } =>
-            gen_for_each(each, key_fn, item_param, body, for_body_decls, output, counter, indent, signal_names, props_param),
+        JsxNode::ForEach { each, key_fn, item_param, index_param, body, for_body_decls } =>
+            gen_for_each(each, key_fn, item_param, index_param.as_deref(), body, for_body_decls, output, counter, indent, signal_names, props_param),
         JsxNode::Element { tag, attrs, children, is_hydrate_root, is_component } =>
             gen_element(tag, attrs, children, *is_hydrate_root, *is_component, output, counter, indent, signal_names, props_param),
         JsxNode::Text(text) => Ok(gen_text(text, output, counter, indent)),
@@ -1531,7 +1574,9 @@ fn gen_element(
                     } else if needs_property_assignment(&attr.name) {
                         format!("{}.{} = {}", var, attr.name, expr)
                     } else {
-                        format!("{}.setAttribute('{}', {})", var, attr.name, expr)
+                        let set_op = format!("{}.setAttribute('{}', {})", var, attr.name, expr);
+                        let remove_op = format!("{}.removeAttribute('{}')", var, attr.name);
+                        format!("(({} != null) ? {} : {})", expr, set_op, remove_op)
                     };
                     if is_reactive_expr(expr, signal_names, props_param) {
                         writeln(output, indent, &format!("bind(() => {{ {}; }});", dom_op));
@@ -1729,6 +1774,7 @@ fn gen_for_each(
     each: &str,
     key_fn: &str,
     item_param: &str,
+    index_param: Option<&str>,
     body: &JsxNode,
     for_body_decls: &[String],
     output: &mut String,
@@ -1747,7 +1793,11 @@ fn gen_for_each(
     writeln(output, indent, &format!("{}.appendChild({});", frag_var, anchor_var));
     writeln(output, indent, &format!("const {} = {{}};", map_var));
 
-    writeln(output, indent, &format!("function {}({}) {{", render_fn, item_param));
+    let render_params = match index_param {
+        Some(idx) => format!("{}, {}", item_param, idx),
+        None => item_param.to_string(),
+    };
+    writeln(output, indent, &format!("function {}({}) {{", render_fn, render_params));
     let render_indent = indent + 1;
     for decl in for_body_decls {
         for line in decl.lines() {
@@ -1783,7 +1833,11 @@ fn gen_for_each(
     writeln(output, bi, "for (let _i = _order.length - 1; _i >= 0; _i--) {");
     writeln(output, bi + 1, "const _key = _order[_i];");
     writeln(output, bi + 1, &format!("if (!{}[_key]) {{", map_var));
-    writeln(output, bi + 2, &format!("{}[_key] = {}(_seen[_key]);", map_var, render_fn));
+    let render_call = match index_param {
+        Some(_) => format!("{}(_seen[_key], _i)", render_fn),
+        None => format!("{}(_seen[_key])", render_fn),
+    };
+    writeln(output, bi + 2, &format!("{}[_key] = {};", map_var, render_call));
     writeln(output, bi + 1, "}");
     writeln(output, bi + 1, &format!("const _n = {}[_key];", map_var));
     writeln(output, bi + 1, "if (_n.nextSibling !== _ref) {");
