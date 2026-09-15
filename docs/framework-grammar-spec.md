@@ -616,6 +616,30 @@ matching the same rule already established for component props.
   makes `key` a required parameter of the construct itself — impossible to forget it because
   there's no code path that skips it.
 
+- **ForEach index parameter** — the render callback may accept a second `idx` parameter:
+
+```tsx
+<For each={props.items} key={(item) => item.id}>
+  {(item, idx) => <ItemRow item={item} position={idx + 1} />}
+</For>
+```
+
+  **Creation-time snapshot semantics:** `idx` is a snapshot of the item's position at the time
+  the DOM node was *created*, not its current position in the array. On reorder, DOM nodes are
+  **moved** (not destroyed and re-created), so `idx` stays attached to its original item:
+
+```tsx
+// array = [{id:1, name:'A'}, {id:2, name:'B'}, {id:3, name:'C'}]
+// initial render: A→0, B→1, C→2
+// reorder to [C, A, B]: DOM nodes move, but idx values stay:
+//   A still has idx=0, B still has idx=1, C still has idx=2
+// NOT: A→1, B→2, C→0 (re-sequenced)
+```
+
+  This is the same behavior as React's `useId`-stable numbering — the index identifies *which
+  node* was created at position N, not *what position* the node currently occupies. If you need
+  the current position, derive it from the array at render time (`items.indexOf(item)`).
+
 - Event handlers: always inline arrow functions or a named handler function declared inside the
   component body (per Section 3, rule 3). No handler passed by string name, no event delegation
   configuration.
@@ -1343,6 +1367,21 @@ anyway as belt-and-braces against future formatting churn.
 | `session()`/`setSession()` call inside a `@runsOn client` file | Credential-bearing session cookie handling leaking to a publicly downloadable bundle |
 | `data()` call inside a `@runsOn api` file | `data()` is page-render-time fetching; an api handler renders no page |
 
+### S1 Re-export barrel gap (discovered 2026-09-14)
+
+`export { x } from './other'` re-export syntax in `.ts` helper files is now emitted verbatim by
+the parser (S4 fix), but the import worklist in `preclassify_files` does NOT follow these
+re-exports transitively. If `helpers.ts` does `export { formatDate } from './format.ts'` and
+a client island imports from `helpers.ts`, the `format.ts` file is not compiled to `.mjs`
+because the worklist only follows direct `import` statements, not `export { ... } from` forms.
+
+**Impact:** barrel-file patterns (re-exporting from sub-modules) silently drop the re-exported
+symbols at build time. The client bundle emits `import { formatDate } from './helpers.mjs'`
+but `helpers.mjs` is empty (no function body), causing a runtime `ReferenceError`.
+
+**Status:** tracked gap, not fixed in this round. Fix requires extending the import worklist
+to also follow `export { ... } from` statements in `.ts` files.
+
 ---
 
 ## 9. Open Items for Layer 2 (compiler) to resolve
@@ -1671,6 +1710,19 @@ window) documented in §7c. Residual non-blocking follow-ups tracked: JSX-tag-on
 client references to server components (undefined import, no secret exposure) and
 cosmetic `MISSING_RUNSON` wording for api files. Crypto core (HMAC construction,
 constant-time compare) verified safe by review.
+
+### Binary-freshness safeguard (tracked follow-up, 4th occurrence 2026-09-14)
+
+Differential tests that exercise the CLI build pipeline (`run_server_fixture` /
+`run_build_fixture`) must rebuild `target/debug/marisjs` from the source under test
+*before* running. If the binary is stale (built from a different commit or branch),
+the test silently passes against the wrong code, producing false negatives.
+
+This is the 4th occurrence of this exact class of problem across the project's history.
+It is now a **standing action item**: any new test that shells out to the CLI binary
+must include an explicit `cargo build --bin marisjs` step, or the test infrastructure
+must enforce binary freshness automatically (e.g., by hashing the binary and comparing
+to the current `Cargo.lock`).
 
 ---
 

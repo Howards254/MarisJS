@@ -129,8 +129,8 @@ pub fn generate_api(component: &ComponentFile, env: &EnvMap) -> Result<String, S
 /// components, so server-to-server .ts imports resolve correctly under _server/.
 pub fn generate_ts_module(
     component: &ComponentFile,
-    rel: &Path,
-    server_files: &std::collections::HashSet<std::path::PathBuf>,
+    _rel: &Path,
+    _server_files: &std::collections::HashSet<std::path::PathBuf>,
 ) -> Result<String, String> {
     let mut output = String::new();
 
