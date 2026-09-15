@@ -3562,7 +3562,13 @@ fn adapter_static_uses_folder_url_convention_for_nested_route() {
         .find(|r| r["path"] == "/docs/api/signals")
         .expect("manifest should contain /docs/api/signals");
     assert_eq!(route["file"], "docs/api/signals/index.html");
-    assert_eq!(manifest["routes"][0]["file"], "index.html");
+    let root_route = manifest["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["path"] == "/")
+        .expect("manifest should contain /");
+    assert_eq!(root_route["file"], "index.html");
 }
 
 // ───────────────────────────────────────────────────────────────────────────
